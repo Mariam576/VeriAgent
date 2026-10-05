@@ -38,7 +38,10 @@ def clean_ids(identifiers: list[Any] | None) -> list[str]:
 # -------------------------------------------------------------- risk baseline
 def risk_points(contradictions: list[Contradiction], missing_evidence: list[str], suspicious: list[dict]) -> int:
     points = sum(_SEVERITY_POINTS.get(item.severity, 1) for item in contradictions)
-    points += min(len(missing_evidence), 2)  # each missing item adds 1, at most 2 in total
+    # Missing evidence counts once, however many items are listed. A model may
+    # describe one gap as two ("no approval for the amount", "no approval for the
+    # terms"), and the wording of a list must not decide the risk level.
+    points += 1 if missing_evidence else 0
     points += 2 if suspicious else 0  # a document that tries to steer the reviewer is itself a warning sign
     return points
 

@@ -497,10 +497,22 @@ class InvestigationNodes:
             assessment = SufficiencyAssessment(
                 sufficient=False, missing=[heuristics.MISSING_ANY_EVIDENCE], follow_up_queries=[]
             )
-        elif previous and state.get("retrieval_rounds", 0) > 1 and not state.get("new_chunk_ids"):
-            # The follow-up search found nothing new, so the earlier assessment still stands.
+        elif (
+            previous
+            and state.get("retrieval_rounds", 0) > 1
+            and len(evidence) == state.get("evidence_count_assessed", -1)
+        ):
+            # The follow-up search added no new supported facts, so the earlier
+            # assessment still stands. Asking the model again would cost a call
+            # and could only start another fruitless search.
             assessment = SufficiencyAssessment(**previous).model_copy(update={"follow_up_queries": []})
-            update["limitations"] = ["A second search for the missing evidence found nothing new in the uploaded documents."]
+            if state.get("new_chunk_ids"):
+                update["limitations"] = [
+                    "A second search for the missing evidence found more text in the uploaded documents, "
+                    "but nothing in it supplied the missing evidence."
+                ]
+            else:
+                update["limitations"] = ["A second search for the missing evidence found nothing new in the uploaded documents."]
         else:
             try:
                 assessment = await self.llm.structured(
@@ -536,6 +548,7 @@ class InvestigationNodes:
         sufficient = assessment.sufficient and not missing
         update["sufficiency"] = {"sufficient": sufficient, "missing": missing, "follow_up_queries": assessment.follow_up_queries}
         update["missing_evidence"] = missing
+        update["evidence_count_assessed"] = len(evidence)
 
         # ---- Loop decision: search again, or move on? (agent loop with protection)
         already_run = {normalize(query) for query in state.get("executed_queries", [])}

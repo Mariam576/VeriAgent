@@ -512,3 +512,34 @@ async def test_a_rejected_llm_request_stops_the_run_instead_of_silently_using_ru
 
     with pytest.raises(LLMConfigurationError, match="rejected the request"):
         await run_graph(DEMO_QUESTION, sample_library(samples_dir), BadKeyLLM())
+
+
+async def test_repeat_search_stops_when_new_text_adds_no_new_facts(samples_dir):
+    """Seen with a real model: it kept proposing searches that found pages but no evidence."""
+    retriever = sample_library(samples_dir)
+    # No approval query in the first round, so the follow-up search still finds unread pages.
+    analysis = RequestAnalysis(
+        task_type="document_investigation", needs_rag=True, needs_calculation=True,
+        needs_external_verification=False, decision_requested=True,
+        standalone_question=DEMO_QUESTION, search_queries=["contract total value", "invoice total amount"],
+    )
+    calls = {"n": 0}
+
+    def always_wants_more(system: str, user: str) -> SufficiencyAssessment:
+        calls["n"] += 1
+        return SufficiencyAssessment(
+            sufficient=False,
+            missing=["signed change order for the price increase", "written approval of the longer payment terms"],
+            follow_up_queries=[f"supplier onboarding insurance {calls['n']}", f"records retention review {calls['n']}"],
+        )
+
+    llm = ScriptedLLM({RequestAnalysis: analysis, SufficiencyAssessment: always_wants_more})
+    state = await run_graph(DEMO_QUESTION, retriever, llm)
+
+    assert state["retrieval_rounds"] == 2  # one repeat, not one per idea the model has
+    assert llm.calls.count("SufficiencyAssessment") == 1
+    assert state["new_chunk_ids"], "the repeat search did find unread pages"
+    assert any("nothing in it supplied the missing evidence" in text for text in state["report"]["limitations"])
+    # Two ways of describing one gap do not push the risk level up a class.
+    assert state["report"]["risk_level"] == "high"
+    assert len(state["report"]["missing_evidence"]) == 2

@@ -157,8 +157,9 @@ def test_baseline_risk_thresholds():
     # the demo: high amount mismatch (3) + medium terms mismatch (2) + missing approval (1) = 6
     assert baseline_risk([contradiction("high"), contradiction("medium")], ["approval"], []) == "high"
     assert baseline_risk([contradiction("high"), contradiction("medium")], ["approval"], [{"id": "S1"}]) == "critical"
-    # missing evidence alone can add at most 2 points
+    # missing evidence counts once, however many items the model lists
     assert baseline_risk([], ["a", "b", "c", "d"], []) == "medium"
+    assert baseline_risk([contradiction("high"), contradiction("medium")], ["approval of amount", "approval of terms"], []) == "high"
 
 
 def test_confidence_ceiling_moves_with_countable_things():

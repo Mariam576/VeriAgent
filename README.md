@@ -299,7 +299,7 @@ This matters for a project about evidence, so here it is plainly.
 
 **Verified by running it**
 
-- The full test suite (275 tests) against PostgreSQL 16 with pgvector 0.6.0 and 0.8.1.
+- The full test suite (276 tests) against PostgreSQL 16 with pgvector 0.6.0 and 0.8.1.
 - The complete flow over HTTP against a running server: upload, investigate, chat, read findings.
 - The Gemini provider code against the real Gemini SDK, with HTTP responses supplied by a fake transport.
 - `docker compose config` accepts the compose file, and the pinned requirements resolve on Python 3.12.

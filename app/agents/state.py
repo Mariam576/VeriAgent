@@ -57,6 +57,7 @@ class InvestigationState(TypedDict, total=False):
     calculations: list[dict[str, Any]]
     tool_selection_done: bool
     sufficiency: dict[str, Any]
+    evidence_count_assessed: int  # how many evidence items the last sufficiency judgement looked at
     missing_evidence: list[str]
     retrieve_again: bool
 
