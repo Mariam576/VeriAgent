@@ -40,6 +40,8 @@ from app.security.guardrails import detect_prompt_injection
 
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+W14 = "{http://schemas.microsoft.com/office/word/2010/wordml}"
+MIN_HIDING_TRANSPARENCY = 88_000  # w14:alpha counts transparency in thousandths of a percent: 88% and more cannot be read
 MC_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
 THEME_RELATIONSHIP = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme"
 
@@ -267,6 +269,23 @@ class _Formatting:
                 return "squeezed until it cannot be read"
         except ValueError:
             pass
+
+        # Word's text effects can make a run transparent or give it no fill at all (w14:textFill).
+        for level in levels:
+            fill = level.find(f"{W14}textFill")
+            if fill is None:
+                continue
+            if fill.find(f"{W14}noFill") is not None:
+                return "transparent text"
+            alpha = fill.find(f".//{W14}alpha")
+            written = (alpha.get(f"{W14}val") or "0") if alpha is not None else "0"
+            try:
+                transparency = float(written.rstrip("%")) * 1000 if written.endswith("%") else float(written)
+            except ValueError:
+                transparency = 0.0
+            if transparency >= MIN_HIDING_TRANSPARENCY:
+                return "transparent text"
+            break
 
         colour_setting = first("color")
         colour = self._colour(colour_setting, "val", "themeColor") if colour_setting is not None else None

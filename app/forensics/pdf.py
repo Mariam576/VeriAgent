@@ -74,7 +74,7 @@ from app.security.guardrails import detect_prompt_injection
 
 logger = logging.getLogger(__name__)
 
-MIN_VISIBLE_SIZE = 3.0  # points; smaller text cannot be read on screen or paper
+MIN_VISIBLE_SIZE = 3.0  # points; smaller text cannot be read on screen or paper (small print goes down to about 3.5)
 RENDER_ZOOM = 2.0  # the page is drawn at 144 dots per inch for the comparison
 MAX_RENDER_PIXELS = 8_000_000  # a poster-sized page is drawn smaller, not with more memory
 # How much the two pictures must differ (0..255, strongest pixel of a character) ...
@@ -82,11 +82,14 @@ NO_INK = 12  # ... for the character to have put any ink on the page at all
 FAINT_INK = 30  # ... for a run of text to be readable: below this it is about 12% away from its background
 CORE_TOP, CORE_BOTTOM = 0.2, 0.1  # the part of a character's box that is looked at (not the gaps to the lines above and below)
 CONTEST_SHARE = 0.25  # share of a character's core that another text command's character must cover to "contest" it
-LARGE_TEXT = 24.0  # points; text this large is seen even when it is pale (a "DRAFT" watermark)
+LARGE_TEXT = 24.0  # points; pale text this large is a watermark ("DRAFT"): not read, and not reported
+OWN_INK_SHARE = 0.15  # how far a pixel must have moved towards a text's colour to count as that text's ink
+MIN_SAME_SHAPES = 8  # so many different characters drawn as one and the same shape: the font does not draw what it says
 SCAN_MARKS = 30  # how much a scan must vary under a piece of recognised text to count as "something is printed here"
 COVER_SHARE = 0.8  # drawing-order rule: share of a character's box that must be covered to call it covered
 MIN_CONTRAST = 0.08  # drawing-order rule: difference in brightness (0..1) below which text and background are one colour
-SCAN_IMAGE_SHARE = 0.7  # an opaque image this large on a page is treated as a scan of the page
+SCAN_IMAGE_SHARE = 0.4  # pictures that together cover this much of a page make it a scan (a half-page document on A4 counts)
+MIN_RENDER_ZOOM = 1.0  # a page so large that it could only be drawn smaller than this is not compared by picture
 MAX_TYPED_CHARS_ON_SCAN = 150
 PAGE_MARGIN_SHARE = 0.07  # the top and bottom strip of a page, where scanners and fax machines print their stamp
 RARE_FONT_SHARE = 0.03
@@ -102,6 +105,13 @@ HIDDEN_WORDS = {
     "tiny": f"smaller than {MIN_VISIBLE_SIZE:g} points",
     "covered": "covered by a shape or image drawn over it",
     "off_page": "placed outside the visible page",
+    "not_drawn": "set in a font that draws other shapes than the characters it stands for",
+    # Pale text of watermark size ("DRAFT" across the page). It is left out of what is read,
+    # like all text that can hardly be seen, but it is no sign of anything: nothing is reported.
+    "pale_large": "a pale watermark",
+    # Invisible text on a scan, at a place where the scan shows nothing. Not read. Recognised text does
+    # stray onto blank paper now and then, so it is only reported when it reads like an instruction.
+    "blank_scan": "invisible, at a place where the scanned page is blank",
 }
 
 # Programs whose main purpose is to change existing PDFs. A file that names one was edited
@@ -143,6 +153,7 @@ class PageTrace:
     height: float = 0.0
     failed: bool = False  # the page could not be read at all: nothing is known about it
     compared: bool = True  # False: the two pictures could not be made; only the drawing order was used
+    drawn_fonts: bool = False  # the page uses a font that draws its own shapes (Type 3)
 
     @property
     def has_hidden(self) -> bool:
@@ -176,6 +187,12 @@ def _contains_point(box: Box, x: float, y: float) -> bool:
     return box[0] <= x <= box[2] and box[1] <= y <= box[3]
 
 
+def _middle(box: Box) -> Box:
+    """The narrow middle band of a character's box: lower-case height, clear of the lines above and below."""
+    height = box[3] - box[1]
+    return box[0], box[1] + 0.4 * height, box[2], box[3] - 0.27 * height
+
+
 def _core(box: Box) -> Box:
     """The middle band of a character's box, where its ink is.
 
@@ -191,8 +208,9 @@ def _core(box: Box) -> Box:
 class _Pictures:
     """What the two drawings of a page say, as arrays of "how different is this pixel" (0..255)."""
 
-    content_ink: Any  # the page with its text against the page without it
+    content_ink: Any  # the finished page against the finished page without the page's text
     annotation_ink: Any | None  # the finished page against the page without annotations (None: it has none)
+    finished: Any  # the page as a reader sees it, in colour
     background: Any  # the finished page without the page's text, in colour: what lies behind (or over) the text
     content_commands: int  # drawing commands with a lower number belong to the page; the rest to annotations
     transform: tuple[float, float, float, float, float, float]  # page coordinates -> pixels
@@ -215,6 +233,39 @@ class _Pictures:
             return 0
         top, bottom, left, right = area
         return int(picture[top:bottom, left:right].max())
+
+    def own_ink(self, box: Box, colour: tuple[float, float, float], strength: float) -> bool:
+        """Is the ink inside ``box`` this text's own ink, judged by its colour?
+
+        Where the two pictures differ, some text put ink on the page - but
+        whose? A white word placed just under a black line of underscores has
+        black ink in its box that is not its own. So the strongest differing
+        pixels are looked at: taking the text away must have moved them from
+        the colour behind TOWARDS this text's colour. Ink that moved them
+        elsewhere belongs to other text, and a colour that equals what is
+        behind it can leave no ink at all.
+        """
+        import numpy
+
+        area = self._pixels(box)
+        if area is None:
+            return False
+        top, bottom, left, right = area
+        patch = self.content_ink[top:bottom, left:right]
+        strongest = numpy.argsort(patch, axis=None)[-4:]
+        wanted_colour = numpy.array(colour, dtype=numpy.float64)
+        for position in strongest[::-1]:
+            y, x = divmod(int(position), patch.shape[1])
+            if patch[y, x] < NO_INK:
+                break
+            behind = self.background[top + y, left + x].astype(numpy.float64)
+            want = (wanted_colour - behind) * strength  # how a fully covered pixel would change
+            if numpy.abs(want).max() < NO_INK:
+                continue
+            move = self.finished[top + y, left + x].astype(numpy.float64) - behind
+            if float(move @ want) / float(want @ want) >= OWN_INK_SHARE:
+                return True
+        return False
 
     def colour_behind(self, box: Box) -> tuple[float, float, float] | None:
         """The typical colour of the text-free page inside ``box`` (red, green, blue: 0..255)."""
@@ -254,70 +305,101 @@ def _draw(page: Any, matrix: Any, *, annotations: bool, alpha: bool = False) -> 
     return numpy.frombuffer(pixmap.samples, dtype=numpy.uint8).reshape(pixmap.height, pixmap.width, pixmap.n).copy()
 
 
-def _pictures(page: Any) -> _Pictures:
+class Workshop:
+    """A private copy of a document, in which pages may be taken apart.
+
+    To draw a page without its text the text has to be removed, and that must
+    not happen to the document that is being read. The copy is a copy of the
+    whole file (made once, when first needed), not of single pages: settings
+    that belong to the document as a whole - such as which layers are switched
+    off - then apply to the copy exactly as they apply to the original.
+    """
+
+    def __init__(self, document: Any, data: bytes | None = None) -> None:
+        self._document, self._data, self._copy = document, data, None
+
+    def page(self, index: int) -> tuple[Any, Any]:
+        """(the copy, its page ``index``)."""
+        import pymupdf
+
+        if self._copy is None:
+            self._copy = pymupdf.open(stream=self._data if self._data is not None else self._document.tobytes(), filetype="pdf")
+        return self._copy, self._copy[index]
+
+    def close(self) -> None:
+        if self._copy is not None:
+            self._copy.close()
+            self._copy = None
+
+
+def _pictures(page: Any, workshop: Workshop | None = None) -> _Pictures:
     """Draw the page with and without its text and compare. Raises when that is not possible."""
-    import numpy
     import pymupdf
 
-    document, index = page.parent, page.number
-    zoom = min(RENDER_ZOOM, math.sqrt(MAX_RENDER_PIXELS / max(page.rect.width * page.rect.height, 1.0)))
-    matrix = pymupdf.Matrix(zoom, zoom)
-    content = _draw(page, matrix, annotations=False)
-
-    # A copy of the page, without its annotations, from which all text is removed. The
-    # redaction tool is used for that: with images and line art left untouched, and no
-    # fill, it takes out every character (also inside reused page parts) and nothing else.
-    stripped_document = pymupdf.open()
+    own_workshop = workshop is None
+    workshop = workshop or Workshop(page.parent)
     try:
-        stripped_document.insert_pdf(document, from_page=index, to_page=index, annots=False, widgets=False)
-        stripped = stripped_document[0]
-        content_commands = len(stripped.get_bboxlog())
-        stripped.add_redact_annot(stripped.rect, fill=False)
-        stripped.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
-        if stripped.get_text("text").strip():
-            raise RuntimeError("text was left on the page after it was removed")
-        without_text = _draw(stripped, matrix, annotations=False)
-    finally:
-        stripped_document.close()
-    if without_text.shape != content.shape:
-        raise RuntimeError("the two pictures of the page have different sizes")
+        zoom = min(RENDER_ZOOM, math.sqrt(MAX_RENDER_PIXELS / max(page.rect.width * page.rect.height, 1.0)))
+        if zoom < MIN_RENDER_ZOOM:
+            # A poster-sized page drawn within the memory limit shows ordinary text as a few grey
+            # pixels: every line would look "hardly visible". Better no comparison than a wrong one.
+            raise RuntimeError("the page is too large to be drawn at a size at which text can be judged")
+        matrix = pymupdf.Matrix(zoom, zoom)
+        annotated = page.first_annot is not None or page.first_widget is not None
+        finished = _draw(page, matrix, annotations=True)
 
-    if page.first_annot is None and page.first_widget is None:
+        # The same page in the copy, with all its text removed. The redaction tool does that: with
+        # images and line art left untouched, and no fill, it takes out every character (also inside
+        # reused page parts) and nothing else. It would take the annotations along, so the page's
+        # list of annotations is put aside first and put back afterwards: they are part of what a
+        # reader sees, and the page must be drawn with them, text or no text.
+        copy, twin = workshop.page(page.number)
+        kind, kept = copy.xref_get_key(twin.xref, "Annots")
+        if kind != "null":
+            copy.xref_set_key(twin.xref, "Annots", "null")
+            twin = copy.reload_page(twin)
+        content_commands = len(twin.get_bboxlog())
+        twin.add_redact_annot(twin.rect, fill=False)
+        twin.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
+        # (Text that the tool cannot reach - inside a repeating pattern - stays in both pictures. It then
+        # makes no difference between them and counts as not visible, which is the safe side.)
+        if kind != "null":
+            copy.xref_set_key(twin.xref, "Annots", kept)
+        else:
+            copy.xref_set_key(twin.xref, "Annots", "null")
+        twin = copy.reload_page(twin)
+        without_text = _draw(twin, matrix, annotations=True)
+        if without_text.shape != finished.shape:
+            raise RuntimeError("the two pictures of the page have different sizes")
+
         transform = tuple(page.rotation_matrix * matrix)
-        return _Pictures(_difference(content, without_text), None, without_text, content_commands, transform)
-
-    # With annotations the finished page is what a reader sees. "Without the page's text" is
-    # then: the annotations painted over the text-free page. The annotations alone are drawn
-    # from a second copy whose page content is emptied.
-    finished = _draw(page, matrix, annotations=True)
-    layer_document = pymupdf.open()
-    try:
-        layer_document.insert_pdf(document, from_page=index, to_page=index)
-        layer_page = layer_document[0]
-        for xref in layer_page.get_contents():
-            layer_document.update_stream(xref, b" ")
-        layer = _draw(layer_page, matrix, annotations=True, alpha=True)
+        annotation_ink = _difference(finished, _draw(page, matrix, annotations=False)) if annotated else None
+        return _Pictures(_difference(finished, without_text), annotation_ink, finished, without_text, content_commands, transform)
     finally:
-        layer_document.close()
-    if layer.shape[:2] != content.shape[:2] or finished.shape != content.shape:
-        raise RuntimeError("the pictures of the page have different sizes")
-    # The layer's colours are stored already multiplied by their opacity ("premultiplied").
-    see_through = (255 - layer[..., 3:4].astype(numpy.uint16))
-    painted_over = (layer[..., :3].astype(numpy.uint16) + (without_text.astype(numpy.uint16) * see_through + 127) // 255).clip(0, 255).astype(numpy.uint8)
-    transform = tuple(page.rotation_matrix * matrix)
-    return _Pictures(_difference(finished, painted_over), _difference(finished, content), painted_over, content_commands, transform)
+        if own_workshop:
+            workshop.close()
 
 
-def _opaque_images(page: Any, images: list[tuple[int, Box]]) -> list[tuple[int, Box]]:
-    """The images that let nothing show through (a scan is one; a watermark or a signature with a clear background is not)."""
-    try:
-        see_through = [tuple(round(v) for v in info["bbox"]) for info in page.get_image_info() if info.get("has-mask")]
-    except Exception:  # noqa: BLE001 - when in doubt an image counts as see-through, so nothing is excused as "a scan"
-        return []
-    return [(seqno, box) for seqno, box in images if tuple(round(v) for v in box) not in see_through]
+def _covered_share(boxes: list[Box], area: Box) -> float:
+    """The share of ``area`` that the boxes cover together (on a coarse grid, so strips and tiles add up)."""
+    width, height = area[2] - area[0], area[3] - area[1]
+    if width <= 0 or height <= 0 or not boxes:
+        return 0.0
+    cells = 40
+    covered = [[False] * cells for _ in range(cells)]
+    for box in boxes:
+        first_x = max(int((box[0] - area[0]) / width * cells + 0.5), 0)
+        last_x = min(int((box[2] - area[0]) / width * cells + 0.5), cells)
+        first_y = max(int((box[1] - area[1]) / height * cells + 0.5), 0)
+        last_y = min(int((box[3] - area[1]) / height * cells + 0.5), cells)
+        for y in range(first_y, last_y):
+            row = covered[y]
+            for x in range(first_x, last_x):
+                row[x] = True
+    return sum(sum(row) for row in covered) / (cells * cells)
 
 
-def trace_page(page: Any, number: int) -> PageTrace:
+def trace_page(page: Any, number: int, workshop: Workshop | None = None) -> PageTrace:
     """Every character on the page with the verdict "visible" or the reason it is hidden."""
     # The trace works in the page's own coordinates, before any /Rotate is applied.
     visible_area: Box = tuple((page.rect * page.derotation_matrix).normalize())
@@ -331,23 +413,31 @@ def trace_page(page: Any, number: int) -> PageTrace:
         trace.failed = True
         return trace
 
-    trace.images = [(index, tuple(box)) for index, (kind, box) in enumerate(log) if kind == "fill-image"]
-    trace.scans = [
-        (seqno, box) for seqno, box in _opaque_images(page, trace.images)
-        if trace.area and _overlap(box, visible_area) >= SCAN_IMAGE_SHARE * trace.area
-    ]
+    trace.images = [(index, tuple(box)) for index, (kind, box) in enumerate(log) if kind in ("fill-image", "fill-imgmask")]
+    # A scanner stores a page as one picture, as several strips, or as a one-colour stencil. What
+    # makes a page "a scan" is that pictures cover it; whether its invisible text is then accepted
+    # as recognised text is decided character by character (_keep_recognised_text).
+    if _covered_share([box for _, box in trace.images], visible_area) >= SCAN_IMAGE_SHARE:
+        trace.scans = list(trace.images)
     if not spans:
         return trace
 
     pictures: _Pictures | None = None
     try:
-        pictures = _pictures(page)
+        pictures = _pictures(page, workshop)
     except Exception as exc:  # noqa: BLE001
         logger.warning("page %d could not be drawn for comparison (%s: %s); using the drawing order only", number, type(exc).__name__, exc)
         trace.compared = False
 
     # Everything except text that was drawn, in order: what can lie over a character.
     covers = [(index, tuple(box)) for index, (kind, box) in enumerate(log) if kind not in _NOT_A_COVER]
+    # A font that draws its own shapes (Type 3) may draw anything for any character. On pages that
+    # use one, runs of text are checked for "many different characters, one and the same shape".
+    try:
+        drawn_fonts = any(str(font[2]).lower() == "type3" for font in page.get_fonts())
+    except Exception:  # noqa: BLE001
+        drawn_fonts = False
+    trace.drawn_fonts = drawn_fonts
     # Opaque filled rectangles: (sequence number, box, brightness). Used by the drawing-order rule.
     fills = []
     for drawing in drawings:
@@ -357,6 +447,11 @@ def trace_page(page: Any, number: int) -> PageTrace:
         if not drawing.get("items") or any(item[0] not in ("re", "qu") for item in drawing["items"]):
             continue  # only plain rectangles: the bounding box of a curve says little about what it covers
         fills.append((int(drawing.get("seqno", -1)), tuple(drawing["rect"]), _luminance(drawing["fill"])))
+    if pictures is None:
+        # Without the pictures only the drawing order is left. Then every shape filled later counts
+        # as a cover by its outline box, whatever its form: too much is called covered rather than too little.
+        known = {seqno for seqno, _, _ in fills}
+        fills += [(index, tuple(box), 1.0) for index, (kind, box) in enumerate(log) if kind == "fill-path" and index not in known]
 
     # ---- pass 1: what the drawing order says about each character, and how much ink it left
     records: list[dict[str, Any]] = []
@@ -376,6 +471,9 @@ def trace_page(page: Any, number: int) -> PageTrace:
         anything_later = [(cover_seq, cover_box) for cover_seq, cover_box in covers if seqno < cover_seq < last_command and _overlap(cover_box, box) > 0]
         colour = _rgb(span.get("color"), span.get("colorspace"))
         strength = float(span.get("opacity", 1.0))
+        # A plain grey, RGB or CMYK colour can be compared with the picture; a pattern or a font that
+        # paints its own colours cannot.
+        plain_colour = span.get("color") is not None and span.get("colorspace") in (1, 3, 4) and not drawn_fonts
 
         for code, _glyph, origin, char_box in span["chars"]:
             char = chr(code)
@@ -383,10 +481,13 @@ def trace_page(page: Any, number: int) -> PageTrace:
             record = {
                 "char": TracedChar(char, char_box, (float(origin[0]), float(origin[1])), seqno, font, size, None),
                 "span": span_number, "unseen": unseen, "annotation": from_annotation, "order": None, "ink": 255, "under": None, "below_something": False,
-                "colour": colour, "strength": strength, "rivals": [],
+                "colour": colour, "strength": strength, "rivals": [], "own": True,
             }
             records.append(record)
-            if char.isspace():
+            if char.isspace() or char_box[2] - char_box[0] < 0.05:
+                # A space, or a character without width (the second half of a ligature, a joiner): it
+                # draws nothing of its own and goes with its neighbours.
+                record["neutral"] = True
                 continue
             centre_x, centre_y = (char_box[0] + char_box[2]) / 2, (char_box[1] + char_box[3]) / 2
             on_image = any(_contains_point(image_box, centre_x, centre_y) for image_box in images_behind)
@@ -402,12 +503,15 @@ def trace_page(page: Any, number: int) -> PageTrace:
                     record["order"] = "same_colour"
             over_it = [cover_seq for cover_seq, cover in anything_later if _contains_point(cover, centre_x, centre_y)]
             record["under"] = min(over_it) if over_it else None  # the first later drawing of the page that lies over it
+            record["plain_colour"] = plain_colour
             # For the wording of the reason only: is anything at all drawn over it later, annotations included?
             record["below_something"] = bool(over_it) or any(
                 cover_seq > seqno and _contains_point(cover, centre_x, centre_y) for cover_seq, cover in covers
             )
             if pictures is not None:
                 record["ink"] = pictures.ink(_core(char_box), annotation=from_annotation)
+                if plain_colour and not from_annotation and not unseen and record["ink"] >= NO_INK:
+                    record["own"] = pictures.own_ink(_core(char_box), colour, strength)
 
     # ---- pass 2: characters of different text commands printed on the same spot ("contested")
     contested: set[int] = set()
@@ -416,7 +520,7 @@ def trace_page(page: Any, number: int) -> PageTrace:
         cores = {}
         for index, record in enumerate(records):
             char = record["char"]
-            if char.char.isspace() or record["annotation"]:
+            if record.get("neutral") or record["annotation"]:
                 continue
             cores[index] = _core(char.bbox)
             grid[(int((char.bbox[0] + char.bbox[2]) / 24), int((char.bbox[1] + char.bbox[3]) / 24))].append(index)
@@ -432,22 +536,27 @@ def trace_page(page: Any, number: int) -> PageTrace:
                         records[index]["rivals"].append(theirs.seqno)
                         records[other]["rivals"].append(records[index]["char"].seqno)
 
-    # ---- pass 3: a run of text that left ink, but hardly any (pale grey on white, 6% opacity)
+    # ---- pass 3: fonts that draw one shape for every character
+    same_shape_fonts = _fonts_drawn_as_one_shape(records, pictures) if pictures is not None and drawn_fonts else set()
+    # Runs of text whose colour is not a plain colour (a pattern): pale is then judged by the ink of the run as a whole.
     faint_spans: set[int] = set()
     if pictures is not None:
         by_span: dict[int, list[int]] = defaultdict(list)
         for index, record in enumerate(records):
-            if record["char"].char.isspace() or record["annotation"] or index in contested or record["ink"] < NO_INK:
+            if record.get("neutral") or index in contested or record["ink"] < NO_INK:
                 continue
-            if record["char"].size < LARGE_TEXT:  # large pale text (a watermark) is seen
+            # Text of annotations is always judged this way: what is behind it is not known apart from it.
+            if record["annotation"] or not record.get("plain_colour"):
                 by_span[record["span"]].append(record["ink"])
         faint_spans = {span for span, inks in by_span.items() if sorted(inks)[len(inks) // 2] < FAINT_INK}
 
     # ---- pass 4: the verdict
     for index, record in enumerate(records):
         char: TracedChar = record["char"]
-        if not char.char.isspace():
-            if _overlap(char.bbox, visible_area) <= 0:
+        if not record.get("neutral"):
+            centre = (char.bbox[0] + char.bbox[2]) / 2, (char.bbox[1] + char.bbox[3]) / 2
+            # By its middle, not by its area: what counts is where the character stands.
+            if not _contains_point(visible_area, *centre):
                 char.hidden = "off_page"
             elif char.size < MIN_VISIBLE_SIZE:
                 char.hidden = "tiny"
@@ -456,11 +565,23 @@ def trace_page(page: Any, number: int) -> PageTrace:
             elif record["annotation"]:
                 # Text of an annotation. The picture says whether it changed the page at all; the
                 # drawing order says whether it is covered, or the colour of its own background.
-                char.hidden = record["order"] or (None if record["ink"] >= NO_INK else "same_colour")
+                pale = record["ink"] < NO_INK or record["span"] in faint_spans
+                char.hidden = record["order"] or ("same_colour" if pale else None)
+            elif char.font in same_shape_fonts:
+                char.hidden = "not_drawn"
             elif index in contested:
                 char.hidden = _contested_verdict(record, pictures)
-            elif record["ink"] < NO_INK or record["span"] in faint_spans:
+            elif record["ink"] < NO_INK or not record["own"]:
                 char.hidden = _why(record)
+            elif record["order"] in ("covered", "invisible") and pictures.ink(_middle(char.bbox)) < NO_INK:
+                # The drawing order says "covered", the picture shows ink in the character's box. Then
+                # the ink must be in the middle of the box, where only this character's own strokes
+                # are - not at its edge, where a neighbouring line reaches in.
+                char.hidden = _why(record)
+            elif _is_pale(record, pictures, faint_spans):
+                char.hidden = "same_colour"
+            if char.hidden == "same_colour" and char.size >= LARGE_TEXT and record["ink"] >= NO_INK:
+                char.hidden = "pale_large"  # a watermark: left out of the text, and not a finding
         trace.chars.append(char)
 
     _keep_recognised_text(trace, records, pictures)
@@ -500,7 +621,10 @@ def _contested_verdict(record: dict[str, Any], pictures: _Pictures) -> str | Non
     """
     if record["ink"] < NO_INK:
         return _why(record)
-    if record["order"]:
+    # Of the drawing order's verdicts only two are taken: its third, "same colour", assumes white
+    # paper wherever no rectangle was filled, and is wrong on a gradient or a picture. The colour
+    # behind the character is read off the picture further down instead.
+    if record["order"] in ("invisible", "covered"):
         return record["order"]
     if record["under"] is not None and any(rival > record["under"] for rival in record["rivals"]):
         return "covered"
@@ -511,6 +635,69 @@ def _contested_verdict(record: dict[str, Any], pictures: _Pictures) -> str | Non
         if difference < FAINT_INK:
             return "same_colour"
     return None
+
+
+def _is_pale(record: dict[str, Any], pictures: _Pictures, faint_spans: set[int]) -> bool:
+    """Can this text hardly be told from what is behind it?
+
+    Judged by the colour the file gives the text against the colour the picture
+    shows behind it, character by character: one pale run of text may stand
+    partly on a dark banner (readable) and partly on white paper (not). The ink
+    a character leaves is no measure for this - a thin comma in a readable
+    grey leaves less of it than a broad letter in an unreadable one.
+    """
+    if not record.get("plain_colour"):
+        return record["span"] in faint_spans
+    if record["ink"] >= 3 * FAINT_INK:
+        return False  # strong ink: no need to look closer
+    behind = pictures.colour_behind(_core(record["char"].bbox))
+    if behind is None:
+        return False
+    return max(abs(mine - theirs) for mine, theirs in zip(record["colour"], behind, strict=True)) * record["strength"] < FAINT_INK
+
+
+def _fonts_drawn_as_one_shape(records: list[dict[str, Any]], pictures: _Pictures) -> set[str]:
+    """Fonts whose different characters are all drawn as the same shape.
+
+    A font of the kind that draws its own shapes (Type 3) can declare "this is
+    an A" and draw a dot. A font in which eight or more different characters
+    produce one and the same picture says something to a program and nothing
+    to a reader. (A font that draws a different meaningless shape for every
+    letter, or other letters altogether, cannot be told from an honest one
+    without reading the picture; the report says so for every page that uses
+    such a font.)
+    """
+    import numpy
+
+    shapes: dict[str, dict[str, bytes]] = defaultdict(dict)
+    for record in records:
+        char: TracedChar = record["char"]
+        if not char.font.lower().startswith("type3") or record.get("neutral") or record["annotation"] or record["ink"] < NO_INK:
+            continue
+        if char.char in shapes[char.font]:
+            continue
+        area = pictures._pixels(char.bbox)
+        if area is None:
+            continue
+        top, bottom, left, right = area
+        patch = pictures.content_ink[top:bottom, left:right] >= NO_INK
+        rows, columns = numpy.nonzero(patch)
+        if not len(rows):
+            continue
+        # The inked part of the box, reduced to a 6 x 6 grid: the same for the same shape, wherever it stands.
+        inked = patch[rows.min() : rows.max() + 1, columns.min() : columns.max() + 1]
+        ys = numpy.linspace(0, inked.shape[0], 7).astype(int)
+        xs = numpy.linspace(0, inked.shape[1], 7).astype(int)
+        grid = bytes(
+            int(inked[ys[y] : max(ys[y + 1], ys[y] + 1), xs[x] : max(xs[x + 1], xs[x] + 1)].mean() >= 0.5)
+            for y in range(6) for x in range(6)
+        )
+        proportions = bytes([min(int(4 * inked.shape[0] / max(inked.shape[1], 1)), 255)])
+        shapes[char.font][char.char] = grid + proportions
+    return {
+        font for font, by_char in shapes.items()
+        if len(by_char) >= MIN_SAME_SHAPES and len(set(by_char.values())) <= max(len(by_char) // 6, 1)
+    }
 
 
 def _why(record: dict[str, Any]) -> str:
@@ -545,6 +732,16 @@ def _keep_recognised_text(trace: PageTrace, records: list[dict[str, Any]], pictu
         return
     if not trace.scans:
         return
+    # A scan is a picture of a page. A page with a picture behind it and its own typed text on top
+    # (a letterhead, a decorative background) is an ordinary page: invisible text on it is hidden text.
+    first_scan = min(seqno for seqno, _ in trace.scans)
+    typed = sum(
+        1 for record in records
+        if record["char"].hidden is None and not record["char"].char.isspace() and not record["annotation"]
+        and record["char"].seqno > first_scan
+    )
+    if typed > MAX_TYPED_CHARS_ON_SCAN:
+        return
     candidates: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
         char = record["char"]
@@ -558,9 +755,14 @@ def _keep_recognised_text(trace: PageTrace, records: list[dict[str, Any]], pictu
     for members in candidates.values():
         # Judged per run of text, not per character: recognised text rarely sits exactly on the printed letters.
         marked = sum(1 for record in members if pictures.marks_behind(record["char"].bbox) >= SCAN_MARKS)
-        if 2 * marked >= len(members):
-            for record in members:
+        for record in members:
+            if 2 * marked >= len(members):
                 record["char"].hidden, record["char"].ocr = None, True
+            else:
+                # Recognised text where the picture shows nothing (a cleaned margin, a page number that
+                # was erased - or a sentence somebody added). It is not read. See _hidden_indicators
+                # for when it is reported.
+                record["char"].hidden = "blank_scan"
 
 
 def _key(char: str, origin: Any) -> tuple[str, float, float]:
@@ -580,8 +782,12 @@ def _visible_lines(page: Any, trace: PageTrace) -> list[list[tuple[str, float, i
     import pymupdf
 
     verdicts: dict[tuple[str, float, float], list[bool]] = defaultdict(list)
+    # The two views do not always agree on which character a code stands for (fonts that draw their
+    # own shapes). A character the trace knows under another name is then found by its place alone.
+    by_place: dict[tuple[float, float], list[bool]] = defaultdict(list)
     for char in trace.chars:
         verdicts[_key(char.char, char.origin)].append(char.hidden is not None)
+        by_place[_key("", char.origin)[1:]].append(char.hidden is not None)
     try:
         raw = page.get_text("rawdict", flags=pymupdf.TEXTFLAGS_TEXT)
     except Exception as exc:  # noqa: BLE001
@@ -597,6 +803,8 @@ def _visible_lines(page: Any, trace: PageTrace) -> list[list[tuple[str, float, i
                 for char in span.get("chars", []):
                     total += 1
                     queue = verdicts.get(_key(char["c"], char["origin"]))
+                    if queue is None:
+                        queue = by_place.get(_key("", char["origin"])[1:])
                     if not (queue.pop(0) if queue else False):
                         kept.append(char["c"])
                         if not char["c"].isspace():
@@ -669,6 +877,10 @@ def _hidden_indicators(trace: PageTrace) -> list[Indicator]:
             by_reason[reason].append((seqno, text))
 
     for reason, every in by_reason.items():
+        if reason == "pale_large":
+            continue  # a watermark is not read and not reported
+        if reason == "blank_scan" and not any(detect_prompt_injection(text) for _, text in every):
+            continue  # stray recognised text on blank paper: not read, and nothing to report
         words = HIDDEN_WORDS[reason]
         aimed_at_ai = [(seqno, text) for seqno, text in every if detect_prompt_injection(text)]
         if aimed_at_ai:
@@ -756,7 +968,9 @@ def _scan_indicator(trace: PageTrace) -> Indicator | None:
     that stays inside those strips is not reported; a value typed into the body
     of a scan is.
     """
-    if not trace.scans:
+    # "A scan" here means a page of pictures that carries recognised text. A page with a picture
+    # as its background and a few typed lines (a certificate, a cover sheet) is not one.
+    if not trace.scans or not any(char.ocr for char in trace.chars):
         return None
     first_scan = min(seqno for seqno, _ in trace.scans)
     typed = [char for char in trace.chars if char.hidden is None and not char.ocr and not char.char.isspace() and char.seqno > first_scan]
@@ -909,10 +1123,14 @@ def read_pdf(document: Any, data: bytes, now: datetime | None = None) -> tuple[l
     unread: list[int] = []
     order_only: list[int] = []
     scanned: list[int] = []
+    drawn_fonts: list[int] = []
+    workshop = Workshop(document, data)
     for number, page in enumerate(document, start=1):
-        trace = trace_page(page, number)
+        trace = trace_page(page, number, workshop)
         if any(char.ocr for char in trace.chars):
             scanned.append(number)
+        if trace.drawn_fonts and any(not char.char.isspace() for char in trace.chars):
+            drawn_fonts.append(number)
         inspected = number <= MAX_PAGES_INSPECTED and not trace.failed
         page_lines = _visible_lines(page, trace) if (trace.has_hidden or inspected) and not trace.failed else None
         texts.append(_page_text(page, trace, page_lines))
@@ -935,6 +1153,15 @@ def read_pdf(document: Any, data: bytes, now: datetime | None = None) -> tuple[l
         metadata["pages_checked_by_drawing_order_only"] = order_only[:50]
     if scanned:
         metadata["scanned_pages"] = scanned[:50]
+    if drawn_fonts:
+        metadata["pages_with_drawn_fonts"] = drawn_fonts[:50]
+    workshop.close()
+    try:
+        import pymupdf
+
+        pymupdf.TOOLS.store_shrink(100)  # give back what the drawing of this file kept in memory
+    except Exception:  # noqa: BLE001
+        pass
     return texts, found, metadata
 
 

@@ -52,6 +52,12 @@ def reading_caveats(metadata: dict) -> list[str]:
     if metadata.get("pages_not_checked"):
         pages = page_list(metadata["pages_not_checked"])
         caveats.append(f"{pages[0].upper()}{pages[1:]} could not be examined for hidden text.")
+    if metadata.get("pages_with_drawn_fonts"):
+        pages = page_list(metadata["pages_with_drawn_fonts"])
+        caveats.append(
+            f"{pages[0].upper()}{pages[1:]} {'uses' if pages.startswith('page ') else 'use'} a font that draws its own shapes. "
+            "Whether those shapes are the characters the file declares could not be checked."
+        )
     if metadata.get("pages_checked_by_drawing_order_only"):
         pages = page_list(metadata["pages_checked_by_drawing_order_only"])
         caveats.append(f"{pages[0].upper()}{pages[1:]} could only be examined in a simpler way, which misses some ways of hiding text.")
