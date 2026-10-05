@@ -263,7 +263,11 @@ async def claim_pending_approval(session: AsyncSession, investigation_id: uuid.U
     """
     result = await session.execute(
         update(Investigation)
-        .where(Investigation.id == investigation_id, Investigation.approval_status == "pending")
+        .where(
+            Investigation.id == investigation_id,
+            Investigation.approval_status == "pending",
+            Investigation.completed_at.is_(None),  # a failed or expired investigation cannot be decided any more
+        )
         .values(approval_status="deciding")
     )
     await session.commit()

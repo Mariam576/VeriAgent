@@ -1,7 +1,7 @@
 """Who is making this request?
 
 AUTHENTICATION PLACEHOLDER (spec section 36).
-Version 1 trusts an ``X-User-Id`` header so that the rest of the system can be
+This version trusts an ``X-User-Id`` header so that the rest of the system can be
 built around a real "current user" and real ownership checks. Anyone can send
 any value, so this is NOT secure. Before exposing the API beyond your own
 machine, replace ``get_current_user`` with real authentication (for example

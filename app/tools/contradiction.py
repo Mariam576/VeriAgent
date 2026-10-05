@@ -6,7 +6,7 @@ How it works
     different values for one key, that is a contradiction. No LLM is involved
     in the comparison itself, so the result is repeatable and explainable.
 
-What is compared in Version 1
+What is compared
     ``total_amount``        the overall value of a document (contract value, invoice total)
     ``payment_terms_days``  the number of days allowed for payment
 

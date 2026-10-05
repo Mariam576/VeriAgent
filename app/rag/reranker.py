@@ -7,7 +7,7 @@ Concept - why rerank?
     the best ones (RERANK_TOP_K = 4) to the LLM. Fewer, better chunks mean a
     shorter prompt, lower cost and fewer distractions for the model.
 
-Version 1 scoring (simple and free, as the spec suggests):
+Scoring (simple and free, as the spec suggests):
     score = 70% vector similarity + 30% share of query words found in the chunk
     Exact identifiers such as "INV-102" or "Clause 7.3" count double, because
     embeddings are weak at matching exact codes.

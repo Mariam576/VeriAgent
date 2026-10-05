@@ -32,7 +32,7 @@ RISK_ORDER: dict[str, int] = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 # Comparison keys. Evidence items that share one of the first two keys describe
 # the same quantity, so their values can be compared across documents.
-# Version 1 compares exactly these two quantities. Comparing arbitrary
+# The agent compares exactly these two quantities. Comparing arbitrary
 # quantities (line items, quantities, dates) needs matching logic that
 # belongs to the "advanced document comparison" planned for Version 3.
 KEY_TOTAL_AMOUNT = "total_amount"

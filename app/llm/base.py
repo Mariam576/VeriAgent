@@ -116,6 +116,20 @@ def _safe(text: object, limit: int = 300) -> str:
     return redact_secrets(str(text), get_settings())[:limit]
 
 
+def _trace_error(exc: BaseException) -> str:
+    """What the stored trace may say about a failed call.
+
+    When the model's answer does not fit the schema, the error text usually
+    quotes that answer. Model output (which may repeat document text) is never
+    stored in a trace, so for those errors only the kind of error is kept.
+    Transport errors ("429 quota exceeded") keep their redacted message.
+    """
+    name = type(exc).__name__
+    if isinstance(exc, (ValueError, TypeError, KeyError)) or "Parser" in name or "Validation" in name:
+        return f"{name}: the model's output did not fit the expected structure"
+    return f"{name}: {_safe(exc, 200)}"
+
+
 class BaseLLM(ABC):
     provider: str = "base"
     model: str = ""
@@ -215,7 +229,7 @@ class BaseLLM(ABC):
             tracing.record(
                 "llm", purpose or "-", (time.perf_counter() - started) * 1000, provider=self.provider,
                 model=self.model, attempt=attempt, status="failed",
-                error=f"{type(last_error).__name__}: {_safe(last_error, 200)}",
+                error=_trace_error(last_error),
             )
             if attempt < attempts:
                 delay = self._backoff * (2 ** (attempt - 1))

@@ -313,3 +313,76 @@ async def test_a_browser_that_disconnects_mid_stream_leaves_a_resumable_investig
 
     resumed = await client.post(f"/investigations/{investigation_id}/resume", headers=user_headers)
     assert resumed.status_code == 200 and resumed.json()["risk_level"] == "high"
+
+
+# ============================================================ checkpoint clean-up
+async def checkpoint_rows(thread_id: str) -> int:
+    async with get_engine().connect() as conn:
+        return await conn.scalar(text("SELECT count(*) FROM checkpoints WHERE thread_id = :t"), {"t": thread_id})
+
+
+async def test_startup_sweep_removes_orphan_checkpoints_and_expires_abandoned_investigations(client, user_headers, library, monkeypatch):
+    from app.agents import service
+    from app.agents.checkpoint import purge_stale_checkpoints
+    from app.agents.state import initial_state
+
+    settings = get_settings()
+    graph = await service.get_graph()
+    # 1. A paused investigation that is still wanted.
+    waiting = await start_paused(client, user_headers)
+    # 2. A checkpoint whose investigation no longer exists.
+    orphan = str(uuid.uuid4())
+    await graph.ainvoke(
+        initial_state(user_id=str(user_uuid_for(user_headers["X-User-Id"])), investigation_id=orphan, question="hello"),
+        service._config(uuid.UUID(orphan)),
+    )
+    # 3. A paused investigation that nobody decided for longer than the limit.
+    abandoned = await start_paused(client, user_headers)
+    async with get_engine().begin() as conn:
+        await conn.execute(
+            text("UPDATE investigations SET created_at = now() - interval '45 days' WHERE id = :id"),
+            {"id": abandoned["investigation_id"]},
+        )
+    assert await checkpoint_rows(orphan) > 0 and await checkpoint_rows(abandoned["investigation_id"]) > 0
+
+    monkeypatch.setattr(settings, "CHECKPOINT_TTL_DAYS", 30)
+    result = await purge_stale_checkpoints()
+
+    assert result["expired_investigations"] >= 1 and result["deleted_rows"] > 0
+    assert await checkpoint_rows(orphan) == 0
+    assert await checkpoint_rows(abandoned["investigation_id"]) == 0
+    assert await checkpoint_rows(waiting["investigation_id"]) > 0  # still waiting for its decision
+    closed = await detail(client, user_headers, abandoned["investigation_id"])
+    assert closed["status"] == "failed" and "left unfinished for too long" in closed["error"]
+    # The one that is still wanted can be decided as usual.
+    approved = await client.post(
+        f"/investigations/{waiting['investigation_id']}/approve", headers=user_headers, json={"decision": "approve"}
+    )
+    assert approved.status_code == 200
+    late = await client.post(
+        f"/investigations/{abandoned['investigation_id']}/approve", headers=user_headers, json={"decision": "approve"}
+    )
+    assert late.status_code == 409
+
+
+async def test_amounts_are_searched_as_one_term_not_as_groups_of_digits():
+    from app.rag.hybrid import keyword_terms, to_websearch_query
+
+    words, identifiers = keyword_terms("Is the total of 58,000 on invoice INV-102 above 1,250,000.50?")
+    assert identifiers == ["58,000", "inv-102", "1,250,000.50"]
+    assert "000" not in words and "58" not in words
+    assert to_websearch_query(identifiers) == '"58,000" or "inv-102" or "1,250,000.50"'
+    async with get_engine().connect() as conn:
+        match = text("SELECT to_tsvector('english', :doc) @@ websearch_to_tsquery('english', :q)")
+        query = to_websearch_query(["58,000"])
+        assert await conn.scalar(match, {"doc": "Total amount due: £58,000", "q": query}) is True
+        assert await conn.scalar(match, {"doc": "Total amount due: £40,000", "q": query}) is False  # used to match on "000"
+
+
+def test_a_parsing_error_never_puts_model_output_into_the_trace():
+    from app.llm.base import LLMUnavailableError, _trace_error
+
+    raw_completion = "The contract says CONFIDENTIAL: director salary is 250,000"
+    assert raw_completion not in _trace_error(ValueError(f"Could not parse output: {raw_completion}"))
+    assert _trace_error(ValueError("x")) == "ValueError: the model's output did not fit the expected structure"
+    assert _trace_error(LLMUnavailableError("429 quota exceeded")) == "LLMUnavailableError: 429 quota exceeded"

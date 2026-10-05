@@ -5,6 +5,9 @@ __pycache__
 *.pyc
 .pytest_cache
 .env
+.env.*
+!.env.example
+*.bundle
 uploads/*
 !uploads/.gitkeep
 docs

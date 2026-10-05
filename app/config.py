@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     )
 
     APP_NAME: str = "VeriAgent"
-    APP_VERSION: str = "1.0.0"
+    APP_VERSION: str = "2.0.0"
 
     # ------------------------------------------------------------------ LLM
     LLM_PROVIDER: Literal["gemini", "grok", "mock"] = "gemini"
@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     KEEP_CHECKPOINTS: bool = False
     # A run with no progress for this long is treated as interrupted and may be resumed.
     STALE_RUN_SECONDS: int = Field(default=300, ge=0)
+    # An investigation still unfinished after this many days (never decided, never resumed)
+    # is closed as failed and its saved state is deleted. 0 = keep waiting forever.
+    CHECKPOINT_TTL_DAYS: int = Field(default=30, ge=0)
     MAX_QUESTION_CHARS: int = Field(default=2000, ge=10)
 
     # --------------------------------------------------------------- Memory

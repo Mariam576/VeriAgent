@@ -29,7 +29,7 @@ from app.tools.calculator import CALCULATOR_TOOLS
 
 logger = logging.getLogger(__name__)
 
-# Only tools listed here can ever run. Version 1 has calculator tools only:
+# Only tools listed here can ever run. There are calculator tools only:
 # they have no side effects, so no human approval is needed before running them.
 ALLOWED_TOOLS: dict[str, BaseTool] = {tool.name: tool for tool in CALCULATOR_TOOLS}
 

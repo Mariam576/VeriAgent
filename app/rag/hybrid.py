@@ -22,7 +22,9 @@ from app.schemas.investigation import RetrievedChunk
 
 RRF_K = 60  # the constant from the original RRF paper; dampens the effect of rank 1 vs rank 2
 
-_TOKEN = re.compile(r"[A-Za-z0-9]+(?:[-./][A-Za-z0-9]+)*")
+# A grouped amount such as 58,000 or 1,250,000.50 is one term. Split at the comma it would
+# become "58" and "000", and "000" matches almost every amount in every document.
+_TOKEN = re.compile(r"\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|[A-Za-z0-9]+(?:[-./][A-Za-z0-9]+)*")
 _STOPWORDS = frozenset(
     "a an and are as at be by for from has have in is it its of on or that the this to was were what "
     "which who will with does do did any there these those between across about tell me please should "
@@ -32,7 +34,7 @@ MAX_KEYWORD_TERMS = 12
 
 
 def is_identifier(term: str) -> bool:
-    """Codes such as INV-102, PO-4421, 7.3 or Contract-2026-004: digits plus something else."""
+    """Codes such as INV-102, PO-4421, 7.3, Contract-2026-004 or the amount 58,000: digits plus something else."""
     return any(char.isdigit() for char in term) and not term.isdigit()
 
 
@@ -55,7 +57,7 @@ def to_websearch_query(terms: list[str]) -> str:
 
     Each term is quoted, so an identifier like inv-102 is searched as the exact
     phrase "inv-102" and not as two unrelated words. Terms contain only
-    letters, digits and - . / (see ``_TOKEN``), and the string is still sent
+    letters, digits and - . / , (see ``_TOKEN``), and the string is still sent
     as a bound parameter, never pasted into SQL.
     """
     return " or ".join(f'"{term}"' for term in terms)

@@ -62,6 +62,12 @@ async def database():
     async with get_session_factory()() as session:
         await session.execute(delete(User).where(User.name.like(f"test-{RUN_ID}-%")))
         await session.commit()
+    # Paused test investigations leave checkpoints behind; their rows are gone now, so sweep them.
+    from app.agents.checkpoint import close_checkpointer, get_checkpointer, purge_stale_checkpoints
+
+    await get_checkpointer()
+    await purge_stale_checkpoints()
+    await close_checkpointer()
     await dispose_engine()
 
 
