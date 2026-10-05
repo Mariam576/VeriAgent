@@ -45,8 +45,14 @@ class ContradictionOut(BaseModel):
     type: str
     severity: str
     description: str
-    value_a: float
-    value_b: float
+    key: str = ""
+    # Numbers for amounts and quantities, text for names, reference numbers and dates.
+    value_a: float | None = None
+    value_b: float | None = None
+    unit_a: str | None = None
+    unit_b: str | None = None
+    text_a: str | None = None
+    text_b: str | None = None
     source_a: str
     source_b: str
     difference: float | None = None

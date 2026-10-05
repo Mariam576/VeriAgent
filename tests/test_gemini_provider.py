@@ -141,7 +141,7 @@ async def test_tool_calls_are_parsed_and_tools_are_declared(gemini):
     assert [(call.name, call.args) for call in calls] == [("calculate_ratio", {"numerator": 58000, "denominator": 40000})]
 
     declared = [d["name"] for tool in fake.requests[0]["tools"] for d in tool["functionDeclarations"]]
-    assert declared == ["calculate_difference", "calculate_percentage_change", "calculate_ratio", "sum_values"]
+    assert declared == ["calculate_difference", "calculate_percentage_change", "calculate_ratio", "sum_values", "multiply_values"]
 
 
 @pytest.mark.parametrize(

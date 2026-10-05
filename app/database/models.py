@@ -158,6 +158,22 @@ class DocumentChunk(Base):
     document: Mapped[Document] = relationship(back_populates="chunks")
 
 
+class DocumentProfileRow(Base):
+    """The key facts of one document in a fixed shape (see app/comparison/profile.py).
+
+    Built the first time a comparison needs it and then reused. ``version``
+    lets a later release rebuild profiles when the way they are built changes.
+    """
+
+    __tablename__ = "document_profiles"
+
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer)
+    built_by: Mapped[str] = mapped_column(String(10))  # llm | rules
+    profile: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class UserMemory(Base):
     """Structured long-term memory: one row per preference of a user (key -> value)."""
 

@@ -33,6 +33,7 @@ from typing import Any
 from app.agents.graph import build_investigation_graph, recursion_limit
 from app.agents.nodes import AgentDeps
 from app.agents.state import initial_state
+from app.comparison.store import MemoryProfileSource, ProfileSource
 from app.config import Settings, get_settings
 from app.embeddings.base import EmbeddingProvider
 from app.evaluation.corpus import Corpus, InMemoryRetriever
@@ -69,8 +70,15 @@ REPORT_LINES: list[tuple[str, str, str, str]] = [
 class EvaluationRun:
     """Runs cases against one LLM and one way of searching the documents."""
 
-    def __init__(self, llm: BaseLLM, settings: Settings, retrievers: dict[str, tuple[Retriever, str]]) -> None:
+    def __init__(
+        self, llm: BaseLLM, settings: Settings, retrievers: dict[str, tuple[Retriever, str]],
+        profiles: ProfileSource | None = None,
+    ) -> None:
         self._llm = llm
+        # With the in-memory search each corpus gets its own profile source (built in run_case);
+        # with PostgreSQL one store serves all of them.
+        self._profiles = profiles
+        self._memory_profiles: dict[str, ProfileSource] = {}
         # No memory, and (see run_case) no pause: every case stands alone and runs to the end.
         # Human approval stays "enabled" so the report still says when a person should decide.
         self._settings = settings.model_copy(update={"ENABLE_HUMAN_APPROVAL": True, "ENABLE_MEMORY": False})
@@ -79,8 +87,11 @@ class EvaluationRun:
     async def run_case(self, case: EvalCase) -> CaseResult:
         corpus = corpora()[case.corpus]
         retriever, user_id = self._retrievers[case.corpus]
+        profiles = self._profiles
+        if profiles is None and isinstance(retriever, InMemoryRetriever):
+            profiles = self._memory_profiles.setdefault(case.corpus, MemoryProfileSource(retriever.chunks, self._llm))
         graph = build_investigation_graph(
-            AgentDeps(llm=self._llm, retriever=retriever, settings=self._settings, pause_for_approval=False)
+            AgentDeps(llm=self._llm, retriever=retriever, settings=self._settings, pause_for_approval=False, profiles=profiles)
         )
         state = initial_state(user_id=user_id, investigation_id=f"eval-{case.id}", question=case.question)
         started = time.perf_counter()
@@ -238,8 +249,13 @@ async def run_evaluation(
     names = {case.corpus for case in cases}
     llm = get_llm()
     user_ids: list[uuid.UUID] = []
+    profiles: ProfileSource | None = None
     if backend == "postgres":
+        from app.comparison.store import PgProfileStore
+        from app.database.session import get_session_factory
+
         retrievers, user_ids = await postgres_retrievers(settings, names)
+        profiles = PgProfileStore(get_session_factory(), llm)
     else:
         retrievers = memory_retrievers(get_embedding_provider(), settings, names)
 
@@ -251,7 +267,7 @@ async def run_evaluation(
     if not quiet:
         print(f"Running {len(cases)} evaluation case(s) with {header['llm']}...\n", flush=True)
     try:
-        run = EvaluationRun(llm, settings, retrievers)
+        run = EvaluationRun(llm, settings, retrievers, profiles)
         results = await run.run(cases, None if quiet else lambda case, result: print_case(case, result, verbose))
     finally:
         if user_ids:

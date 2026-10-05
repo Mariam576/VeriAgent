@@ -70,7 +70,7 @@ def test_execute_tool_records_a_successful_call():
 
 
 def test_only_allowlisted_tools_can_run():
-    assert set(ALLOWED_TOOLS) == {"calculate_difference", "calculate_percentage_change", "calculate_ratio", "sum_values"}
+    assert set(ALLOWED_TOOLS) == {"calculate_difference", "calculate_percentage_change", "calculate_ratio", "sum_values", "multiply_values"}
     record = execute_tool("delete_all_documents", {})
     assert record.status == "rejected"
     assert "allowlist" in record.error

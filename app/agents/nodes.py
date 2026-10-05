@@ -10,7 +10,9 @@ Where the LLM is used, and where it is not:
     retrieve               no LLM: embeddings + pgvector + reranker
     extract_evidence       LLM   (structured output)   fallback: rules
                            + code verifies every fact against its source chunk
-    detect_contradictions  no LLM: typed comparison
+    detect_contradictions  no LLM in the comparison itself. Document profiles (parties, dates,
+                           line items) are read by the LLM once per document, verified by code
+                           and stored                               fallback: rules
     calculate              no LLM for the arithmetic; the LLM may request extra
                            calculator calls (tool calling), Python validates and runs them
     check_sufficiency      LLM   (structured output)   fallback: rules
@@ -58,6 +60,9 @@ from app.agents.assessment import (
 )
 from app.agents.report import build_report
 from app.agents.state import InvestigationState
+from app.comparison.engine import Cited, ProfileFinding, compare_profiles
+from app.comparison.profile import PROFILED_TYPES
+from app.comparison.store import ProfileSource
 from app.config import Settings
 from app.formatting import key_label
 from app.llm.base import BaseLLM, LLMConfigurationError, LLMError
@@ -74,7 +79,7 @@ from app.memory.profile import with_defaults
 from app.memory.store import MemoryStore
 from app.numbers import normalize_unit
 from app.observability import tracing
-from app.rag.citations import is_grounded, normalize, numbers_not_in_source
+from app.rag.citations import is_grounded, normalize, numbers_not_in_source, quote_in_text
 from app.rag.reranker import select_diverse
 from app.rag.retriever import Retriever, SearchFilters
 from app.schemas.investigation import (
@@ -104,6 +109,10 @@ MAX_FOLLOW_UP_QUERIES = 3
 MAX_EVIDENCE_ITEMS = 40
 MAX_LLM_TOOL_CALLS = 5
 MAX_REVIEW_ROUNDS = 2
+MAX_PROFILED_DOCUMENTS = 6  # one model call per document the first time, so keep the set small
+MAX_PROFILE_EVIDENCE = 24  # evidence items a comparison may add on top of the extracted facts
+# A comparison finding may rest on a total or on payment terms that the evidence already holds under its own key.
+_SAME_FACT = {"document_total": "total_amount", "document_payment_terms": "payment_terms_days"}
 
 _CHUNK_REF = re.compile(r"\bC\d+\b", re.IGNORECASE)
 # Answers such as "none" in a list of missing evidence mean "nothing is missing".
@@ -123,6 +132,8 @@ class AgentDeps:
     pause_for_approval: bool = False
     # Long-term memory. None = the agent runs without memory (unit tests, evaluation).
     memory: MemoryStore | None = None
+    # Document profiles for the detailed comparison. None = only totals and payment terms are compared.
+    profiles: ProfileSource | None = None
 
 
 def traced(name: str) -> Callable[[NodeFunction], NodeFunction]:
@@ -222,6 +233,7 @@ class InvestigationNodes:
         self.settings = deps.settings
         self.pause_for_approval = deps.pause_for_approval and deps.settings.ENABLE_HUMAN_APPROVAL
         self.memory = deps.memory if deps.settings.ENABLE_MEMORY else None
+        self.profiles = deps.profiles if deps.settings.ENABLE_DOCUMENT_COMPARISON else None
 
     # ================================================================ Node 0
     @traced("load_memory")
@@ -529,15 +541,146 @@ class InvestigationNodes:
     # ================================================================ Node 4
     @traced("detect_contradictions")
     async def detect_contradictions(self, state: InvestigationState) -> dict[str, Any]:
+        """Find where the documents disagree. No LLM takes part in any comparison.
+
+        Two sources feed this step:
+        1. the evidence from the search: total amounts and payment terms (app/tools/contradiction.py)
+        2. the document profiles: parties, reference numbers, dates and line items (app/comparison)
+        """
         evidence = [EvidenceItem(**item) for item in state.get("evidence", [])]
         contradictions = find_contradictions(evidence)
-        return {
-            "contradictions": [item.model_dump() for item in contradictions],
-            "events": [
-                event("detect_contradictions", "Checking contradictions..."),
-                event("detect_contradictions", f"{len(contradictions)} contradiction(s) detected."),
-            ],
-        }
+        update: dict[str, Any] = {"events": [event("detect_contradictions", "Checking contradictions...")]}
+
+        if self.profiles is not None and state.get("analysis", {}).get("task_type") == "document_investigation":
+            detailed = await self._compare_documents(state, evidence, update)
+            contradictions += [
+                item.model_copy(update={"id": f"X{len(contradictions) + index}"})
+                for index, item in enumerate(detailed, start=1)
+            ]
+
+        update["contradictions"] = [item.model_dump() for item in contradictions]
+        update["events"].append(event("detect_contradictions", f"{len(contradictions)} contradiction(s) detected."))
+        return update
+
+    async def _compare_documents(
+        self, state: InvestigationState, evidence: list[EvidenceItem], update: dict[str, Any]
+    ) -> list[Contradiction]:
+        """Compare the profiles of the documents this investigation is about.
+
+        Every finding must be citable: each value it rests on is turned into an
+        evidence item that points at the chunk containing its quote. A finding
+        with a value that cannot be found again in the stored text is dropped.
+        """
+        assert self.profiles is not None
+        retrieved = [RetrievedChunk(**chunk) for chunk in state.get("retrieved_documents", [])]
+        document_ids = list(dict.fromkeys(
+            chunk.document_id for chunk in retrieved if chunk.document_type in PROFILED_TYPES
+        ))[:MAX_PROFILED_DOCUMENTS]
+        if not document_ids:
+            return []
+        earlier = [Contradiction(**item) for item in state.get("contradictions", []) if item.get("origin") == "profile"]
+        if set(document_ids) == set(state.get("compared_documents", [])):
+            return earlier  # same documents as in the previous round: the comparison cannot come out differently
+
+        user_id = state["user_id"]
+        try:
+            batch = await self.profiles.profiles(user_id, document_ids)
+        except LLMConfigurationError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the detailed comparison is an extra; the investigation goes on without it
+            logger.warning("document comparison failed: %s: %s", type(exc).__name__, exc)
+            tracing.record("error", "comparison", error=type(exc).__name__)
+            update["limitations"] = [
+                "The detailed comparison of parties, dates, reference numbers and line items was unavailable for this request."
+            ]
+            return earlier
+        if batch.llm_calls:
+            update["llm_calls"] = batch.llm_calls
+        if batch.used_rules:
+            update["used_fallback"] = True
+            update["limitations"] = [
+                "The language model was unavailable while reading the document details (parties, dates, line items); "
+                "only common layouts were understood."
+            ]
+
+        findings = compare_profiles(batch.profiles)
+        added_evidence = 0
+        page_cache: dict[tuple[str, int], list[RetrievedChunk]] = {}
+
+        async def locate(cited: Cited) -> RetrievedChunk | None:
+            """The chunk that contains the quoted words: an already retrieved one if possible."""
+            def holds(chunk: RetrievedChunk) -> bool:
+                return chunk.document_id == cited.document_id and chunk.page == cited.page and quote_in_text(cited.quote, chunk.text, 2)
+
+            known = next((chunk for chunk in retrieved if holds(chunk)), None)
+            if known is not None:
+                return known
+            slot = (cited.document_id, cited.page)
+            if slot not in page_cache:
+                page_cache[slot] = await self.profiles.page_chunks(user_id, cited.document_id, cited.page)  # type: ignore[union-attr]
+            return next((chunk for chunk in page_cache[slot] if holds(chunk)), None)
+
+        def existing(cited: Cited) -> EvidenceItem | None:
+            same_as = _SAME_FACT.get(cited.key)
+            for item in evidence:
+                if item.document_id != cited.document_id:
+                    continue
+                same_words = normalize(item.quote) == normalize(cited.quote)
+                if item.key == cited.key and same_words:
+                    return item
+                # A line that the fact extraction already took from the same words: one evidence item, not two.
+                if same_words and cited.value_number is not None and item.value_number is not None \
+                        and abs(item.value_number - cited.value_number) < 0.005:
+                    return item
+                if same_as and item.key == same_as and item.value_number is not None and cited.value_number is not None \
+                        and abs(item.value_number - cited.value_number) < 0.005:
+                    return item
+            return None
+
+        results: list[Contradiction] = []
+        for finding in findings:
+            located = []
+            for cited in finding.cited:
+                item = existing(cited)
+                chunk = None if item is not None else await locate(cited)
+                if item is None and chunk is None:
+                    break
+                located.append((cited, item, chunk))
+            new_items = sum(1 for _, item, _ in located if item is None)
+            if len(located) != len(finding.cited) or added_evidence + new_items > MAX_PROFILE_EVIDENCE:
+                logger.info("comparison_finding_dropped type=%s reason=not_citable", finding.type)
+                continue
+
+            evidence_ids = []
+            for cited, item, chunk in located:
+                if item is None:
+                    assert chunk is not None
+                    if all(known.chunk_id != chunk.chunk_id for known in retrieved):
+                        chunk = chunk.model_copy(update={"ref": f"C{len(retrieved) + 1}"})
+                        retrieved.append(chunk)
+                    else:
+                        chunk = next(known for known in retrieved if known.chunk_id == chunk.chunk_id)
+                    item = EvidenceItem(
+                        id=f"E{len(evidence) + 1}", claim=cited.claim[:400], key=cited.key,
+                        value_number=cited.value_number, unit=cited.unit, quote=cited.quote[:400], extracted_by="profile",
+                        chunk_id=chunk.chunk_id, chunk_ref=chunk.ref, document_id=chunk.document_id,
+                        filename=chunk.filename, document_type=chunk.document_type, page=chunk.page,
+                    )
+                    evidence.append(item)
+                    added_evidence += 1
+                if item.id not in evidence_ids:
+                    evidence_ids.append(item.id)
+            results.append(_as_contradiction(finding, evidence_ids))
+
+        tracing.record(
+            "comparison", "profiles", documents=[profile.filename for profile in batch.profiles],
+            built_by_model=batch.llm_calls, findings=[finding.type for finding in findings], kept=len(results),
+        )
+        update["compared_documents"] = document_ids
+        update["evidence"] = [item.model_dump() for item in evidence]
+        update["retrieved_documents"] = [chunk.model_dump() for chunk in retrieved]
+        update["events"].append(event("detect_contradictions", "Comparing parties, dates and line items..."))
+        return results
 
     # ================================================================ Node 5
     @traced("calculate")
@@ -570,14 +713,29 @@ class InvestigationNodes:
 
         # --- Part 1: calculations every numeric contradiction needs. Chosen by code, run by the tool.
         for item in contradictions:
-            if item.type in ("unit_mismatch", "internal_inconsistency"):
-                continue  # different currencies cannot be subtracted; one-document notes need no maths
+            if not item.is_numeric:
+                continue  # names and dates, different currencies, one-document notes: nothing to subtract
             label = key_label(item.key)
+            within_one_document = item.source_a == item.source_b
+            # Side A of a one-document check is a value that has to be worked out first.
+            if item.operation == "sum" and item.operands:
+                worked_out = run("sum_values", {"values": item.operands}, f"sum of the line items on {item.source_a}", "system")
+                item.value_a = worked_out.result if worked_out.result is not None else item.value_a
+            elif item.operation == "multiply" and len(item.operands) == 2:
+                worked_out = run(
+                    "multiply_values", {"value_a": item.operands[0], "value_b": item.operands[1]},
+                    f"quantity x unit price on {item.source_a}", "system",
+                )
+                item.value_a = worked_out.result if worked_out.result is not None else item.value_a
             difference = run(
                 "calculate_difference", {"value_a": item.value_b, "value_b": item.value_a},
-                f"{label}: {item.source_b} minus {item.source_a}", "system",
+                f"{label}: stated value minus calculated value ({item.source_a})" if within_one_document
+                else f"{label}: {item.source_b} minus {item.source_a}",
+                "system",
             )
             item.difference = difference.result
+            if within_one_document:
+                continue  # a percentage of a document's own arithmetic says nothing
             change = run(
                 "calculate_percentage_change", {"old": item.value_a, "new": item.value_b},
                 f"{label}: percentage change from {item.source_a} to {item.source_b}", "system",
@@ -945,6 +1103,15 @@ class InvestigationNodes:
         if limitations:
             update["limitations"] = limitations
         return update
+
+
+def _as_contradiction(finding: ProfileFinding, evidence_ids: list[str]) -> Contradiction:
+    return Contradiction(
+        id="X0", type=finding.type, key=finding.key, severity=finding.severity, description=finding.description,
+        value_a=finding.value_a, value_b=finding.value_b, unit_a=finding.unit_a, unit_b=finding.unit_b,
+        text_a=finding.text_a, text_b=finding.text_b, source_a=finding.source_a, source_b=finding.source_b,
+        evidence_ids=evidence_ids, origin="profile", operands=finding.operands, operation=finding.operation,
+    )
 
 
 def _parse_decision(decision: Any) -> tuple[dict[str, Any] | None, str]:

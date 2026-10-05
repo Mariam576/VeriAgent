@@ -338,10 +338,13 @@ def result_panel(api: ApiClient) -> None:
             with st.expander(f"{plain(item['severity'].upper())} · {plain(item['description'])}"):
                 st.markdown(f"**Finding:** {plain(item['description'])}")
                 st.markdown(f"**Risk:** {plain(item['severity'].capitalize())}")
-                st.markdown(
-                    f"**Values:** {plain(item['source_a'])}: {plain(amount(item['value_a']))} · "
-                    f"{plain(item['source_b'])}: {plain(amount(item['value_b']))}"
-                )
+                side_a = item.get("text_a") if item.get("value_a") is None else amount(item["value_a"])
+                side_b = item.get("text_b") if item.get("value_b") is None else amount(item["value_b"])
+                if side_a is not None and side_b is not None:
+                    st.markdown(
+                        f"**Values:** {plain(item['source_a'])}: {plain(side_a)} · "
+                        f"{plain(item['source_b'])}: {plain(side_b)}"
+                    )
                 if item.get("difference") is not None:
                     change = f" ({amount(item['percentage_change'])}%)" if item.get("percentage_change") is not None else ""
                     st.markdown(f"**Difference (calculated by a tool):** {plain(amount(item['difference']) + change)}")

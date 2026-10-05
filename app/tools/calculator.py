@@ -69,4 +69,10 @@ def sum_values(values: list[float]) -> float:
     return _to_float(sum((_to_decimal(value) for value in values), Decimal(0)))
 
 
-CALCULATOR_TOOLS = [calculate_difference, calculate_percentage_change, calculate_ratio, sum_values]
+@tool
+def multiply_values(value_a: float, value_b: float) -> float:
+    """Return value_a times value_b, for example a quantity times a unit price."""
+    return _to_float(_to_decimal(value_a) * _to_decimal(value_b))
+
+
+CALCULATOR_TOOLS = [calculate_difference, calculate_percentage_change, calculate_ratio, sum_values, multiply_values]

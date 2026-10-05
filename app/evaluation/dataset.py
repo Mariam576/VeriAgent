@@ -2,7 +2,8 @@
 
 Categories (spec section 41): retrieval, contradiction, calculation, missing
 evidence, prompt injection, plus two "general" cases that must not search at
-all. Expected values were worked out by hand from the documents, not copied
+all. Version 3 adds "comparison": the checks on parties, reference numbers,
+dates and line items (app/comparison). Expected values were worked out by hand from the documents, not copied
 from the agent's output.
 
 Adding a case: add a corpus if you need new documents, then append an
@@ -24,14 +25,14 @@ class ExpectedCall:
     """A calculator call that must happen, with the arguments and the result it must have."""
 
     tool_name: str
-    arguments: dict[str, float]
+    arguments: dict[str, Any]  # numbers, or a tuple of numbers for sum_values
     result: float
 
 
 @dataclass(frozen=True)
 class EvalCase:
     id: str
-    category: str  # retrieval | contradiction | calculation | missing_evidence | prompt_injection | general
+    category: str  # retrieval | contradiction | comparison | calculation | missing_evidence | prompt_injection | general
     corpus: str
     question: str
     statuses: tuple[str, ...] = ()  # acceptable report statuses
@@ -216,6 +217,108 @@ def corpora() -> dict[str, Corpus]:
                 ],
             ),
             Corpus(
+                "wrong_supplier",
+                [
+                    _MAINTENANCE_CONTRACT,
+                    _doc(
+                        "Invoice_355.txt",
+                        """INVOICE Invoice No. INV-355. Invoice date: 12 March 2026. From: Redbridge Lift Services
+                        Ltd. To: Harlow Print Works Ltd. Contract reference: MC-2026-011. Lift maintenance,
+                        annual. Total amount due: £40,000. Payment terms: 30 days from the date of invoice.
+                        Please note our new bank details below.""",
+                    ),
+                ],
+            ),
+            Corpus(
+                "wrong_reference",
+                [
+                    _MAINTENANCE_CONTRACT,
+                    _doc(
+                        "Invoice_356.txt",
+                        """INVOICE Invoice No. INV-356. Invoice date: 12 March 2026. From: Redbridge Lifts Ltd.
+                        To: Harlow Print Works Ltd. Contract reference: MC-2026-019. Lift maintenance, annual.
+                        Total amount due: £40,000. Payment terms: 30 days from the date of invoice.""",
+                    ),
+                ],
+            ),
+            Corpus(
+                "short_names",
+                [
+                    _MAINTENANCE_CONTRACT,
+                    _doc(
+                        "Invoice_357.txt",
+                        """INVOICE Invoice No. INV-357. Invoice date: 12 March 2026. From: REDBRIDGE LIFTS LIMITED.
+                        To: Harlow Print Works. Contract reference: MC 2026/011. Lift maintenance, annual.
+                        Total amount due: £40,000. Payment terms: 30 days from the date of invoice.""",
+                    ),
+                ],
+            ),
+            Corpus(
+                "before_term",
+                [
+                    _doc(
+                        "Cleaning_Contract.txt",
+                        """CLEANING CONTRACT Contract No. CC-2026-005. This contract is made on 10 January 2026
+                        between Aldgate Storage Ltd (the "Client") and Fenwick Cleaning Services Ltd (the
+                        "Supplier"). 2.1 This contract starts on 1 March 2026 and continues for twelve months.
+                        3.1 The total contract value is £18,000 for the Term. 3.2 Payment terms: 30 days from
+                        the date of invoice.""",
+                    ),
+                    _doc(
+                        "Invoice_512.txt",
+                        """INVOICE Invoice No. INV-512. Invoice date: 14 January 2026. From: Fenwick Cleaning
+                        Services Ltd. To: Aldgate Storage Ltd. Contract reference: CC-2026-005. Cleaning
+                        services. Total amount due: £18,000. Payment terms: 30 days from the date of invoice.""",
+                    ),
+                ],
+            ),
+            Corpus(
+                "lines_do_not_add_up",
+                [
+                    _doc(
+                        "Invoice_702.txt",
+                        """INVOICE Invoice No. INV-702. Invoice date: 6 May 2026. From: Tolland Electrical Ltd.
+                        To: Aldgate Storage Ltd. Rewiring of loading bay: £4,200. Replacement distribution
+                        board: £1,850. Testing and certification: £600. Total amount due: £7,650. Payment
+                        terms: 30 days from the date of invoice.""",
+                    )
+                ],
+            ),
+            Corpus(
+                "duplicate_invoices",
+                [
+                    _doc(
+                        "Invoice_880.txt",
+                        """INVOICE Invoice No. INV-880. Invoice date: 2 April 2026. From: Tolland Electrical Ltd.
+                        To: Aldgate Storage Ltd. Emergency lighting repairs. Total amount due: £3,150. Payment
+                        terms: 30 days from the date of invoice.""",
+                    ),
+                    _doc(
+                        "Invoice_880_resent.txt",
+                        """INVOICE Invoice No. INV-880. Invoice date: 2 April 2026. From: Tolland Electrical Ltd.
+                        To: Aldgate Storage Ltd. Repairs to emergency lighting, second request for payment.
+                        Total amount due: £3,150. Payment terms: 30 days from the date of invoice.""",
+                    ),
+                ],
+            ),
+            Corpus(
+                "unit_price",
+                [
+                    _doc(
+                        "Purchase_Order_PO-9102.txt",
+                        """PURCHASE ORDER Purchase Order No. PO-9102. Date: 4 May 2026. Buyer: Orchard Foods Ltd.
+                        Supplier: Kestrel Packaging Ltd. 10 pallet wrapping machines at £120 each. Order
+                        total: £1,200. Payment terms: 30 days from the date of invoice.""",
+                    ),
+                    _doc(
+                        "Invoice_3310.txt",
+                        """INVOICE Invoice No. INV-3310. Invoice date: 20 May 2026. From: Kestrel Packaging Ltd.
+                        To: Orchard Foods Ltd. Purchase order: PO-9102. 10 pallet wrapping machines at £135
+                        each. Total amount due: £1,350. Payment terms: 30 days from the date of invoice.""",
+                    ),
+                ],
+            ),
+            Corpus(
                 "injection_inside_invoice",
                 [
                     _CONTRACT_40K,
@@ -285,8 +388,13 @@ CASES: list[EvalCase] = [
     EvalCase(
         "contradiction_invoice_vs_purchase_order", "contradiction", "purchase_order",
         "Does invoice INV-129 match purchase order PO-7781?",
-        statuses=("review_required",), contradictions=("amount_mismatch",),
-        calls=(ExpectedCall(_DIFF, {"value_a": 9020, "value_b": 8200}, 820),),
+        statuses=("review_required",), contradictions=("amount_mismatch", "quantity_mismatch"),
+        calls=(
+            ExpectedCall(_DIFF, {"value_a": 9020, "value_b": 8200}, 820),
+            ExpectedCall(_DIFF, {"value_a": 44, "value_b": 40}, 4),
+        ),
+        answer_contains=("40 x sterilisation pouches cartons",),
+        note="The totals differ because the invoice bills 44 cartons where the order says 40; both must be reported.",
     ),
     EvalCase(
         "contradiction_same_amount_european_format", "contradiction", "european_format",
@@ -302,6 +410,60 @@ CASES: list[EvalCase] = [
         "contradiction_with_approval_on_file", "contradiction", "approved", "Compare the invoice with the maintenance contract.",
         statuses=("review_required",), contradictions=("amount_mismatch",), missing_evidence=False,
         note="The amounts differ, but the signed variation is among the documents, so no evidence is missing.",
+    ),
+    # ------------------------------------------------------------ comparison
+    EvalCase(
+        "comparison_wrong_supplier", "comparison", "wrong_supplier",
+        "Review invoice INV-355 against the maintenance contract.",
+        statuses=("review_required",), risk_levels=("high", "critical"), contradictions=("party_mismatch",),
+        sources=(("Maintenance_Contract.txt", 1), ("Invoice_355.txt", 1)),
+        answer_contains=("Redbridge Lift Services Ltd", "Redbridge Lifts Ltd"), human_review=True,
+        note="Amount and terms agree. The only thing wrong is who is asking for the money: a look-alike supplier name.",
+    ),
+    EvalCase(
+        "comparison_wrong_contract_reference", "comparison", "wrong_reference",
+        "Review invoice INV-356 against the maintenance contract.",
+        statuses=("review_required",), contradictions=("reference_mismatch",),
+        answer_contains=("MC-2026-019", "MC-2026-011"),
+    ),
+    EvalCase(
+        "comparison_same_company_other_spelling", "comparison", "short_names",
+        "Review invoice INV-357 against the maintenance contract.",
+        statuses=("no_issues_found",), risk_levels=("low",), contradictions=(),
+        note="LIMITED for Ltd, a missing legal form and 'MC 2026/011' for 'MC-2026-011' are spelling, not differences.",
+    ),
+    EvalCase(
+        "comparison_invoice_before_term", "comparison", "before_term",
+        "Review invoice INV-512 against the cleaning contract.",
+        statuses=("review_required",), contradictions=("date_outside_term",),
+        answer_contains=("14 January 2026", "1 March 2026"),
+    ),
+    EvalCase(
+        "comparison_lines_do_not_add_up", "comparison", "lines_do_not_add_up",
+        "Check invoice INV-702 for errors.",
+        statuses=("review_required",), contradictions=("line_items_total_mismatch",),
+        calls=(
+            ExpectedCall("sum_values", {"values": (4200, 1850, 600)}, 6650),
+            ExpectedCall(_DIFF, {"value_a": 7650, "value_b": 6650}, 1000),
+        ),
+        answer_contains=("£6,650", "£7,650"),
+        note="One document only. The sum of the lines is worked out by the calculator tool, not by the model.",
+    ),
+    EvalCase(
+        "comparison_duplicate_invoice", "comparison", "duplicate_invoices",
+        "Review these invoices from Tolland Electrical before payment.",
+        statuses=("review_required",), risk_levels=("high", "critical"), contradictions=("duplicate_invoice",),
+        answer_contains=("INV-880",), human_review=True,
+    ),
+    EvalCase(
+        "comparison_unit_price", "comparison", "unit_price",
+        "Does invoice INV-3310 match purchase order PO-9102?",
+        statuses=("review_required",), contradictions=("amount_mismatch", "unit_price_mismatch"),
+        calls=(
+            ExpectedCall(_DIFF, {"value_a": 135, "value_b": 120}, 15),
+            ExpectedCall(_PCT, {"old": 120, "new": 135}, 12.5),
+        ),
+        answer_contains=("£120", "£135"),
     ),
     # ----------------------------------------------------------- calculation
     EvalCase(

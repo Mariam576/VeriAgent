@@ -54,6 +54,10 @@ class CaseResult:
 
 
 def _close(a: Any, b: Any) -> bool:
+    if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):  # sum_values takes a list of numbers
+        if not isinstance(a, (list, tuple)) or not isinstance(b, (list, tuple)) or len(a) != len(b):
+            return False
+        return all(_close(x, y) for x, y in zip(a, b))
     try:
         return abs(float(a) - float(b)) <= TOLERANCE
     except (TypeError, ValueError):

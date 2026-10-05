@@ -41,6 +41,7 @@ from app.agents.graph import build_investigation_graph, recursion_limit
 from app.agents.nodes import STAGE_LABELS, AgentDeps
 from app.agents.report import findings_for_storage, render_report
 from app.agents.state import initial_state
+from app.comparison.store import get_profile_store, reset_profile_store
 from app.config import get_settings
 from app.database import repositories
 from app.database.models import Investigation, User
@@ -84,6 +85,7 @@ async def get_graph() -> CompiledStateGraph:
                 settings=settings,
                 pause_for_approval=True,  # still subject to ENABLE_HUMAN_APPROVAL
                 memory=get_memory_store(),  # still subject to ENABLE_MEMORY
+                profiles=get_profile_store(),  # still subject to ENABLE_DOCUMENT_COMPARISON
             )
             _graph = build_investigation_graph(deps, checkpointer=await get_checkpointer())
     return _graph
@@ -93,6 +95,7 @@ def reset_graph() -> None:
     """Forget the built graph (used at shutdown and by tests)."""
     global _graph
     _graph = None
+    reset_profile_store()
 
 
 def _config(investigation_id: uuid.UUID) -> dict[str, Any]:

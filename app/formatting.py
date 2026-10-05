@@ -11,6 +11,10 @@ _CURRENCY_CODES = {"PKR", "AED", "SAR", "CAD", "AUD", "CHF", "CNY", "SGD", "ZAR"
 _KEY_LABELS = {
     "total_amount": "total amount",
     "payment_terms_days": "payment terms",
+    "document_total": "total amount",
+    "document_subtotal": "subtotal",
+    "document_payment_terms": "payment terms",
+    "document_date": "date",
 }
 
 

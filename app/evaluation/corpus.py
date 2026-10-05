@@ -87,6 +87,11 @@ class InMemoryRetriever:
             )
             self._chunks.append((record, vector))
 
+    @property
+    def chunks(self) -> list[RetrievedChunk]:
+        """Every stored chunk (the document comparison reads whole pages, not search results)."""
+        return [chunk for chunk, _ in self._chunks]
+
     def add_file(self, path: Path, document_type: str | None = None) -> None:
         pages = load_pages(path.read_bytes(), path.suffix.lower())
         self.add_text(path.name, [page.text for page in pages], document_type)

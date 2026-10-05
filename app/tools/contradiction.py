@@ -10,9 +10,10 @@ What is compared
     ``total_amount``        the overall value of a document (contract value, invoice total)
     ``payment_terms_days``  the number of days allowed for payment
 
-    Nothing else is compared. Line items, quantities and dates need to be
-    matched to each other first, and guessing that match would produce false
-    alarms.
+    These two come straight from the evidence that the search found. Parties,
+    reference numbers, dates and line items are compared as well, but they
+    need to be matched to each other first; that is the job of the document
+    profiles in ``app/comparison`` (Version 3).
 
 A contradiction is a reason to review, not proof that something is wrong:
 an invoice can legitimately differ from a contract when a signed variation
@@ -72,7 +73,7 @@ def _unit(key: str, items: list[EvidenceItem]) -> str | None:
     return None
 
 
-def _classify(key: str, value_a: float, value_b: float) -> tuple[str, str]:
+def classify_difference(key: str, value_a: float, value_b: float) -> tuple[str, str]:
     """Return (type, severity) for two different values of the same key."""
     difference = abs(value_b - value_a)
     relative = difference / max(abs(value_a), abs(value_b), 1e-9)
@@ -144,7 +145,7 @@ def find_contradictions(evidence: list[EvidenceItem]) -> list[Contradiction]:
                     "values cannot be compared directly."
                 )
             else:
-                kind, severity = _classify(key, value_a, value_b)
+                kind, severity = classify_difference(key, value_a, value_b)
                 description = (
                     f"{source_a} states the {key_label(key)} as {format_value(value_a, unit_a)} but "
                     f"{source_b} states {format_value(value_b, unit_b or unit_a)}."

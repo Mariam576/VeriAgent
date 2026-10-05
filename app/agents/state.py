@@ -60,6 +60,7 @@ class InvestigationState(TypedDict, total=False):
     evidence: list[dict[str, Any]]
     discarded_facts: int  # extracted statements dropped because they were not grounded
     contradictions: list[dict[str, Any]]
+    compared_documents: list[str]  # documents whose profiles the last comparison looked at
     calculations: list[dict[str, Any]]
     tool_selection_done: bool
     sufficiency: dict[str, Any]
@@ -127,6 +128,7 @@ def initial_state(
         evidence=[],
         discarded_facts=0,
         contradictions=[],
+        compared_documents=[],
         calculations=[],
         tool_selection_done=False,
         missing_evidence=[],

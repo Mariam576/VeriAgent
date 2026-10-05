@@ -31,10 +31,10 @@ Severity = Literal["low", "medium", "high"]
 RISK_ORDER: dict[str, int] = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 # Comparison keys. Evidence items that share one of the first two keys describe
-# the same quantity, so their values can be compared across documents.
-# The agent compares exactly these two quantities. Comparing arbitrary
-# quantities (line items, quantities, dates) needs matching logic that
-# belongs to the "advanced document comparison" planned for Version 3.
+# the same quantity, so their values can be compared across documents straight
+# from the retrieved evidence. Everything else that is compared (parties,
+# reference numbers, dates, line items) first has to be matched between the
+# documents; that happens on document profiles, see app/comparison.
 KEY_TOTAL_AMOUNT = "total_amount"
 KEY_PAYMENT_TERMS = "payment_terms_days"
 KEY_OTHER = "other"
@@ -67,7 +67,8 @@ class EvidenceItem(BaseModel):
     value_number: float | None = None
     unit: str | None = None
     quote: str = ""
-    extracted_by: Literal["llm", "rules"] = "llm"
+    # llm / rules: read from a retrieved chunk. profile: a field of a document profile (app/comparison).
+    extracted_by: Literal["llm", "rules", "profile"] = "llm"
     # --- source, copied from the retrieved chunk by code
     chunk_id: str
     chunk_ref: str = ""
@@ -88,21 +89,43 @@ class Calculation(BaseModel):
     requested_by: Literal["system", "llm"] = "system"
 
 
+# Contradiction types whose two sides are not numbers that can be subtracted.
+NOT_ARITHMETIC = ("unit_mismatch", "internal_inconsistency")
+
+
 class Contradiction(BaseModel):
     id: str  # "X1", "X2", ...
-    type: str  # amount_mismatch | payment_terms_mismatch | value_mismatch | unit_mismatch | internal_inconsistency
+    # From the evidence:  amount_mismatch | payment_terms_mismatch | unit_mismatch | internal_inconsistency
+    # From the profiles:  reference_mismatch | party_mismatch | date_outside_term | quantity_mismatch |
+    #                     unit_price_mismatch | unlisted_line_item | line_items_total_mismatch |
+    #                     line_arithmetic_mismatch | duplicate_invoice
+    type: str
     key: str
     severity: Severity
     description: str
-    value_a: float
-    value_b: float
+    # Side A is the reference (contract, purchase order), side B the document checked against it.
+    # Numbers for amounts and quantities; text for names, reference numbers and dates.
+    value_a: float | None = None
+    value_b: float | None = None
     unit_a: str | None = None
     unit_b: str | None = None
+    text_a: str | None = None
+    text_b: str | None = None
     source_a: str
     source_b: str
     difference: float | None = None  # value_b - value_a, filled in by the calculator tool
     percentage_change: float | None = None
     evidence_ids: list[str] = Field(default_factory=list)
+    origin: Literal["evidence", "profile"] = "evidence"
+    # value_a has to be worked out first (the sum of the lines, quantity x price): the calculator
+    # tool does that from these numbers, so the result is recorded like every other calculation.
+    operands: list[float] = Field(default_factory=list)
+    operation: Literal["sum", "multiply"] | None = None
+
+    @property
+    def is_numeric(self) -> bool:
+        """Can a difference be calculated for it?"""
+        return self.value_a is not None and self.value_b is not None and self.type not in NOT_ARITHMETIC
 
 
 class ToolCallRecord(BaseModel):

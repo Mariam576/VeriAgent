@@ -1,4 +1,4 @@
-"""Document endpoints: upload a file, list your files, delete one."""
+"""Document endpoints: upload a file, list your files, read a file's key facts, delete one."""
 
 from __future__ import annotations
 
@@ -14,6 +14,10 @@ from app.database import repositories
 from app.embeddings.factory import get_embedding_provider
 from app.errors import FileTooLarge, NotFound
 from app.rag.ingestion import ingest_document
+from app.comparison.profile import PROFILED_TYPES
+from app.comparison.service import NOT_PROFILED
+from app.comparison.store import get_profile_store
+from app.schemas.comparison import ProfileOut
 from app.schemas.document import DocumentList, DocumentOut
 from app.security.permissions import CurrentUser, DbSession
 from app.security.validation import validate_document_type
@@ -61,6 +65,29 @@ async def list_documents(user: CurrentUser, session: DbSession) -> DocumentList:
         out.chunk_count = chunk_count
         documents.append(out)
     return DocumentList(documents=documents)
+
+
+@router.get("/{document_id}/profile", response_model=ProfileOut)
+async def document_profile(document_id: uuid.UUID, user: CurrentUser, session: DbSession) -> ProfileOut:
+    """The key facts of one document: numbers, parties, dates, totals and line items, each with page and quote.
+
+    Built the first time it is asked for (one model call) and stored after that.
+    """
+    document = await repositories.get_document(session, user.id, document_id)
+    if document is None or document.status != "ready":
+        raise NotFound("Document not found.")
+    out = ProfileOut(document_id=str(document.id), filename=document.filename, document_type=document.document_type)
+    if document.document_type not in PROFILED_TYPES:
+        out.note = NOT_PROFILED
+        return out
+    user_id = str(user.id)
+    await session.rollback()  # release the connection while the model works
+    batch = await get_profile_store().profiles(user_id, [str(document_id)])
+    if batch.profiles:
+        out.profile = batch.profiles[0].model_dump(mode="json")
+        if batch.profiles[0].is_empty:
+            out.note = "None of the usual key facts could be read from this document."
+    return out
 
 
 def _remove_stored_file(upload_dir: str, user_id: uuid.UUID, document_id: uuid.UUID) -> None:

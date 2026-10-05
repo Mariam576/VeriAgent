@@ -17,10 +17,12 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from pydantic import BaseModel
+
 from app.agents import prompts
 from app.formatting import format_value
 from app.llm.base import ToolCallRequest
-from app.numbers import NUMBER_CORE, normalize_unit, parse_number
+from app.patterns import find_amounts, find_payment_terms, sentence_around
 from app.llm.mock_provider import MockLLM
 from app.memory.extraction import mock_memory
 from app.rag.citations import normalize
@@ -40,29 +42,6 @@ from app.schemas.memory import MemoryCandidate
 from app.security.guardrails import UNTRUSTED_CLOSE, dedupe_keep_order
 
 # =========================================================== fact extraction
-# A currency marker directly before or after a number token (see app.numbers for the number formats).
-_NUMBER = NUMBER_CORE + r"(?![\w]|[.,]\d)"
-_MONEY = re.compile(
-    rf"(?P<cur>£|\$|€|₹|\b(?:GBP|USD|EUR|PKR|INR|AED|SAR|Rs\.?))\s?(?P<num>{_NUMBER})"
-    rf"|(?<!\w)(?<!\d[.,])(?P<num2>{_NUMBER})\s?(?P<cur2>GBP|USD|EUR|PKR|INR|AED|SAR)\b",
-    re.IGNORECASE,
-)
-
-# (pattern, priority). A higher priority wins when a document has several candidates.
-_TOTAL_LABELS: list[tuple[re.Pattern[str], int]] = [
-    (re.compile(r"\b(?:grand total|total amount due|amount due|total due|balance due|total payable|invoice total|total invoice (?:amount|value))\b", re.I), 3),
-    (re.compile(r"\b(?:total (?:contract |order |purchase )?(?:value|price|sum|amount|fee|charges?|cost)|contract (?:value|price|sum|amount)|order (?:total|value))\b", re.I), 2),
-    (re.compile(r"(?<![a-z-])total\b", re.I), 1),
-]
-_SUBTOTAL = re.compile(r"sub[\s-]?total", re.I)
-
-_PAYMENT_TERMS = [
-    re.compile(r"payment terms?\b[^.]{0,80}?\b(?P<days>\d{1,3})\s*(?:calendar |working |business )?days", re.I),
-    re.compile(r"\b(?:pay|paid|payable|payment)\b[^.]{0,80}?\bwithin\s+(?P<days>\d{1,3})\s*(?:calendar |working |business )?days", re.I),
-    re.compile(r"\b(?P<days>\d{1,3})\s*days\s+(?:from|of|after)\s+(?:the\s+)?(?:date of\s+)?(?:receipt of\s+)?(?:the\s+)?invoice", re.I),
-    re.compile(r"\bnet\s?(?P<days>\d{1,3})\b", re.I),
-]
-
 _APPROVAL = re.compile(
     r"\b(?:approved|authorised|authorized|signed off)\s+by\b|\bapproval\s+(?:granted|given|confirmed)\b", re.I
 )
@@ -73,29 +52,6 @@ _APPROVAL_REQUIREMENT = re.compile(
     r"\b(?:prior|written)\s+approval\b[^.]{0,80}\b(?:is|are)\s+(?:required|needed|attached)\b",
     re.I,
 )
-
-
-def _currency(match: re.Match[str]) -> str:
-    return normalize_unit(match.group("cur") or match.group("cur2")) or ""
-
-
-def _amount(match: re.Match[str]) -> float | None:
-    readings = parse_number(match.group("num") or match.group("num2"))
-    # For money, "40.000" means forty thousand (the first reading), not forty.
-    return readings[0] if readings else None
-
-
-def _sentence_bounds(text: str, start: int, end: int) -> tuple[int, int]:
-    """Start and end index of the sentence (or line) that contains text[start:end]."""
-    left = max(text.rfind(". ", 0, start), text.rfind("\n", 0, start)) + 1
-    right_candidates = [pos for pos in (text.find(". ", end), text.find("\n", end)) if pos != -1]
-    right = min(right_candidates) if right_candidates else len(text)
-    return left, right
-
-
-def _sentence_around(text: str, start: int, end: int) -> str:
-    left, right = _sentence_bounds(text, start, end)
-    return text[left:right].strip(" .\n")
 
 
 def extract_facts_with_rules(chunk: RetrievedChunk) -> list[tuple[ExtractedFact, int]]:
@@ -110,45 +66,22 @@ def extract_facts_with_rules(chunk: RetrievedChunk) -> list[tuple[ExtractedFact,
     # --- amounts
     labelled: list[tuple[ExtractedFact, int]] = []
     unlabelled: list[tuple[ExtractedFact, int]] = []
-    for match in _MONEY.finditer(text):
-        value = _amount(match)
-        if value is None:
-            continue
-        unit = _currency(match)
-        sentence = _sentence_around(text, match.start(), match.end())
-        # Look only at the words directly before the amount, within the same sentence.
-        sentence_start, _ = _sentence_bounds(text, match.start(), match.end())
-        before = text[max(sentence_start, match.start() - 90) : match.start()]
-        priority = 0
-        if not _SUBTOTAL.search(before):
-            for pattern, level in _TOTAL_LABELS:
-                label = None
-                for label in pattern.finditer(before):
-                    pass  # keep the last (closest) label
-                if label is None:
-                    continue
-                gap = before[label.end():]
-                # The amount must follow the label closely: "total ... is £40,000", "Total due: £58,000".
-                if len(gap) <= 30 and not re.search(r"\d", gap) and not re.search(
-                    r"\b(?:above|exceed\w*|over|under|below|up to|more than|less than|limit|threshold)\b", gap, re.I
-                ):
-                    priority = level
-                    break
-        if priority:
+    for hit in find_amounts(text):
+        if hit.priority:
             labelled.append((
                 ExtractedFact(
                     chunk_ref=chunk.ref,
-                    claim=f"{chunk.filename} states a total amount of {format_value(value, unit)}.",
-                    key=KEY_TOTAL_AMOUNT, value_number=value, unit=unit, quote=sentence,
+                    claim=f"{chunk.filename} states a total amount of {format_value(hit.value, hit.unit)}.",
+                    key=KEY_TOTAL_AMOUNT, value_number=hit.value, unit=hit.unit, quote=hit.sentence,
                 ),
-                priority,
+                hit.priority,
             ))
         elif len(unlabelled) < 4:
             unlabelled.append((
                 ExtractedFact(
                     chunk_ref=chunk.ref,
-                    claim=f"{chunk.filename} lists {format_value(value, unit)}: {sentence[:160]}",
-                    key=KEY_OTHER, value_number=value, unit=unit, quote=sentence,
+                    claim=f"{chunk.filename} lists {format_value(hit.value, hit.unit)}: {hit.sentence[:160]}",
+                    key=KEY_OTHER, value_number=hit.value, unit=hit.unit, quote=hit.sentence,
                 ),
                 0,
             ))
@@ -158,24 +91,22 @@ def extract_facts_with_rules(chunk: RetrievedChunk) -> list[tuple[ExtractedFact,
 
     # --- payment terms
     flattened = re.sub(r"\s+", " ", text)
-    for pattern in _PAYMENT_TERMS:
-        match = pattern.search(flattened)
-        if match:
-            days = float(match.group("days"))
-            facts.append((
-                ExtractedFact(
-                    chunk_ref=chunk.ref,
-                    claim=f"{chunk.filename} states payment terms of {int(days)} days.",
-                    key=KEY_PAYMENT_TERMS, value_number=days, unit="days", quote=match.group(0),
-                ),
-                0,
-            ))
-            break
+    terms = find_payment_terms(flattened)
+    if terms:
+        days, wording = terms
+        facts.append((
+            ExtractedFact(
+                chunk_ref=chunk.ref,
+                claim=f"{chunk.filename} states payment terms of {int(days)} days.",
+                key=KEY_PAYMENT_TERMS, value_number=days, unit="days", quote=wording,
+            ),
+            0,
+        ))
 
     # --- approval requirements ("must not be paid until written approval ...")
     match = _APPROVAL_REQUIREMENT.search(flattened)
     if match:
-        sentence = _sentence_around(flattened, match.start(), match.end())
+        sentence = sentence_around(flattened, match.start(), match.end())
         facts.append((
             ExtractedFact(
                 chunk_ref=chunk.ref,
@@ -188,7 +119,7 @@ def extract_facts_with_rules(chunk: RetrievedChunk) -> list[tuple[ExtractedFact,
     # --- approval statements
     match = _APPROVAL.search(flattened)
     if match:
-        sentence = _sentence_around(flattened, match.start(), match.end())
+        sentence = sentence_around(flattened, match.start(), match.end())
         facts.append((
             ExtractedFact(
                 chunk_ref=chunk.ref,
@@ -275,6 +206,17 @@ def fallback_analysis(question: str, history: list[dict[str, str]] | None = None
 
 # ============================================================== sufficiency
 MISSING_APPROVAL = "Written approval or a signed variation covering the difference(s) between the documents"
+MISSING_SUPPLIER_CONFIRMATION = (
+    "Confirmation that the company on the invoice is the contracted party (for example a signed change-of-name "
+    "or assignment notice)"
+)
+MISSING_REFERENCED_DOCUMENT = "The contract or purchase order that the invoice refers to"
+# Findings that an approval cannot settle: they question which document or which company this is,
+# or the document's own arithmetic. What is missing for them, if anything, is named separately.
+_NOT_A_DEVIATION = {
+    "party_mismatch", "reference_mismatch", "date_outside_term", "duplicate_invoice",
+    "line_items_total_mismatch", "line_arithmetic_mismatch",
+}
 MISSING_APPROVAL_RECORD = "An approval record for this item (for example a signed approval or sign-off)"
 _ASKS_IF_APPROVED = re.compile(r"\b(?:was|were|is|has|have|been|already)\b[^?.]{0,60}\b(?:approved|authori[sz]ed|signed off)\b", re.I)
 MISSING_ANY_EVIDENCE = "No relevant evidence was found in the uploaded documents for this request."
@@ -295,10 +237,18 @@ def fallback_sufficiency(
     missing: list[str] = []
     follow_up: list[str] = []
     has_approval = any(_APPROVAL.search(str(item.get("claim", ""))) for item in evidence)
-    if contradictions and (decision_requested or investigating) and not has_approval:
-        missing.append(MISSING_APPROVAL)
-        follow_up = ["written approval of invoice deviation", "signed variation change order"]
-    elif _ASKS_IF_APPROVED.search(question) and not has_approval:
+    kinds = {str(item.get("type", "")) for item in contradictions}
+    deviations = kinds - _NOT_A_DEVIATION
+    if contradictions and (decision_requested or investigating):
+        if deviations and not has_approval:
+            missing.append(MISSING_APPROVAL)
+            follow_up = ["written approval of invoice deviation", "signed variation change order"]
+        if "party_mismatch" in kinds:
+            missing.append(MISSING_SUPPLIER_CONFIRMATION)
+            follow_up.append("change of name assignment novation notice")
+        if "reference_mismatch" in kinds:
+            missing.append(MISSING_REFERENCED_DOCUMENT)
+    if not missing and _ASKS_IF_APPROVED.search(question) and not has_approval:
         # "Was this invoice approved?" with no approval document: say so, never assume.
         missing.append(MISSING_APPROVAL_RECORD)
         follow_up = ["approved by signature sign-off", "approval record authorisation"]
@@ -440,7 +390,24 @@ def _mock_tool_choice(system: str, user: str, tools: list[Any]) -> list[ToolCall
     return []
 
 
+def _mock_profile(system: str, user: str) -> BaseModel:
+    """The document profile as the rules read it, in the shape the model would answer in."""
+    from app.comparison.llm import to_extraction
+    from app.comparison.rules import build_profile_with_rules
+    from app.rag.loaders import PageText
+
+    context = prompts.read_json_section(user, "CONTEXT") or {}
+    pages = [PageText(chunk.page, chunk.text) for chunk in _parse_chunks(user)]
+    profile = build_profile_with_rules(
+        document_id=str(context.get("document", "")), filename=str(context.get("document", "")),
+        document_type=str(context.get("document_type", "other")), pages=pages,
+    )
+    return to_extraction(profile)
+
+
 def create_mock_llm() -> MockLLM:
+    from app.comparison.llm import ProfileExtraction  # imported here: app.comparison uses this module's prompts
+
     return MockLLM(
         handlers={
             RequestAnalysis: _mock_analysis,
@@ -448,6 +415,7 @@ def create_mock_llm() -> MockLLM:
             SufficiencyAssessment: _mock_sufficiency,
             RiskAssessment: _mock_risk,
             MemoryCandidate: mock_memory,
+            ProfileExtraction: _mock_profile,
         },
         tool_chooser=_mock_tool_choice,
     )

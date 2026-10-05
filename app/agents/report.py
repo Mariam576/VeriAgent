@@ -110,12 +110,22 @@ def needs_human_review(
     )
 
 
+_CALCULATED_SIDE = {
+    "line_items_total_mismatch": "the sum of its line items",
+    "line_arithmetic_mismatch": "quantity x unit price",
+}
+
+
 def _calculation_sentence(contradiction: Contradiction) -> str | None:
     if contradiction.difference is None:
         return None
     unit = contradiction.unit_b or contradiction.unit_a
     amount = format_value(abs(contradiction.difference), unit)
     direction = "above" if contradiction.difference > 0 else "below"
+    if contradiction.source_a == contradiction.source_b:
+        # One document checked against its own arithmetic: side A is the calculated value.
+        calculated = _CALCULATED_SIDE.get(contradiction.type, "the calculated value")
+        return f"{contradiction.source_b}: the stated amount is {amount} {direction} {calculated}."
     sentence = (
         f"Difference in {key_label(contradiction.key)}: {amount}. {contradiction.source_b} is {amount} "
         f"{direction} {contradiction.source_a}"
@@ -201,8 +211,9 @@ def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_pro
 
     contradictions_out = [
         ContradictionOut(
-            id=item.id, type=item.type, severity=item.severity, description=item.description,
-            value_a=item.value_a, value_b=item.value_b, source_a=item.source_a, source_b=item.source_b,
+            id=item.id, type=item.type, severity=item.severity, description=item.description, key=item.key,
+            value_a=item.value_a, value_b=item.value_b, unit_a=item.unit_a, unit_b=item.unit_b,
+            text_a=item.text_a, text_b=item.text_b, source_a=item.source_a, source_b=item.source_b,
             difference=item.difference, percentage_change=item.percentage_change,
             citations=_unique([_cite(by_id[i]) for i in item.evidence_ids if i in by_id]),
         )

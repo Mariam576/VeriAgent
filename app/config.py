@@ -93,6 +93,11 @@ class Settings(BaseSettings):
     # then read from X-Forwarded-For. Without such a proxy a client could fake that header.
     TRUST_PROXY_HEADERS: bool = False
 
+    # ---------------------------------------------------------- Comparison
+    # Compare parties, reference numbers, dates and line items between documents (one extra
+    # model call per document, the first time it takes part in a comparison).
+    ENABLE_DOCUMENT_COMPARISON: bool = True
+
     # --------------------------------------------------------------- Memory
     ENABLE_MEMORY: bool = True
     MEMORY_TOP_K: int = Field(default=3, ge=1, le=10)

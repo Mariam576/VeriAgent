@@ -143,10 +143,11 @@ async def run_graph(
     document_ids: list[str] | None = None,
     memory: InMemoryMemoryStore | None = None,
     user_id: str = "user-1",
+    profiles: Any = None,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
     graph = build_investigation_graph(
-        AgentDeps(llm=llm or create_mock_llm(), retriever=retriever, settings=settings, memory=memory)
+        AgentDeps(llm=llm or create_mock_llm(), retriever=retriever, settings=settings, memory=memory, profiles=profiles)
     )
     state = initial_state(
         user_id=user_id, investigation_id="inv-1", question=question, history=history, document_ids=document_ids

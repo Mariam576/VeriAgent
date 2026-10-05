@@ -94,7 +94,7 @@ def confidence_ceiling(
     documents = {item.document_id for item in evidence}
     score += 0.15 if len(documents) >= 2 else 0.05
     score += 0.15 * (len(evidence) / (len(evidence) + discarded_facts))
-    numeric = [item for item in contradictions if item.type not in ("unit_mismatch", "internal_inconsistency")]
+    numeric = [item for item in contradictions if item.is_numeric]
     if all(item.difference is not None for item in numeric):
         score += 0.10
     score -= min(0.05 * len(missing_evidence), 0.15)
@@ -153,6 +153,9 @@ def known_numbers(
             numbers.add(float(item.value_number))
     for item in contradictions:
         numbers.update(v for v in (item.value_a, item.value_b, item.difference, item.percentage_change) if v is not None)
+        # Descriptions are written by code from verified values (never by the model). They can hold
+        # numbers that are not amounts: the day of a date, a grace period, a reference number.
+        numbers.update(numbers_in_text(item.description))
     for item in calculations:
         if item.result is not None:
             numbers.add(float(item.result))
@@ -212,6 +215,8 @@ def recompute(calculation: Calculation) -> float | None:
             value = Fraction(str(args["numerator"])) / Fraction(str(args["denominator"]))
         elif calculation.tool_name == "sum_values":
             value = sum((Fraction(str(v)) for v in args["values"]), Fraction(0))
+        elif calculation.tool_name == "multiply_values":
+            value = Fraction(str(args["value_a"])) * Fraction(str(args["value_b"]))
         else:
             return None
     except (KeyError, ValueError, ZeroDivisionError):
