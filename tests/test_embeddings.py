@@ -12,11 +12,11 @@ def cosine(a: list[float], b: list[float]) -> float:
     return sum(x * y for x, y in zip(a, b))
 
 
-def test_factory_returns_the_configured_provider():
+def test_factory_returns_the_configured_provider(settings):
     provider = get_embedding_provider()
     assert isinstance(provider, EmbeddingProvider)
-    assert provider.model_id == "hash:384"
-    assert provider.dimension == 384
+    assert provider.model_id == f"hash:{settings.EMBEDDING_DIM}"
+    assert provider.dimension == settings.EMBEDDING_DIM
 
 
 def test_hash_embeddings_are_deterministic_and_normalised():

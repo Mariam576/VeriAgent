@@ -14,10 +14,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api import health
+from app.api import documents, health
 from app.config import get_settings
 from app.database.session import dispose_engine, init_db
+from app.embeddings.base import EmbeddingError
 from app.errors import AppError
+from app.llm.base import LLMConfigurationError, LLMError
 from app.logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -60,6 +62,18 @@ def create_app() -> FastAPI:
             content={"error": {"code": exc.code, "message": exc.message}},
         )
 
+    @app.exception_handler(LLMError)
+    async def handle_llm_error(_: Request, exc: LLMError) -> JSONResponse:
+        code = "llm_not_configured" if isinstance(exc, LLMConfigurationError) else "llm_unavailable"
+        return JSONResponse(status_code=503, content={"error": {"code": code, "message": str(exc)}})
+
+    @app.exception_handler(EmbeddingError)
+    async def handle_embedding_error(_: Request, exc: EmbeddingError) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"code": "embeddings_unavailable", "message": str(exc)}},
+        )
+
     @app.exception_handler(Exception)
     async def handle_unexpected_error(_: Request, exc: Exception) -> JSONResponse:
         # Log everything, tell the client nothing internal.
@@ -70,6 +84,7 @@ def create_app() -> FastAPI:
         )
 
     app.include_router(health.router)
+    app.include_router(documents.router)
     return app
 
 

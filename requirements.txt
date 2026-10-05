@@ -18,7 +18,7 @@ langchain-google-genai>=4.0,<5
 langchain-openai>=1.0,<2
 
 # --- Documents
-pymupdf>=1.24
+pymupdf>=1.24.3
 python-docx>=1.1
 
 # --- Local embeddings (free, runs on your machine)
