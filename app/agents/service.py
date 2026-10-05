@@ -28,7 +28,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import aclosing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from langgraph.errors import GraphRecursionError
@@ -46,7 +46,7 @@ from app.database import repositories
 from app.database.models import Investigation, User
 from app.database.session import get_session_factory
 from app.embeddings.factory import get_embedding_provider
-from app.errors import Conflict, NotFound, ServiceUnavailable, ValidationFailed, safe_error
+from app.errors import Conflict, NotFound, ServiceUnavailable, TooManyRequests, ValidationFailed, safe_error
 from app.llm.factory import get_llm
 from app.memory.semantic import remember_investigation
 from app.memory.store import get_memory_store
@@ -367,6 +367,17 @@ async def stream_investigation(
         owned = await repositories.owned_document_ids(session, user.id, document_ids)
         if owned != set(document_ids):
             raise NotFound("One or more of the selected documents were not found.")
+
+    if settings.MAX_INVESTIGATIONS_PER_DAY:
+        # Every investigation spends model calls. On a public deployment this cap keeps
+        # one account from using up the whole quota.
+        since = datetime.now(timezone.utc) - timedelta(days=1)
+        used = await repositories.count_recent_investigations(session, user.id, since)
+        if used >= settings.MAX_INVESTIGATIONS_PER_DAY:
+            raise TooManyRequests(
+                f"You have reached the limit of {settings.MAX_INVESTIGATIONS_PER_DAY} investigations in 24 hours. "
+                "Try again later."
+            )
 
     investigation = await repositories.create_investigation(session, user.id, question, conversation_id)
     logger.info("investigation_started id=%s user=%s", investigation.id, user.id)

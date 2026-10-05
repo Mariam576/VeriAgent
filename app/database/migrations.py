@@ -55,6 +55,16 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
             "AND report -> 'human_review' IS NULL",
         ],
     ),
+    (
+        "v3_001_user_accounts",
+        [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sub VARCHAR(64)",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT false",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true",
+            "CREATE UNIQUE INDEX IF NOT EXISTS users_google_sub_key ON users (google_sub)",
+        ],
+    ),
 ]
 
 # Any fixed number: it only has to be the same in every API process.

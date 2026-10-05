@@ -46,6 +46,21 @@ class ServiceUnavailable(AppError):
     code = "service_unavailable"
 
 
+class Unauthorized(AppError):
+    status_code = 401
+    code = "unauthorized"
+
+
+class Forbidden(AppError):
+    status_code = 403
+    code = "forbidden"
+
+
+class TooManyRequests(AppError):
+    status_code = 429
+    code = "too_many_requests"
+
+
 class Conflict(AppError):
     status_code = 409
     code = "conflict"

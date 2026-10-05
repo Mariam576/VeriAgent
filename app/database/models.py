@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, Uuid, text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, Uuid, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -34,7 +34,44 @@ class User(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(120))
+    # Stored in lower case. NULL for the placeholder users of AUTH_MODE=dev.
     email: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Argon2 hash, never the password. NULL for accounts that only sign in with Google.
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Google's stable id for the account ("sub"). An email address can change; this cannot.
+    google_sub: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
+    # True once someone proved they own the address (today: by signing in with Google).
+    email_verified: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+
+
+class RefreshToken(Base):
+    """A long-lived sign-in. Only a hash of the token is stored, like a password.
+
+    Tokens rotate: each use replaces the token with a new one of the same
+    ``family_id``. If a token that was already replaced shows up again, someone
+    copied it, and the whole family is revoked.
+    """
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    family_id: Mapped[uuid.UUID] = mapped_column(Uuid, index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AppSecret(Base):
+    """Values the application creates for itself, such as the token signing key."""
+
+    __tablename__ = "app_secrets"
+
+    name: Mapped[str] = mapped_column(String(50), primary_key=True)
+    value: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

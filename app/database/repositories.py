@@ -22,6 +22,7 @@ from app.database.models import (
     Finding,
     Investigation,
     Message,
+    RefreshToken,
     ToolCall,
     TraceEvent,
     User,
@@ -42,6 +43,115 @@ async def get_or_create_user(session: AsyncSession, user_id: uuid.UUID, name: st
     # and requests that need a second one (memory, streaming) could then starve the pool.
     await session.commit()
     return user
+
+
+# ------------------------------------------------------------------ accounts
+async def get_user(session: AsyncSession, user_id: uuid.UUID) -> User | None:
+    user = await session.get(User, user_id)
+    await session.commit()  # hand the connection back (see get_or_create_user)
+    return user
+
+
+async def get_user_by_email(session: AsyncSession, email: str) -> User | None:
+    result = await session.execute(select(User).where(User.email == email.strip().lower()))
+    return result.scalar_one_or_none()
+
+
+async def get_user_by_google_sub(session: AsyncSession, google_sub: str) -> User | None:
+    result = await session.execute(select(User).where(User.google_sub == google_sub))
+    return result.scalar_one_or_none()
+
+
+async def create_account(
+    session: AsyncSession, *, email: str, name: str, password_hash: str | None = None,
+    google_sub: str | None = None, email_verified: bool = False,
+) -> User | None:
+    """Create an account. Returns None when the email address is already taken.
+
+    The unique index on ``email`` decides, not a read beforehand, so two
+    registrations at the same moment cannot both succeed.
+    """
+    statement = (
+        pg_insert(User)
+        .values(
+            id=uuid.uuid4(), email=email.strip().lower(), name=name.strip()[:120], password_hash=password_hash,
+            google_sub=google_sub, email_verified=email_verified, is_active=True,
+        )
+        .on_conflict_do_nothing()
+        .returning(User.id)
+    )
+    user_id = (await session.execute(statement)).scalar_one_or_none()
+    await session.commit()
+    return await session.get(User, user_id) if user_id else None
+
+
+async def store_refresh_token(
+    session: AsyncSession, user_id: uuid.UUID, token_hash: str, expires_at: Any, family_id: uuid.UUID | None = None
+) -> RefreshToken:
+    token = RefreshToken(user_id=user_id, token_hash=token_hash, expires_at=expires_at, family_id=family_id or uuid.uuid4())
+    session.add(token)
+    await session.commit()
+    return token
+
+
+async def use_refresh_token(session: AsyncSession, token_hash: str) -> tuple[RefreshToken | None, bool]:
+    """Spend a refresh token. Returns (token, ok).
+
+    ``ok`` is True only for exactly one caller: the UPDATE that marks the
+    token revoked has ``revoked_at IS NULL`` in its WHERE clause, so if two
+    requests arrive with the same token, the database lets one through.
+    A token that exists but was already spent is returned with ok=False,
+    which is the sign that a copy of it is in someone else's hands.
+    """
+    token = (await session.execute(select(RefreshToken).where(RefreshToken.token_hash == token_hash))).scalar_one_or_none()
+    if token is None:
+        await session.commit()
+        return None, False
+    result = await session.execute(
+        update(RefreshToken)
+        .where(RefreshToken.id == token.id, RefreshToken.revoked_at.is_(None), RefreshToken.expires_at > utcnow())
+        .values(revoked_at=utcnow())
+    )
+    await session.commit()
+    return token, result.rowcount == 1
+
+
+async def revoke_token_family(session: AsyncSession, family_id: uuid.UUID) -> None:
+    await session.execute(
+        update(RefreshToken)
+        .where(RefreshToken.family_id == family_id, RefreshToken.revoked_at.is_(None))
+        .values(revoked_at=utcnow())
+    )
+    await session.commit()
+
+
+async def revoke_all_refresh_tokens(session: AsyncSession, user_id: uuid.UUID) -> None:
+    """Sign the user out everywhere (after a password change, or when an account is taken back)."""
+    await session.execute(
+        update(RefreshToken)
+        .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
+        .values(revoked_at=utcnow())
+    )
+    await session.commit()
+
+
+async def delete_expired_refresh_tokens(session: AsyncSession) -> int:
+    result = await session.execute(delete(RefreshToken).where(RefreshToken.expires_at < utcnow()))
+    await session.commit()
+    return result.rowcount
+
+
+async def count_recent_investigations(session: AsyncSession, user_id: uuid.UUID, since: Any) -> int:
+    count = await session.scalar(
+        select(func.count(Investigation.id)).where(Investigation.user_id == user_id, Investigation.created_at >= since)
+    )
+    return int(count or 0)
+
+
+async def delete_user(session: AsyncSession, user_id: uuid.UUID) -> None:
+    """Delete an account and, through ON DELETE CASCADE, everything that belongs to it."""
+    await session.execute(delete(User).where(User.id == user_id))
+    await session.commit()
 
 
 # ----------------------------------------------------------------- documents

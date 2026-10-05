@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 
 from app.agents.checkpoint import close_checkpointer, get_checkpointer, purge_stale_checkpoints
 from app.agents.service import reset_graph
-from app.api import chat, documents, health, investigations, memory
+from app.api import auth, chat, documents, health, investigations, memory
 from app.api.sse import error_payload
 from app.config import get_settings
 from app.database.session import dispose_engine, init_db
@@ -80,6 +80,7 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=status_code, content={"error": payload})
 
     app.include_router(health.router)
+    app.include_router(auth.router)
     app.include_router(documents.router)
     app.include_router(investigations.router)
     app.include_router(chat.router)

@@ -1,7 +1,7 @@
 """Run the demo investigation from spec section 57 against a running API.
 
-    docker compose exec api python -m scripts.run_demo
-    docker compose exec api python -m scripts.run_demo --with-injection
+    docker compose exec api python -m scripts.run_demo --email you@example.com --register
+    docker compose exec api python -m scripts.run_demo --email you@example.com --with-injection
     python -m scripts.run_demo --base-url http://localhost:8000 --question "Compare the payment terms across these documents."
 
 It uploads the sample contract, invoice and policy, asks the question and
@@ -24,7 +24,9 @@ the finished report instead.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -66,6 +68,31 @@ def stream_investigation(client: httpx.Client, question: str) -> tuple[dict | No
     return (report, "") if report else (None, "the stream ended without a report")
 
 
+def sign_in(client: httpx.Client, args: argparse.Namespace) -> str:
+    """Put the right credentials on the client. Returns "" or what went wrong."""
+    config = client.get("/auth/config").json()
+    if config["auth_mode"] == "dev":
+        client.headers["X-User-Id"] = args.user  # development mode: a name is enough
+        return ""
+    email = args.email or os.environ.get("VERIAGENT_EMAIL", "")
+    password = args.password or os.environ.get("VERIAGENT_PASSWORD", "")
+    if not email or not password:
+        if not sys.stdin.isatty():
+            return "This server needs a sign-in. Pass --email and --password (add --register to create the account)."
+        email = email or input("Email: ").strip()
+        password = password or getpass.getpass("Password: ")
+    credentials = {"email": email, "password": password}
+    response = client.post("/auth/login", json=credentials)
+    if response.status_code == 401 and args.register:
+        response = client.post("/auth/register", json={**credentials, "signup_code": args.signup_code})
+    if response.status_code not in (200, 201):
+        hint = "" if args.register else " (add --register to create the account)"
+        return f"Sign-in failed: {response.json().get('error', {}).get('message', response.text)}{hint}"
+    client.headers["Authorization"] = f"Bearer {response.json()['access_token']}"
+    print(f"Signed in as {response.json()['user']['email']}")
+    return ""
+
+
 def print_report(report: dict) -> None:
     print("=" * 78)
     print(report["answer_text"])
@@ -97,7 +124,11 @@ def ask_decision(args: argparse.Namespace) -> dict | None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the VeriAgent demo investigation.")
     parser.add_argument("--base-url", default="http://localhost:8000")
-    parser.add_argument("--user", default="demo-user", help="Value for the X-User-Id header.")
+    parser.add_argument("--user", default="demo-user", help="AUTH_MODE=dev only: value for the X-User-Id header.")
+    parser.add_argument("--email", help="Account to sign in with (or set VERIAGENT_EMAIL).")
+    parser.add_argument("--password", help="Its password (or set VERIAGENT_PASSWORD; asked for when omitted).")
+    parser.add_argument("--register", action="store_true", help="Create the account if it does not exist yet.")
+    parser.add_argument("--signup-code", default=None, help="The sign-up code, if the server asks for one.")
     parser.add_argument("--question", default=DEFAULT_QUESTION)
     parser.add_argument("--with-injection", action="store_true", help="Also upload a note containing a prompt-injection attempt.")
     parser.add_argument("--no-stream", action="store_true", help="Wait for the result instead of showing live progress.")
@@ -111,17 +142,19 @@ def main() -> int:
 
         make_samples()
 
-    headers = {"X-User-Id": args.user}
     files = [SAMPLES_DIR / name for name in SAMPLE_FILES]
     if args.with_injection:
         files.append(SAMPLES_DIR / "adversarial" / "Vendor_Note.txt")
 
     # An investigation makes several LLM calls, so allow it plenty of time.
-    with httpx.Client(base_url=args.base_url, headers=headers, timeout=600) as client:
+    with httpx.Client(base_url=args.base_url, timeout=600) as client:
         try:
             health = client.get("/health").json()
         except httpx.HTTPError as exc:
             return fail(f"Cannot reach the API at {args.base_url} ({exc}). Is 'docker compose up' running?")
+        problem = sign_in(client, args)
+        if problem:
+            return fail(problem)
         print(f"API: {health['status']}  |  LLM: {health['llm_provider']} ({health['llm_model']})  |  Embeddings: {health['embedding_provider']}")
         if health["llm_provider"] == "mock":
             print("Note: LLM_PROVIDER=mock is a rule-based stand-in. Set LLM_PROVIDER=gemini and GEMINI_API_KEY for real reasoning.")

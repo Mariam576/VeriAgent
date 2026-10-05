@@ -16,6 +16,12 @@ from pathlib import Path
 os.environ["LLM_PROVIDER"] = "mock"
 os.environ["EMBEDDING_PROVIDER"] = "hash"
 os.environ["LLM_FALLBACK_PROVIDER"] = ""
+# Most tests identify the user with the X-User-Id header. Sign-in has its own tests (test_auth.py).
+os.environ["AUTH_MODE"] = "dev"
+os.environ["JWT_SECRET"] = ""
+os.environ["GOOGLE_CLIENT_ID"] = ""
+os.environ["SIGNUP_CODE"] = ""
+os.environ["MAX_INVESTIGATIONS_PER_DAY"] = "0"
 os.environ["UPLOAD_DIR"] = tempfile.mkdtemp(prefix="veriagent-test-uploads-")
 os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/veriagent")
 
