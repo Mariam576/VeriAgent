@@ -63,6 +63,59 @@ class InMemoryRetriever:
         return rerank(query, scored[:top_k], rerank_top_k)
 
 
+class InMemoryMemoryStore:
+    """Same interface as PgMemoryStore, but everything lives in Python dicts."""
+
+    def __init__(self) -> None:
+        self._embedder = HashEmbeddingProvider(256)
+        self.preferences: dict[str, dict[str, str]] = {}
+        self.notes: list[dict[str, Any]] = []
+        self.fail = False
+
+    def _check(self) -> None:
+        if self.fail:
+            raise ConnectionError("memory store is down")
+
+    async def get_preferences(self, user_id: str) -> dict[str, str]:
+        self._check()
+        return dict(self.preferences.get(user_id, {}))
+
+    async def set_preference(self, user_id: str, key: str, value: str) -> None:
+        self._check()
+        self.preferences.setdefault(user_id, {})[key] = value
+
+    async def add_note(self, user_id: str, text: str, *, source: str, investigation_id: str | None = None) -> str:
+        self._check()
+        for note in self.notes:
+            if note["user_id"] == user_id and note["text"] == text:
+                note["investigation_id"] = investigation_id
+                return note["id"]
+        note = {
+            "id": f"note-{len(self.notes) + 1}", "user_id": user_id, "text": text, "source": source,
+            "investigation_id": investigation_id, "vector": self._embedder.embed_text(text),
+        }
+        self.notes.append(note)
+        return note["id"]
+
+    async def search_notes(
+        self, user_id: str, query: str, *, top_k: int, min_similarity: float, exclude_ids: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        self._check()
+        query_vector = self._embedder.embed_text(query)
+        scored = []
+        for note in self.notes:
+            if note["user_id"] != user_id or note["id"] in (exclude_ids or []):
+                continue
+            similarity = round(sum(a * b for a, b in zip(query_vector, note["vector"])), 4)
+            if similarity >= min_similarity:
+                scored.append({
+                    "id": note["id"], "text": note["text"], "source": note["source"], "similarity": similarity,
+                    "created_at": None, "investigation_id": note["investigation_id"],
+                })
+        scored.sort(key=lambda item: item["similarity"], reverse=True)
+        return scored[:top_k]
+
+
 class ScriptedLLM(BaseLLM):
     """An LLM whose answers are fixed in advance, per schema.
 
@@ -130,11 +183,15 @@ async def run_graph(
     settings: Settings | None = None,
     history: list[dict[str, str]] | None = None,
     document_ids: list[str] | None = None,
+    memory: InMemoryMemoryStore | None = None,
+    user_id: str = "user-1",
 ) -> dict[str, Any]:
     settings = settings or get_settings()
-    graph = build_investigation_graph(AgentDeps(llm=llm or create_mock_llm(), retriever=retriever, settings=settings))
+    graph = build_investigation_graph(
+        AgentDeps(llm=llm or create_mock_llm(), retriever=retriever, settings=settings, memory=memory)
+    )
     state = initial_state(
-        user_id="user-1", investigation_id="inv-1", question=question, history=history, document_ids=document_ids
+        user_id=user_id, investigation_id="inv-1", question=question, history=history, document_ids=document_ids
     )
     return await graph.ainvoke(state, config={"recursion_limit": recursion_limit(settings.MAX_AGENT_ITERATIONS)})
 

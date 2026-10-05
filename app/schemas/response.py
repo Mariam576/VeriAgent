@@ -96,6 +96,29 @@ class ReportStats(BaseModel):
     output_tokens: int = 0
 
 
+class RecalledMemory(BaseModel):
+    """A note from an earlier session that is related to this question. Context, not evidence."""
+
+    text: str
+    source: str = "investigation"  # investigation | user
+    similarity: float = 0.0
+    created_at: str | None = None
+    investigation_id: str | None = None
+
+
+class MemoryInfo(BaseModel):
+    # What this request added to long-term memory, as sentences for the user.
+    saved: list[str] = Field(default_factory=list)
+    recalled: list[RecalledMemory] = Field(default_factory=list)
+
+
+class Presentation(BaseModel):
+    """The user's preferences that shaped ``answer_text`` (from structured long-term memory)."""
+
+    detail_level: Literal["brief", "standard", "detailed"] = "standard"
+    response_format: Literal["text", "markdown"] = "text"
+
+
 class InvestigationReport(BaseModel):
     investigation_id: str
     question: str
@@ -116,6 +139,8 @@ class InvestigationReport(BaseModel):
     sources: list[CitationOut] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     stats: ReportStats = Field(default_factory=ReportStats)
+    memory: MemoryInfo = Field(default_factory=MemoryInfo)
+    presentation: Presentation = Field(default_factory=Presentation)
     # The same content as one readable text block (what a chat window shows).
     answer_text: str = ""
 

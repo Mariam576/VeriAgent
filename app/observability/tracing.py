@@ -48,7 +48,7 @@ def json_safe(value: Any) -> Any:
 @dataclass
 class TraceEvent:
     seq: int
-    kind: str  # node | llm | tool | retrieval | error
+    kind: str  # node | llm | tool | retrieval | memory | error
     name: str
     latency_ms: float | None
     data: dict[str, Any]

@@ -17,6 +17,11 @@ from app.agents.nodes import MAX_REVIEW_ROUNDS
 from app.agents.state import InvestigationState
 
 
+def route_after_memory(state: InvestigationState) -> Literal["analyze_request", "final_report"]:
+    """Only something to remember?  yes -> confirm it in the report   no -> investigate."""
+    return "final_report" if state.get("memory_only") else "analyze_request"
+
+
 def route_after_analysis(state: InvestigationState) -> Literal["retrieve", "extract_evidence"]:
     """Need RAG?  yes -> search the documents   no -> skip the search."""
     return "retrieve" if state.get("analysis", {}).get("needs_rag") else "extract_evidence"

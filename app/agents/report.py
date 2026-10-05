@@ -11,7 +11,8 @@ from __future__ import annotations
 from typing import Any
 
 from app.agents.assessment import evidence_quality
-from app.formatting import format_value, key_label
+from app.formatting import format_number, format_value, key_label
+from app.memory.profile import with_defaults
 from app.rag.citations import citations_from_evidence, format_citation
 from app.schemas.investigation import (
     KEY_OTHER,
@@ -30,6 +31,9 @@ from app.schemas.response import (
     FindingOut,
     HumanReview,
     InvestigationReport,
+    MemoryInfo,
+    Presentation,
+    RecalledMemory,
     ReportStats,
 )
 
@@ -229,10 +233,23 @@ def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_pro
     ]
     sources = _unique(sources + [_cite_suspicious(item) for item in suspicious])
 
-    if status == "not_applicable":
+    memory = MemoryInfo(
+        saved=list(state.get("memory_notes", [])),
+        recalled=[RecalledMemory(**item) for item in state.get("memories", [])],
+    )
+    if status == "not_applicable" and memory.saved:
+        # The message only asked to remember something: confirm it instead of introducing the agent.
+        summary, action = " ".join(memory.saved), "Ask a question about your documents whenever you are ready."
+    elif status == "not_applicable":
         summary, action = CAPABILITIES, "Upload documents and ask a question about them."
     else:
         summary, action = draft.get("summary", ""), draft.get("recommended_action", "")
+    if status == "insufficient_evidence" and memory.recalled:
+        # Memory is not evidence, but it is worth pointing to when the documents are silent.
+        summary = (
+            f"{summary} Memory holds {len(memory.recalled)} related note(s) from earlier sessions "
+            "(listed under 'From Earlier Investigations'); they are not evidence from the current documents."
+        ).strip()
     review, action = human_review_block(human_review, state.get("approval"), action)
 
     report = InvestigationReport(
@@ -265,6 +282,8 @@ def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_pro
             duration_ms=round(duration_ms, 1),
             llm_provider=llm_provider,
         ),
+        memory=memory,
+        presentation=Presentation(**with_defaults(state.get("preferences"))),
     )
     report.answer_text = render_report(report)
     return report
@@ -280,46 +299,87 @@ def _human_review_line(review: HumanReview) -> str:
 
 
 def render_report(report: InvestigationReport) -> str:
-    """The report as readable text, in the layout of spec section 3."""
+    """The report as readable text, in the layout of spec section 3.
+
+    Two stored preferences shape it (see app/memory/profile.py):
+    ``detail_level`` decides which sections are written out and
+    ``response_format`` whether section titles are plain or Markdown.
+    The structured report itself is always complete; only this text changes.
+    """
     if report.status == "not_applicable":
         return report.summary
+    detail = report.presentation.detail_level
+    markdown = report.presentation.response_format == "markdown"
 
     def cites(citations: list[CitationOut]) -> str:
         return "".join(" " + format_citation(c.document, c.page) for c in citations)
 
+    def title(text: str) -> str:
+        return f"## {text}" if markdown else f"{text}:"
+
+    def field(label: str, value: str) -> str:
+        return f"**{label}:** {value}" if markdown else f"{label}: {value}"
+
     lines = [
-        f"Investigation Status: {report.status_label}",
-        f"Overall Risk Level: {report.risk_level.capitalize()}",
-        f"Confidence Score: {round(report.confidence * 100)}%",
-        f"Human Review: {_human_review_line(report.human_review)}",
+        field("Investigation Status", report.status_label),
+        field("Overall Risk Level", report.risk_level.capitalize()),
+        field("Confidence Score", f"{round(report.confidence * 100)}%"),
+        field("Human Review", _human_review_line(report.human_review)),
         "",
-        "Summary:",
+        title("Summary"),
         report.summary,
     ]
     labels = {"fact": "Fact", "calculation": "Calculation", "missing_evidence": "Missing evidence"}
-    if report.key_findings:
-        lines += ["", "Key Findings:"]
+    if report.key_findings and detail != "brief":
+        lines += ["", title("Key Findings")]
         for number, finding in enumerate(report.key_findings, start=1):
             lines.append(f"{number}. [{labels.get(finding.type, finding.type)}] {finding.statement}{cites(finding.citations)}")
     if report.contradictions:
-        lines += ["", "Contradictions Detected:"]
+        lines += ["", title("Contradictions Detected")]
         lines += [f"- ({item.severity}) {item.description}{cites(item.citations)}" for item in report.contradictions]
     if report.missing_evidence:
-        lines += ["", "Missing Evidence:"]
+        lines += ["", title("Missing Evidence")]
         lines += [f"- {text}" for text in report.missing_evidence]
-    if report.risk_reasons:
-        lines += ["", "Risk Reasoning (inference):"]
+    if report.calculations and detail == "detailed":
+        lines += ["", title("Calculations (deterministic tools)")]
+        for item in report.calculations:
+            arguments = ", ".join(f"{name}={_number_text(value)}" for name, value in item.arguments.items())
+            lines.append(f"- {item.description}: {item.tool_name}({arguments}) = {_number_text(item.result)}")
+    if report.risk_reasons and detail != "brief":
+        lines += ["", title("Risk Reasoning (inference)")]
         lines += [f"- {reason.statement}{cites(reason.citations)}" for reason in report.risk_reasons]
-    lines += ["", f"Evidence Quality: {report.evidence_quality.capitalize()}", "", "Recommended Action:", report.recommended_action]
+    if detail != "brief":
+        lines += ["", field("Evidence Quality", report.evidence_quality.capitalize())]
+    lines += ["", title("Recommended Action"), report.recommended_action]
     if report.human_review.original_action:
         lines.append(f"(The agent had recommended: {report.human_review.original_action})")
     if report.sources:
-        lines += ["", "Sources:"]
+        lines += ["", title("Sources")]
         lines += [f"- {source.document} — Page {source.page}" for source in report.sources]
+    if report.memory.recalled:
+        lines += ["", title("From Earlier Investigations (memory, not evidence)")]
+        lines += [f"- {note.text}" for note in report.memory.recalled]
+    if report.memory.saved:
+        lines += ["", title("Memory")]
+        lines += [f"- {text}" for text in report.memory.saved]
     if report.limitations:
-        lines += ["", "Limitations:"]
+        lines += ["", title("Limitations")]
         lines += [f"- {text}" for text in report.limitations]
+    if detail == "detailed":
+        stats = report.stats
+        lines += [
+            "",
+            title("Run Statistics"),
+            f"- LLM calls: {stats.llm_calls}, tool calls: {stats.tool_calls}, searches: {stats.retrieval_rounds}, "
+            f"chunks read: {stats.retrieved_chunks}, facts kept/discarded: {stats.evidence_items}/{stats.discarded_facts}",
+        ]
     return "\n".join(lines)
+
+
+def _number_text(value: Any) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return format_number(value)
+    return str(value)
 
 
 def findings_for_storage(report: InvestigationReport) -> list[dict[str, Any]]:

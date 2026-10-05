@@ -22,6 +22,7 @@ from app.formatting import format_value
 from app.llm.base import ToolCallRequest
 from app.numbers import NUMBER_CORE, normalize_unit, parse_number
 from app.llm.mock_provider import MockLLM
+from app.memory.extraction import mock_memory
 from app.rag.citations import normalize
 from app.schemas.investigation import (
     KEY_OTHER,
@@ -35,6 +36,7 @@ from app.schemas.investigation import (
     RiskReason,
     SufficiencyAssessment,
 )
+from app.schemas.memory import MemoryCandidate
 from app.security.guardrails import UNTRUSTED_CLOSE, dedupe_keep_order
 
 # =========================================================== fact extraction
@@ -445,6 +447,7 @@ def create_mock_llm() -> MockLLM:
             EvidenceExtraction: _mock_extraction,
             SufficiencyAssessment: _mock_sufficiency,
             RiskAssessment: _mock_risk,
+            MemoryCandidate: mock_memory,
         },
         tool_chooser=_mock_tool_choice,
     )

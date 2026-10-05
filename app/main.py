@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 
 from app.agents.checkpoint import close_checkpointer, get_checkpointer
 from app.agents.service import reset_graph
-from app.api import chat, documents, health, investigations
+from app.api import chat, documents, health, investigations, memory
 from app.config import get_settings
 from app.database.session import dispose_engine, init_db
 from app.embeddings.base import EmbeddingError
@@ -94,6 +94,7 @@ def create_app() -> FastAPI:
     app.include_router(documents.router)
     app.include_router(investigations.router)
     app.include_router(chat.router)
+    app.include_router(memory.router)
     return app
 
 

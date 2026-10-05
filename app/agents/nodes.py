@@ -39,9 +39,8 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
-
 from datetime import datetime, timezone
+from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.errors import GraphBubbleUp
@@ -61,6 +60,11 @@ from app.agents.state import InvestigationState
 from app.config import Settings
 from app.formatting import key_label
 from app.llm.base import BaseLLM, LLMConfigurationError, LLMError
+from app.memory.extraction import MEMORY_TASK, accepted_memory, build_memory_prompt, fallback_memory, might_contain_memory
+from app.memory.profile import describe as describe_preference
+from app.memory.profile import with_defaults
+from app.memory.semantic import investigation_note
+from app.memory.store import MemoryStore
 from app.numbers import normalize_unit
 from app.observability import tracing
 from app.rag.citations import is_grounded, normalize
@@ -80,7 +84,9 @@ from app.schemas.investigation import (
     RiskAssessment,
     SufficiencyAssessment,
 )
-from app.security.guardrails import dedupe_keep_order
+from app.schemas.memory import MemoryCandidate
+from app.schemas.response import InvestigationReport
+from app.security.guardrails import dedupe_keep_order, redact_secrets
 from app.tools.calculator import CALCULATOR_TOOLS
 from app.tools.contradiction import find_contradictions
 from app.tools.registry import execute_tool
@@ -109,6 +115,8 @@ class AgentDeps:
     settings: Settings
     # True only when the graph has a checkpointer, because pausing needs somewhere to save the state.
     pause_for_approval: bool = False
+    # Long-term memory. None = the agent runs without memory (unit tests, evaluation).
+    memory: MemoryStore | None = None
 
 
 def traced(name: str) -> Callable[[NodeFunction], NodeFunction]:
@@ -171,6 +179,99 @@ class InvestigationNodes:
         self.retriever = deps.retriever
         self.settings = deps.settings
         self.pause_for_approval = deps.pause_for_approval and deps.settings.ENABLE_HUMAN_APPROVAL
+        self.memory = deps.memory if deps.settings.ENABLE_MEMORY else None
+
+    # ================================================================ Node 0
+    @traced("load_memory")
+    async def load_memory(self, state: InvestigationState) -> dict[str, Any]:
+        """Read long-term memory before the investigation starts.
+
+        Three things happen, all for the current user only:
+        1. if the message states something to remember, store it (see app/memory/extraction.py)
+        2. load the user's preferences (structured memory: a direct key/value lookup)
+        3. recall notes from earlier sessions that are close in meaning (semantic memory)
+
+        Memory is a convenience. If it fails, the investigation continues without it.
+        """
+        if self.memory is None:
+            return {}
+        user_id, question = state["user_id"], state["question"]
+        update: dict[str, Any] = {"events": [event("load_memory", "Checking memory...")]}
+        notes: list[str] = []
+        saved_ids: list[str] = []
+        memory_only = False
+        try:
+            if might_contain_memory(question):
+                try:
+                    candidate = await self.llm.structured(
+                        MemoryCandidate,
+                        system=prompts.system_prompt(MEMORY_TASK),
+                        user=build_memory_prompt(question),
+                        purpose="extract_memory",
+                    )
+                    update["llm_calls"] = 1
+                except LLMConfigurationError:
+                    raise
+                except LLMError as exc:
+                    logger.warning("extract_memory fell back to rules: %s", exc)
+                    candidate = fallback_memory(question)
+                accepted = accepted_memory(candidate, self.settings)  # the model proposes, code decides
+                if accepted is not None:
+                    kind, first, second = accepted
+                    if kind == "profile":
+                        await self.memory.set_preference(user_id, first, second)
+                        notes.append(describe_preference(first, second))
+                    else:
+                        saved_ids.append(await self.memory.add_note(user_id, first, source="user"))
+                        notes.append(f"Noted for later: {first}")
+                    tracing.record("memory", "save", memory_type=kind)
+                    memory_only = candidate.only_memory
+
+            update["preferences"] = with_defaults(await self.memory.get_preferences(user_id))
+            if not memory_only:
+                recalled = await self.memory.search_notes(
+                    user_id, question, top_k=self.settings.MEMORY_TOP_K,
+                    min_similarity=self.settings.MEMORY_MIN_SIMILARITY, exclude_ids=saved_ids,
+                )
+                update["memories"] = recalled
+                tracing.record("memory", "recall", notes=[note["id"] for note in recalled])
+        except LLMConfigurationError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - memory must never stop an investigation
+            logger.warning("load_memory failed: %s: %s", type(exc).__name__, exc)
+            tracing.record("error", "memory", error=type(exc).__name__)
+            update["limitations"] = ["Long-term memory was unavailable for this request."]
+
+        update["memory_notes"] = notes
+        if memory_only:
+            # Nothing to investigate: skip straight to the report, which confirms what was saved.
+            update["memory_only"] = True
+            update["analysis"] = RequestAnalysis(
+                task_type="general", needs_rag=False, needs_calculation=False, needs_external_verification=False,
+                decision_requested=False, standalone_question=question, search_queries=[],
+            ).model_dump()
+        return update
+
+    # ============================================================== Node 11
+    @traced("save_memory")
+    async def save_memory(self, state: InvestigationState) -> dict[str, Any]:
+        """After the final report: leave one note about this investigation in semantic memory."""
+        if self.memory is None or not state.get("report"):
+            return {}
+        note = investigation_note(InvestigationReport(**state["report"]))
+        if note is None:
+            return {}  # small talk and plain look-ups are not worth remembering
+        try:
+            await self.memory.add_note(
+                state["user_id"], redact_secrets(note, self.settings),
+                source="investigation", investigation_id=state.get("investigation_id"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("save_memory failed: %s: %s", type(exc).__name__, exc)
+            tracing.record("error", "memory", error=type(exc).__name__)
+            return {}
+        tracing.record("memory", "save", memory_type="investigation")
+        return {"events": [event("save_memory", "Saved a note about this investigation to memory.")]}
 
     # ================================================================ Node 1
     @traced("analyze_request")
@@ -801,10 +902,11 @@ class InvestigationNodes:
             "risk_level": report.risk_level,
             "confidence_score": report.confidence,
             "requires_human_review": report.requires_human_review,
-            "risk_draft": working["risk_draft"],
             "messages": [AIMessage(content=report.answer_text)],
             "events": [event("final_report", "Generating report...")],
         }
+        if "risk_draft" in working:  # absent when the message only asked to remember something
+            update["risk_draft"] = working["risk_draft"]
         if limitations:
             update["limitations"] = limitations
         return update

@@ -12,6 +12,9 @@ needs a truly independent point of view; here ordinary nodes are enough.
 
                          START
                            |
+                      load_memory           preferences + related notes from earlier sessions
+                           |                (a message that only asks to remember something
+                           |                 skips straight to final_report)
                     analyze_request
                      /            \\
            needs RAG                no RAG
@@ -38,6 +41,8 @@ needs a truly independent point of view; here ordinary nodes are enough.
          |                   and continues after POST /investigations/{id}/approve
      final_report
          |
+     save_memory             one note about this investigation, for later sessions
+         |
         END
 
 Concept - checkpointing:
@@ -58,6 +63,7 @@ from app.agents.nodes import AgentDeps, InvestigationNodes
 from app.agents.routing import (
     route_after_analysis,
     route_after_contradictions,
+    route_after_memory,
     route_after_review,
     route_after_sufficiency,
 )
@@ -74,6 +80,7 @@ def build_investigation_graph(
     graph = StateGraph(InvestigationState)
 
     # --- nodes: name -> function
+    graph.add_node("load_memory", nodes.load_memory)
     graph.add_node("analyze_request", nodes.analyze_request)
     graph.add_node("retrieve", nodes.retrieve)
     graph.add_node("extract_evidence", nodes.extract_evidence)
@@ -85,18 +92,21 @@ def build_investigation_graph(
     graph.add_node("correct_findings", nodes.correct_findings)
     graph.add_node("human_approval", nodes.human_approval)
     graph.add_node("final_report", nodes.final_report)
+    graph.add_node("save_memory", nodes.save_memory)
 
     # --- edges: fixed order
-    graph.add_edge(START, "analyze_request")
+    graph.add_edge(START, "load_memory")
     graph.add_edge("retrieve", "extract_evidence")
     graph.add_edge("extract_evidence", "detect_contradictions")
     graph.add_edge("calculate", "check_sufficiency")
     graph.add_edge("assess_risk", "review_findings")
     graph.add_edge("correct_findings", "review_findings")  # loop: review again after correcting
     graph.add_edge("human_approval", "final_report")
-    graph.add_edge("final_report", END)
+    graph.add_edge("final_report", "save_memory")
+    graph.add_edge("save_memory", END)
 
     # --- conditional edges: the router function picks the next node
+    graph.add_conditional_edges("load_memory", route_after_memory, ["analyze_request", "final_report"])
     graph.add_conditional_edges("analyze_request", route_after_analysis, ["retrieve", "extract_evidence"])
     graph.add_conditional_edges("detect_contradictions", route_after_contradictions, ["calculate", "check_sufficiency"])
     graph.add_conditional_edges("check_sufficiency", route_after_sufficiency, ["retrieve", "assess_risk"])  # loop
@@ -109,6 +119,6 @@ def recursion_limit(max_agent_iterations: int) -> int:
     """Hard backstop on graph steps, on top of the iteration counter in the state.
 
     One retrieval loop is 5 nodes; a correction loop is 2. The straight path is
-    10 nodes. This leaves room for every allowed loop and nothing more.
+    12 nodes. This leaves room for every allowed loop and nothing more.
     """
-    return 13 + 5 * max_agent_iterations + 6
+    return 15 + 5 * max_agent_iterations + 6

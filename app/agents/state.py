@@ -42,9 +42,11 @@ class InvestigationState(TypedDict, total=False):
     history: list[dict[str, str]]  # earlier turns of the conversation: {"role", "content"}
     document_ids: list[str]  # optional: restrict the investigation to these documents
     filters: dict[str, Any]  # optional metadata filters: document_type, year
-    # Long-term memory handed in by the service (read-only for the graph):
-    preferences: dict[str, str]  # user profile, e.g. {"detail_level": "brief"}
-    memories: list[dict[str, Any]]  # related earlier investigations of the same user
+    # ------------------------------------------------- long-term memory
+    preferences: dict[str, str]  # the user's profile, e.g. {"detail_level": "brief"}
+    memories: list[dict[str, Any]]  # notes from earlier sessions that are related to this question
+    memory_notes: list[str]  # what this request added to memory, as sentences for the user
+    memory_only: bool  # the message only asked to remember something; nothing to investigate
 
     # --------------------------------------------------- request analysis
     analysis: dict[str, Any]
@@ -115,6 +117,8 @@ def initial_state(
         filters=filters or {},
         preferences=preferences or {},
         memories=memories or [],
+        memory_notes=[],
+        memory_only=False,
         search_queries=[],
         executed_queries=[],
         retrieved_documents=[],

@@ -47,6 +47,7 @@ from app.database.session import get_session_factory
 from app.embeddings.factory import get_embedding_provider
 from app.errors import Conflict, NotFound, ServiceUnavailable, ValidationFailed
 from app.llm.factory import get_llm
+from app.memory.store import get_memory_store
 from app.observability.tracing import json_safe, start_trace
 from app.rag.retriever import PgVectorRetriever
 from app.schemas.response import InvestigationReport
@@ -80,6 +81,7 @@ async def get_graph() -> CompiledStateGraph:
                 ),
                 settings=settings,
                 pause_for_approval=True,  # still subject to ENABLE_HUMAN_APPROVAL
+                memory=get_memory_store(),  # still subject to ENABLE_MEMORY
             )
             _graph = build_investigation_graph(deps, checkpointer=await get_checkpointer())
     return _graph

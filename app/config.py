@@ -71,6 +71,12 @@ class Settings(BaseSettings):
     STALE_RUN_SECONDS: int = Field(default=300, ge=0)
     MAX_QUESTION_CHARS: int = Field(default=2000, ge=10)
 
+    # --------------------------------------------------------------- Memory
+    ENABLE_MEMORY: bool = True
+    MEMORY_TOP_K: int = Field(default=3, ge=1, le=10)
+    # Notes less similar to the question than this are not recalled (cosine similarity, 0..1).
+    MEMORY_MIN_SIMILARITY: float = Field(default=0.3, ge=0.0, le=1.0)
+
     # -------------------------------------------------------------- Uploads
     MAX_UPLOAD_MB: int = Field(default=20, ge=1, le=200)
     ALLOWED_EXTENSIONS: str = ".pdf,.docx,.txt"

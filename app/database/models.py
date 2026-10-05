@@ -121,6 +121,41 @@ class DocumentChunk(Base):
     document: Mapped[Document] = relationship(back_populates="chunks")
 
 
+class UserMemory(Base):
+    """Structured long-term memory: one row per preference of a user (key -> value)."""
+
+    __tablename__ = "user_memory"
+    __table_args__ = (UniqueConstraint("user_id", "memory_key", name="uq_user_memory_user_key"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    memory_key: Mapped[str] = mapped_column(String(50))
+    memory_value: Mapped[str] = mapped_column(String(200))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class SemanticMemory(Base):
+    """Semantic long-term memory: a lasting note in free text, found again by meaning."""
+
+    __tablename__ = "semantic_memory"
+    # No vector index: a user has at most a few hundred notes, so an exact scan
+    # of that user's rows is fast and always returns the true nearest notes.
+    # The same note is stored once per user; saving it again only refreshes its date.
+    __table_args__ = (UniqueConstraint("user_id", "text_hash", name="uq_semantic_memory_user_text"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    text: Mapped[str] = mapped_column(Text)
+    text_hash: Mapped[str] = mapped_column(String(64))
+    embedding: Mapped[list[float]] = mapped_column(Vector(get_settings().EMBEDDING_DIM))
+    # Vectors from different embedding models cannot be compared (same rule as for documents).
+    embedding_model: Mapped[str] = mapped_column(String(200), default="")
+    source: Mapped[str] = mapped_column(String(20), default="investigation")  # investigation | user
+    # No foreign key on purpose: a note outlives the investigation it came from.
+    investigation_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class Investigation(Base):
     __tablename__ = "investigations"
 
@@ -182,7 +217,7 @@ class TraceEvent(Base):
     )
     run: Mapped[int] = mapped_column(Integer, default=1)  # 1 = first run, 2 = after a human decision, ...
     seq: Mapped[int] = mapped_column(Integer)
-    kind: Mapped[str] = mapped_column(String(20))  # node | llm | tool | retrieval | error
+    kind: Mapped[str] = mapped_column(String(20))  # node | llm | tool | retrieval | memory | error
     name: Mapped[str] = mapped_column(String(100))
     latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     offset_ms: Mapped[float] = mapped_column(Float, default=0.0)
