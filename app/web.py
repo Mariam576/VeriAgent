@@ -26,6 +26,8 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 # Scripts: only our own files and Google's sign-in button. Styles need 'unsafe-inline' for
@@ -73,6 +75,12 @@ class SecurityHeaders:
             await self.app(scope, receive, send)
             return
         path: str = scope.get("path", "")
+        https = scope.get("scheme") == "https"
+        if not https and get_settings().TRUST_PROXY_HEADERS:
+            # Behind a hosting platform's proxy the request reaches us as plain HTTP;
+            # the proxy says in this header how the browser really connected.
+            forwarded = dict(scope.get("headers", [])).get(b"x-forwarded-proto", b"").decode("latin-1")
+            https = forwarded.split(",")[0].strip() == "https"
 
         async def send_with_headers(message: dict[str, Any]) -> None:
             if message["type"] == "http.response.start":
@@ -86,6 +94,9 @@ class SecurityHeaders:
                 add(b"x-content-type-options", "nosniff")  # never guess a file's type from its content
                 add(b"referrer-policy", "no-referrer")
                 add(b"x-frame-options", "DENY")  # the page may not be embedded in another site
+                if https:
+                    # "From now on, only ever talk to this site over HTTPS."
+                    add(b"strict-transport-security", "max-age=31536000")
                 if not path.startswith(_NO_POLICY):
                     add(b"content-security-policy", CONTENT_SECURITY_POLICY)
                 if path.startswith("/assets/"):

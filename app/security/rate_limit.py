@@ -61,11 +61,24 @@ class RateLimiter:
 
 
 def client_address(request: Request) -> str:
-    """Who is calling. Behind a trusted proxy the real address is in X-Forwarded-For."""
-    if get_settings().TRUST_PROXY_HEADERS:
-        forwarded = request.headers.get("x-forwarded-for", "")
-        if forwarded:
-            return forwarded.split(",")[0].strip()[:64]
+    """Who is calling, for the per-address limits.
+
+    Directly connected, that is the address of the connection. Behind a hosting
+    platform's proxy every connection comes from the proxy, and the real address
+    is in a header the proxy sets. Which header can be trusted depends on the
+    proxy: one that the proxy always overwrites (``CLIENT_ADDRESS_HEADER``) is
+    safe; ``X-Forwarded-For`` is a list that many proxies only add to, so its
+    first entry may have been written by the client itself. That is why the
+    limit that protects passwords counts per account, not per address
+    (``failed_logins`` in app/api/auth.py).
+    """
+    settings = get_settings()
+    if settings.TRUST_PROXY_HEADERS:
+        for name in dict.fromkeys((settings.CLIENT_ADDRESS_HEADER.strip().lower(), "x-forwarded-for")):
+            value = request.headers.get(name, "") if name else ""
+            first = value.split(",")[0].strip()
+            if first:
+                return first[:64]
     return request.client.host if request.client else "unknown"
 
 

@@ -52,6 +52,9 @@ class Settings(BaseSettings):
 
     # ------------------------------------------------------------- Database
     DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/veriagent"
+    # Connections the application keeps open. A small hosted database allows only a few.
+    DB_POOL_SIZE: int = Field(default=5, ge=1, le=50)
+    DB_MAX_OVERFLOW: int = Field(default=5, ge=0, le=50)
 
     # ----------------------------------------------------------- Embeddings
     EMBEDDING_PROVIDER: Literal["local", "gemini", "hash"] = "local"
@@ -99,6 +102,10 @@ class Settings(BaseSettings):
     # true only behind a proxy you trust (Render, a load balancer): the client's address is
     # then read from X-Forwarded-For. Without such a proxy a client could fake that header.
     TRUST_PROXY_HEADERS: bool = False
+    # Which header carries the client's address when TRUST_PROXY_HEADERS is on. The safe choice is
+    # one that the proxy always overwrites (behind Cloudflare: cf-connecting-ip). If the request
+    # does not carry it, X-Forwarded-For is used.
+    CLIENT_ADDRESS_HEADER: str = "x-forwarded-for"
 
     # ---------------------------------------------------------- Comparison
     # Compare parties, reference numbers, dates and line items between documents (one extra
@@ -177,12 +184,10 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------ Derived
     @property
     def async_database_url(self) -> str:
-        """SQLAlchemy needs the driver in the URL: postgresql+asyncpg://..."""
-        url = self.DATABASE_URL
-        for prefix in ("postgresql://", "postgres://"):
-            if url.startswith(prefix):
-                return "postgresql+asyncpg://" + url[len(prefix):]
-        return url
+        """SQLAlchemy needs the driver in the URL: postgresql+asyncpg://... (see app/database/urls.py)"""
+        from app.database.urls import parse_database_url
+
+        return parse_database_url(self.DATABASE_URL).async_url
 
     @property
     def allowed_extensions(self) -> set[str]:

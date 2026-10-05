@@ -29,6 +29,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from app.config import get_settings
+from app.database.urls import parse_database_url
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +40,7 @@ _lock = asyncio.Lock()
 
 def _connection_url() -> str:
     """psycopg wants a plain postgresql:// URL (no SQLAlchemy "+driver" part)."""
-    url = get_settings().DATABASE_URL
-    for prefix in ("postgresql+asyncpg://", "postgresql+psycopg://", "postgres://"):
-        if url.startswith(prefix):
-            return "postgresql://" + url[len(prefix):]
-    return url
+    return parse_database_url(get_settings().DATABASE_URL).psycopg_url
 
 
 async def get_checkpointer() -> AsyncPostgresSaver:
@@ -60,13 +57,18 @@ async def get_checkpointer() -> AsyncPostgresSaver:
         )
     async with _lock:
         if _saver is None:
+            target = parse_database_url(get_settings().DATABASE_URL)
             pool = AsyncConnectionPool(
-                _connection_url(),
+                target.psycopg_url,
                 min_size=1,
-                max_size=5,
+                max_size=min(5, get_settings().DB_POOL_SIZE),
                 open=False,
+                # A hosted database may close idle connections (scale to zero). Each connection is
+                # tested when it is taken from the pool, and replaced if it is dead.
+                check=AsyncConnectionPool.check_connection,
+                max_idle=240,
                 # The checkpointer manages its own transactions and returns rows as dicts.
-                kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+                kwargs={"autocommit": True, "prepare_threshold": target.psycopg_prepare_threshold, "row_factory": dict_row},
             )
             await pool.open(wait=True, timeout=30)
             saver = AsyncPostgresSaver(pool)

@@ -1,0 +1,74 @@
+# Render Blueprint: describes the VeriAgent web service so that Render can create it
+# from this repository (Render dashboard -> New -> Blueprint). The step-by-step guide,
+# including the database on Neon, is docs/DEPLOYMENT.md.
+#
+# Values marked "sync: false" are secrets. They are NOT in this file: Render asks for
+# them once, when the Blueprint is first applied, and stores them itself.
+
+services:
+  - type: web
+    name: veriagent
+    runtime: docker
+    plan: free
+    # Pick the region nearest to you, and create the Neon database in the same part of
+    # the world: oregon | ohio | virginia | frankfurt | singapore
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit   # every push to the main branch is deployed
+    envVars:
+      # Render hands these variables to "docker build" as well. This one selects the
+      # small image without PyTorch (see the Dockerfile): the free plan has 512 MB of memory.
+      - key: LOCAL_EMBEDDINGS
+        value: "false"
+
+      # ---- secrets: typed into Render, never committed
+      - key: DATABASE_URL        # the connection string from Neon
+        sync: false
+      - key: GEMINI_API_KEY      # from https://aistudio.google.com/apikey
+        sync: false
+      - key: SIGNUP_CODE         # a word of your choice; needed to create an account
+        sync: false
+      - key: JWT_SECRET          # signs the sign-in tokens; Render invents a random value
+        generateValue: true
+
+      # ---- model and embeddings: both through the Gemini API, nothing heavy runs here
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: GEMINI_MODEL
+        value: gemini-3.1-flash-lite
+      - key: EMBEDDING_PROVIDER
+        value: gemini
+      - key: GEMINI_EMBEDDING_MODEL
+        value: gemini-embedding-001
+      - key: EMBEDDING_DIM
+        value: "768"
+      - key: LLM_REQUESTS_PER_MINUTE   # stay inside the free tier of the Gemini API
+        value: "10"
+
+      # ---- sign-in and limits
+      - key: AUTH_MODE
+        value: jwt
+      - key: TRUST_PROXY_HEADERS       # Render's proxy tells us the visitor's address and "https"
+        value: "true"
+      - key: CLIENT_ADDRESS_HEADER     # set by Cloudflare, which sits in front of Render
+        value: cf-connecting-ip
+      - key: MAX_INVESTIGATIONS_PER_DAY
+        value: "25"
+
+      # ---- sized for a small machine and a small database
+      - key: MAX_BACKGROUND_JOBS
+        value: "1"
+      - key: DB_POOL_SIZE
+        value: "3"
+      - key: DB_MAX_OVERFLOW
+        value: "2"
+
+      # ---- the free plan has no permanent disk
+      - key: KEEP_UPLOADED_FILES       # text, vectors and inspection results live in the database
+        value: "false"
+      - key: ACTION_SERVER             # the built-in ticket list; its file is emptied by every restart
+        value: tickets
+      - key: TICKETS_FILE
+        value: /app/data/tickets.jsonl

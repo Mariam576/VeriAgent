@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.config import get_settings
+from app.database.urls import parse_database_url
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +33,16 @@ DB_STARTUP_DELAY_SECONDS = 2.0
 @lru_cache
 def get_engine() -> AsyncEngine:
     settings = get_settings()
+    target = parse_database_url(settings.DATABASE_URL)
     return create_async_engine(
-        settings.async_database_url,
+        target.async_url,
+        connect_args=target.connect_args,
         pool_pre_ping=True,  # detect dropped connections before using them
-        pool_size=5,
-        max_overflow=10,
+        # A hosted database that "scales to zero" closes idle connections after a few minutes.
+        # Connections older than this are replaced instead of being found dead.
+        pool_recycle=240,
+        pool_size=settings.DB_POOL_SIZE,
+        max_overflow=settings.DB_MAX_OVERFLOW,
     )
 
 

@@ -63,6 +63,23 @@ async def test_api_routes_win_over_files_and_unknown_paths_are_404(built):
     assert (await get(app, "/%2e%2e/%2e%2e/etc/passwd")).status_code == 404
 
 
+async def test_https_is_made_permanent_only_when_the_request_really_came_over_https(built, monkeypatch):
+    from app.config import get_settings
+
+    app = app_with(built)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        assert "strict-transport-security" not in (await client.get("/")).headers
+        # A header anyone can send is ignored unless a trusted proxy is configured.
+        spoofed = await client.get("/", headers={"X-Forwarded-Proto": "https"})
+        assert "strict-transport-security" not in spoofed.headers
+        monkeypatch.setattr(get_settings(), "TRUST_PROXY_HEADERS", True)
+        behind_proxy = await client.get("/", headers={"X-Forwarded-Proto": "https"})
+        assert behind_proxy.headers["strict-transport-security"] == "max-age=31536000"
+        assert "strict-transport-security" not in (await client.get("/", headers={"X-Forwarded-Proto": "http"})).headers
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://test") as client:
+        assert (await client.get("/")).headers["strict-transport-security"] == "max-age=31536000"
+
+
 async def test_without_a_build_the_root_explains_what_to_do(tmp_path):
     page = await get(app_with(tmp_path / "missing"), "/")
     assert page.status_code == 200 and page.text == NOT_BUILT and "npm run build" in page.text

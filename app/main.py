@@ -28,6 +28,7 @@ from app.jobs import get_jobs
 from app.logging_config import configure_logging
 from app.maintenance import run_maintenance
 from app.security.guardrails import redact_secrets
+from app.startup import check_configuration
 from app.web import mount_interface
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     """Runs once at startup (before ``yield``) and once at shutdown (after)."""
     settings = get_settings()
     configure_logging(settings.LOG_LEVEL)
+    check_configuration(settings)  # refuse to start with settings that cannot work (app/startup.py)
     await init_db()
     logger.info(
         "%s %s started (llm=%s, embeddings=%s)",
