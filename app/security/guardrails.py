@@ -110,7 +110,7 @@ def redact_secrets(text: str, settings: Settings) -> str:
     if not text:
         return text
     secrets = []
-    for secret in (settings.GEMINI_API_KEY, settings.GROK_API_KEY):
+    for secret in (settings.GEMINI_API_KEY, settings.GROK_API_KEY, settings.GITHUB_TOKEN, settings.JWT_SECRET):
         if secret is not None and len(secret.get_secret_value()) >= 6:
             secrets.append(secret.get_secret_value())
     for secret in secrets:

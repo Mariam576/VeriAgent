@@ -27,6 +27,7 @@ from app.schemas.response import (
     STATUS_LABELS,
     CalculationOut,
     CitationOut,
+    ActionOut,
     ContradictionOut,
     DocumentIntegrityOut,
     FindingOut,
@@ -336,8 +337,18 @@ def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_pro
         memory=memory,
         presentation=Presentation(**with_defaults(state.get("preferences"))),
     )
+    report.actions = action_list(state)
     report.answer_text = render_report(report)
     return report
+
+
+def action_list(state: dict[str, Any]) -> list[ActionOut]:
+    """Follow-up actions for the report: their results once decided, otherwise the open proposals."""
+    proposals = {item["id"]: item for item in state.get("proposed_actions", [])}
+    results = state.get("action_results")
+    if results is None:
+        return [ActionOut(**item, status="proposed") for item in proposals.values()]
+    return [ActionOut(**{**proposals.get(item["id"], {}), **item}) for item in results]
 
 
 def _human_review_line(review: HumanReview) -> str:
@@ -416,6 +427,9 @@ def render_report(report: InvestigationReport) -> str:
     lines += ["", title("Recommended Action"), safe(report.recommended_action)]
     if report.human_review.original_action:
         lines.append(safe(f"(The agent had recommended: {report.human_review.original_action})"))
+    if report.actions:
+        lines += ["", title("Follow-up Actions (carried out only after approval)")]
+        lines += [f"- {safe(_action_line(item))}" for item in report.actions]
     if report.sources:
         lines += ["", title("Sources")]
         lines += [f"- {safe(f'{source.document} — Page {source.page}')}" for source in report.sources]
@@ -437,6 +451,20 @@ def render_report(report: InvestigationReport) -> str:
             f"chunks read: {stats.retrieved_chunks}, facts kept/discarded: {stats.evidence_items}/{stats.discarded_facts}",
         ]
     return "\n".join(lines)
+
+
+def _action_line(item: ActionOut) -> str:
+    what = f"Create an issue in {item.target}: \"{item.title}\""
+    if item.status == "proposed":
+        return f"{what} - proposed, waiting for approval"
+    if item.status == "not_approved":
+        return f"{what} - not approved, nothing was created"
+    if item.status == "done":
+        where = f" ({item.url or item.reference})" if item.url or item.reference else ""
+        return f"{what} - created{where}"
+    if item.status == "failed":
+        return f"{what} - failed: {item.detail or 'no details'}"
+    return f"{what} - result unknown: {item.detail or ''}".rstrip()
 
 
 def _number_text(value: Any) -> str:

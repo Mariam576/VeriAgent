@@ -117,6 +117,7 @@ async def approve_investigation(
         decision=request.decision,
         note=request.note,
         modified_action=request.modified_action,
+        approved_actions=request.approved_actions,
     )
 
 

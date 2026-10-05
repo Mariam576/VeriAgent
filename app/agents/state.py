@@ -68,6 +68,8 @@ class InvestigationState(TypedDict, total=False):
     missing_evidence: list[str]
     retrieve_again: bool
     integrity_findings: list[dict[str, Any]]  # documents with forensic indicators (app/forensics)
+    proposed_actions: list[dict[str, Any]]  # follow-up actions offered with the approval request (app/actions)
+    action_results: list[dict[str, Any]]  # what became of them after the decision
 
     # ---------------------------------------------------------- assessment
     risk_draft: dict[str, Any]

@@ -282,7 +282,7 @@ async def test_approve_through_the_api(client, user_headers, library):
     trace = (await client.get(f"/investigations/{investigation_id}/trace", headers=user_headers)).json()
     assert trace["totals"]["runs"] == 2
     second_run = [event["name"] for event in trace["events"] if event["run"] == 2 and event["kind"] == "node"]
-    assert second_run == ["human_approval", "final_report"]
+    assert second_run == ["human_approval", "follow_up", "final_report"]
 
     # A finished investigation leaves no checkpoints behind.
     from app.agents import service

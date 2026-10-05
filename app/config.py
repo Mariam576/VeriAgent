@@ -105,6 +105,19 @@ class Settings(BaseSettings):
     # model call per document, the first time it takes part in a comparison).
     ENABLE_DOCUMENT_COMPARISON: bool = True
 
+    # -------------------------------------------------------------- Actions
+    # Where a follow-up issue is created after a person approved it, through MCP (app/actions).
+    #   ""        nothing is ever created
+    #   tickets   VeriAgent's own small ticket list (a file); needs no account
+    #   github    an issue in GITHUB_REPOSITORY, through GitHub's MCP server
+    ACTION_SERVER: Literal["", "tickets", "github"] = ""
+    TICKETS_FILE: str = "data/tickets.jsonl"
+    GITHUB_MCP_URL: str = "https://api.githubcopilot.com/mcp/"
+    # A personal access token that may write issues in that one repository, and nothing else.
+    GITHUB_TOKEN: SecretStr | None = None
+    GITHUB_REPOSITORY: str = ""  # owner/repository
+    ACTION_TIMEOUT_SECONDS: float = Field(default=30.0, gt=0, le=120)
+
     # ------------------------------------------------------------ Forensics
     # Inspect every uploaded file for signs of editing (hidden or covered text, odd fonts,
     # file history). No model call; the result is a risk indicator, never proof.

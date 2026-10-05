@@ -36,6 +36,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.actions.runner import get_action_runner, reset_action_runner
 from app.agents.checkpoint import get_checkpointer
 from app.agents.graph import build_investigation_graph, recursion_limit
 from app.agents.nodes import STAGE_LABELS, AgentDeps
@@ -89,6 +90,7 @@ async def get_graph() -> CompiledStateGraph:
                 profiles=get_profile_store(),  # still subject to ENABLE_DOCUMENT_COMPARISON
                 forensics=get_forensics_store(),  # still subject to ENABLE_FORENSICS
                 reviewer=get_reviewer_llm(),  # still subject to ENABLE_CLAIM_REVIEW
+                actions=get_action_runner(),  # None unless ACTION_SERVER is set
             )
             _graph = build_investigation_graph(deps, checkpointer=await get_checkpointer())
     return _graph
@@ -100,6 +102,7 @@ def reset_graph() -> None:
     _graph = None
     reset_profile_store()
     reset_forensics_store()
+    reset_action_runner()
 
 
 def _config(investigation_id: uuid.UUID) -> dict[str, Any]:
@@ -425,6 +428,7 @@ async def decide_investigation(
     decision: str,
     note: str | None = None,
     modified_action: str | None = None,
+    approved_actions: list[str] | None = None,
 ) -> InvestigationReport:
     """Deliver a person's decision to a paused investigation and return the final report."""
     if decision == "modify" and not (modified_action or "").strip():
@@ -443,7 +447,10 @@ async def decide_investigation(
     # ``Command(resume=...)`` continues the paused graph; the value becomes the
     # return value of ``interrupt()`` inside the human_approval node.
     command = Command(
-        resume={"decision": decision, "note": note, "modified_action": modified_action, "reviewer": user.name}
+        resume={
+            "decision": decision, "note": note, "modified_action": modified_action, "reviewer": user.name,
+            "approved_actions": list(approved_actions or []),
+        }
     )
     report = await _last_report(_run(session, investigation, command, mode="decide"))
     if report.human_review.status == "pending":

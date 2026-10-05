@@ -30,6 +30,9 @@ psycopg-pool==3.3.3
 langchain-google-genai==4.4.0
 langchain-openai==1.6.7
 
+# --- Actions outside VeriAgent: MCP client, and the built-in ticket server
+mcp==2.3.0
+
 # --- Documents
 pymupdf==1.28.2
 python-docx==1.2.0

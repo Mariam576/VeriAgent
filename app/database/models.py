@@ -311,3 +311,29 @@ class ToolCall(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     investigation: Mapped[Investigation] = relationship(back_populates="tool_calls")
+
+
+class ExternalAction(Base):
+    """Something VeriAgent did in another system after a person approved it (see app/actions).
+
+    The unique pair (investigation, action) is what guarantees "at most once":
+    a second attempt to start the same action finds this row instead of creating one.
+    """
+
+    __tablename__ = "external_actions"
+    __table_args__ = (UniqueConstraint("investigation_id", "action_key", name="uq_external_actions_investigation_key"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    investigation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("investigations.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    action_key: Mapped[str] = mapped_column(String(10))  # "A1"
+    kind: Mapped[str] = mapped_column(String(30))  # create_issue
+    server: Mapped[str] = mapped_column(String(30))  # tickets | github
+    target: Mapped[str] = mapped_column(String(200))
+    title: Mapped[str] = mapped_column(String(300))
+    status: Mapped[str] = mapped_column(String(20))  # started | done | failed | unknown
+    reference: Mapped[str | None] = mapped_column(String(100), nullable=True)  # "T-1A2B3C4D", "#17"
+    url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

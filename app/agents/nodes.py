@@ -50,6 +50,7 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
 
 from app.agents import heuristics, prompts
+from app.actions.runner import ActionRunner
 from app.agents.assessment import (
     baseline_risk,
     clean_ids,
@@ -59,7 +60,7 @@ from app.agents.assessment import (
     review_draft,
     suspicious_content,
 )
-from app.agents.report import build_report
+from app.agents.report import action_list, build_report, render_report
 from app.agents.reviewer import review_claims, reviewable
 from app.agents.state import InvestigationState
 from app.comparison.engine import Cited, ProfileFinding, compare_profiles
@@ -141,6 +142,8 @@ class AgentDeps:
     forensics: ForensicsSource | None = None
     # The model that double-checks extracted statements. None = they are not double-checked.
     reviewer: BaseLLM | None = None
+    # Carries out approved follow-up actions through MCP. None = nothing is ever done outside VeriAgent.
+    actions: ActionRunner | None = None
 
 
 def traced(name: str) -> Callable[[NodeFunction], NodeFunction]:
@@ -190,6 +193,7 @@ STAGE_LABELS: dict[str, str | None] = {
     "review_findings": "Reviewing findings...",
     "correct_findings": "Correcting findings...",
     "human_approval": None,
+    "follow_up": None,  # announced only when there is something to carry out
     "final_report": "Generating report...",
 }
 
@@ -243,6 +247,7 @@ class InvestigationNodes:
         self.profiles = deps.profiles if deps.settings.ENABLE_DOCUMENT_COMPARISON else None
         self.forensics = deps.forensics if deps.settings.ENABLE_FORENSICS else None
         self.reviewer = deps.reviewer if deps.settings.ENABLE_CLAIM_REVIEW else None
+        self.actions = deps.actions
 
     # ================================================================ Node 0
     @traced("load_memory")
@@ -1148,6 +1153,13 @@ class InvestigationNodes:
             # Pausing is switched off (or there is no checkpointer): only flag it.
             return {"approval": {"status": "not_requested"}}
 
+        # What the agent would like to do outside VeriAgent. Only proposed here: the person sees
+        # the exact text with the draft and chooses (see app/actions and the follow_up node).
+        proposals = self.actions.propose(draft) if self.actions is not None else []
+        if proposals:
+            draft.actions = action_list({"proposed_actions": proposals})
+            draft.answer_text = render_report(draft)
+
         request = {
             "type": "approval_request",
             "investigation_id": state.get("investigation_id"),
@@ -1158,15 +1170,54 @@ class InvestigationNodes:
         # must not crash the node: LangGraph would remember it and replay it on
         # the next attempt. Asking again is the safe way to refuse it.
         while True:
-            approval, problem = _parse_decision(interrupt(request))
+            approval, problem = _parse_decision(interrupt(request), {item["id"] for item in proposals})
             if approval is not None:
                 break
             request = {**request, "error": problem}
 
         return {
             "approval": approval,
+            "proposed_actions": proposals,
             "events": [event("human_approval", f"Human decision received: {approval['status']}.")],
         }
+
+    # ============================================================== Node 9b
+    @traced("follow_up")
+    async def follow_up(self, state: InvestigationState) -> dict[str, Any]:
+        """Carry out the follow-up actions a person approved - and only those.
+
+        This is the one place where VeriAgent changes something outside itself.
+        It runs after the pause, reads which proposals were ticked, and hands
+        each to the action runner, which talks to the MCP server and makes sure
+        an action is never carried out twice (see app/actions/runner.py).
+        """
+        proposals = state.get("proposed_actions", [])
+        if not proposals:
+            return {}
+        approval = state.get("approval", {})
+        approved = set(approval.get("approved_actions", [])) if approval.get("status") in ("approved", "modified") else set()
+        results: list[dict[str, Any]] = []
+        records: list[dict[str, Any]] = []
+        events = []
+        for proposal in proposals:
+            summary = {key: proposal[key] for key in ("id", "kind", "server", "target", "title")}
+            if proposal["id"] not in approved or self.actions is None:
+                results.append({**summary, "status": "not_approved"})
+                continue
+            events.append(event("follow_up", f"Creating an issue in {proposal['target']}..."))
+            outcome, record = await self.actions.execute(str(state.get("investigation_id")), state["user_id"], proposal)
+            results.append(outcome)
+            if record is not None:
+                records.append(record)
+        update: dict[str, Any] = {"action_results": results}
+        if events:
+            update["events"] = events
+        if records:
+            update["tool_calls"] = records
+        failed = [item for item in results if item["status"] in ("failed", "unknown")]
+        if failed:
+            update["limitations"] = [f"An approved follow-up action was not completed: {item.get('detail') or item['status']}" for item in failed]
+        return update
 
     # =============================================================== Node 10
     @traced("final_report")
@@ -1198,8 +1249,11 @@ def _as_contradiction(finding: ProfileFinding, evidence_ids: list[str]) -> Contr
     )
 
 
-def _parse_decision(decision: Any) -> tuple[dict[str, Any] | None, str]:
-    """Validate what a person sent. Returns (approval, "") or (None, what is wrong)."""
+def _parse_decision(decision: Any, offered: set[str] | None = None) -> tuple[dict[str, Any] | None, str]:
+    """Validate what a person sent. Returns (approval, "") or (None, what is wrong).
+
+    ``offered``: the ids of the follow-up actions that were proposed with the request.
+    """
     if not isinstance(decision, dict):
         return None, "The decision must be an object with a 'decision' field."
     choice = str(decision.get("decision", "")).strip().lower()
@@ -1209,8 +1263,16 @@ def _parse_decision(decision: Any) -> tuple[dict[str, Any] | None, str]:
     modified_action = _clean_text(decision.get("modified_action"))
     if status == "modified" and not modified_action:
         return None, "A 'modify' decision needs the replacement recommendation."
+    wanted = decision.get("approved_actions") or []
+    if not isinstance(wanted, list) or any(not isinstance(item, str) for item in wanted):
+        return None, "'approved_actions' must be a list of action ids."
+    unknown = [item for item in wanted if item not in (offered or set())]
+    if unknown:
+        return None, f"Unknown action id: {unknown[0][:20]}. Only actions proposed with this report can be approved."
     return {
         "status": status,
+        # Rejecting the recommendation rejects what was proposed with it.
+        "approved_actions": list(dict.fromkeys(wanted)) if status != "rejected" else [],
         "reviewer": _clean_text(decision.get("reviewer"), 100) or "reviewer",
         "note": _clean_text(decision.get("note")),
         "modified_action": modified_action if status == "modified" else None,

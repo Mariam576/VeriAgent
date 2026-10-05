@@ -39,6 +39,8 @@ needs a truly independent point of view; here ordinary nodes are enough.
          |
      human_approval          pauses here (interrupt) when a person must decide,
          |                   and continues after POST /investigations/{id}/approve
+     follow_up               carries out the follow-up actions the person approved,
+         |                   through MCP (creates an issue); does nothing otherwise
      final_report
          |
         END                  (the service then stores the result and, once that
@@ -90,6 +92,7 @@ def build_investigation_graph(
     graph.add_node("review_findings", nodes.review_findings)
     graph.add_node("correct_findings", nodes.correct_findings)
     graph.add_node("human_approval", nodes.human_approval)
+    graph.add_node("follow_up", nodes.follow_up)
     graph.add_node("final_report", nodes.final_report)
 
     # --- edges: fixed order
@@ -99,7 +102,8 @@ def build_investigation_graph(
     graph.add_edge("calculate", "check_sufficiency")
     graph.add_edge("assess_risk", "review_findings")
     graph.add_edge("correct_findings", "review_findings")  # loop: review again after correcting
-    graph.add_edge("human_approval", "final_report")
+    graph.add_edge("human_approval", "follow_up")
+    graph.add_edge("follow_up", "final_report")
     graph.add_edge("final_report", END)
 
     # --- conditional edges: the router function picks the next node
@@ -116,6 +120,6 @@ def recursion_limit(max_agent_iterations: int) -> int:
     """Hard backstop on graph steps, on top of the iteration counter in the state.
 
     One retrieval loop is 5 nodes; a correction loop is 2. The straight path is
-    11 nodes. This leaves room for every allowed loop and nothing more.
+    12 nodes. This leaves room for every allowed loop and nothing more.
     """
-    return 14 + 5 * max_agent_iterations + 6
+    return 15 + 5 * max_agent_iterations + 6

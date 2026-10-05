@@ -78,6 +78,23 @@ class DocumentIntegrityOut(BaseModel):
     indicators: list[IntegrityIndicatorOut] = Field(default_factory=list)
 
 
+class ActionOut(BaseModel):
+    """Something to be done outside VeriAgent, and what became of it (see app/actions)."""
+
+    id: str  # "A1"
+    kind: str  # create_issue
+    server: str  # tickets | github
+    target: str  # where it goes, in words
+    title: str
+    body: str | None = None  # the exact text that is (or was) sent
+    # proposed = waiting for a person; not_approved = the person did not tick it;
+    # done / failed = carried out, or tried; unknown = started, result never recorded
+    status: Literal["proposed", "not_approved", "done", "failed", "unknown"] = "proposed"
+    reference: str | None = None  # "T-1A2B3C4D", "#17"
+    url: str | None = None
+    detail: str | None = None
+
+
 class CalculationOut(BaseModel):
     id: str
     description: str
@@ -160,6 +177,7 @@ class InvestigationReport(BaseModel):
     key_findings: list[FindingOut] = Field(default_factory=list)
     contradictions: list[ContradictionOut] = Field(default_factory=list)
     document_integrity: list[DocumentIntegrityOut] = Field(default_factory=list)
+    actions: list[ActionOut] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
     calculations: list[CalculationOut] = Field(default_factory=list)
     risk_reasons: list[FindingOut] = Field(default_factory=list)
@@ -222,6 +240,13 @@ class ApprovalRequest(BaseModel):
     note: str | None = Field(default=None, max_length=1000, description="Why. Shown in the final report.")
     modified_action: str | None = Field(
         default=None, max_length=1000, description="Required for 'modify': the recommendation to use instead."
+    )
+    approved_actions: list[str] = Field(
+        default_factory=list, max_length=5,
+        description=(
+            "Ids of the proposed follow-up actions to carry out (see 'actions' in the pending report), for example "
+            "[\"A1\"]. Nothing outside VeriAgent is done unless it is listed here. Ignored for 'reject'."
+        ),
     )
 
 
