@@ -14,13 +14,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api import documents, health
+from app.api import chat, documents, health, investigations
 from app.config import get_settings
 from app.database.session import dispose_engine, init_db
 from app.embeddings.base import EmbeddingError
 from app.errors import AppError
 from app.llm.base import LLMConfigurationError, LLMError
 from app.logging_config import configure_logging
+from app.security.guardrails import redact_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -65,13 +66,14 @@ def create_app() -> FastAPI:
     @app.exception_handler(LLMError)
     async def handle_llm_error(_: Request, exc: LLMError) -> JSONResponse:
         code = "llm_not_configured" if isinstance(exc, LLMConfigurationError) else "llm_unavailable"
-        return JSONResponse(status_code=503, content={"error": {"code": code, "message": str(exc)}})
+        message = redact_secrets(str(exc), get_settings())  # provider errors must never leak a key
+        return JSONResponse(status_code=503, content={"error": {"code": code, "message": message}})
 
     @app.exception_handler(EmbeddingError)
     async def handle_embedding_error(_: Request, exc: EmbeddingError) -> JSONResponse:
         return JSONResponse(
             status_code=503,
-            content={"error": {"code": "embeddings_unavailable", "message": str(exc)}},
+            content={"error": {"code": "embeddings_unavailable", "message": redact_secrets(str(exc), get_settings())}},
         )
 
     @app.exception_handler(Exception)
@@ -85,6 +87,8 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(documents.router)
+    app.include_router(investigations.router)
+    app.include_router(chat.router)
     return app
 
 

@@ -123,9 +123,11 @@ def guess_document_type(filename: str, first_page_text: str) -> str:
     for doc_type, keywords in _TYPE_KEYWORDS:
         if any(keyword.replace("_", " ") in name for keyword in keywords):
             return doc_type
-    head = first_page_text[:600].lower()
+    # Otherwise look at the title only (the first line). Looking deeper would
+    # label a cover note that merely mentions an invoice as an invoice.
+    title = next((line for line in first_page_text.splitlines() if line.strip()), "")[:120].lower()
     for doc_type, keywords in _TYPE_KEYWORDS:
-        if any(keyword in head for keyword in keywords if len(keyword) > 4):
+        if any(keyword in title for keyword in keywords if len(keyword) > 4):
             return doc_type
     return "other"
 
