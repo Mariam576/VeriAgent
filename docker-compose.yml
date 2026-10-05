@@ -1,4 +1,4 @@
-# Start everything:   docker compose up --build
+# Start everything:   docker compose up --build      then open http://localhost:8501
 # Stop:               docker compose down
 # Stop + wipe data:   docker compose down -v
 services:
@@ -44,6 +44,21 @@ services:
       - uploads:/app/uploads
       # Keeps the downloaded embedding model between restarts.
       - hf_cache:/home/app/.cache/huggingface
+
+  ui:
+    # The Streamlit interface. It only talks to the API over HTTP.
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    environment:
+      # Inside Docker the API host is the service name "api".
+      VERIAGENT_API_URL: http://api:8000
+    depends_on:
+      - api
+    restart: unless-stopped
+    ports:
+      # Open http://localhost:8501 in your browser. Reachable from this computer only.
+      - "127.0.0.1:${UI_PORT:-8501}:8501"
 
 volumes:
   pgdata:

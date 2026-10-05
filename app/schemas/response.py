@@ -27,6 +27,8 @@ class CitationOut(BaseModel):
     document: str
     page: int
     document_id: str | None = None
+    # The exact words on that page that support the statement (set for findings, not for the source list).
+    quote: str | None = None
 
 
 class FindingOut(BaseModel):

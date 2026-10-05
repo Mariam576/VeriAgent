@@ -38,6 +38,7 @@ from app.schemas.response import (
 )
 
 MAX_OTHER_FACTS = 6
+MAX_QUOTE_CHARS = 300
 _KEY_ORDER = {KEY_TOTAL_AMOUNT: 0, KEY_PAYMENT_TERMS: 1}
 _DOC_ORDER = {"contract": 0, "purchase_order": 1, "quotation": 2, "invoice": 3, "receipt": 4, "policy": 5}
 
@@ -49,7 +50,11 @@ CAPABILITIES = (
 
 
 def _cite(item: EvidenceItem) -> CitationOut:
-    return CitationOut(document=item.filename, page=item.page, document_id=item.document_id)
+    # The quote was checked against the chunk when the fact was extracted, so it is safe to show.
+    return CitationOut(
+        document=item.filename, page=item.page, document_id=item.document_id,
+        quote=item.quote[:MAX_QUOTE_CHARS] or None,
+    )
 
 
 def _cite_suspicious(item: dict[str, Any]) -> CitationOut:

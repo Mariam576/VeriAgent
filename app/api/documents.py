@@ -1,15 +1,18 @@
-"""Document endpoints: upload a file, list your files."""
+"""Document endpoints: upload a file, list your files, delete one."""
 
 from __future__ import annotations
 
+import asyncio
+import uuid
+from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, File, Form, Response, UploadFile
 
 from app.config import get_settings
 from app.database import repositories
 from app.embeddings.factory import get_embedding_provider
-from app.errors import FileTooLarge
+from app.errors import FileTooLarge, NotFound
 from app.rag.ingestion import ingest_document
 from app.schemas.document import DocumentList, DocumentOut
 from app.security.permissions import CurrentUser, DbSession
@@ -58,3 +61,23 @@ async def list_documents(user: CurrentUser, session: DbSession) -> DocumentList:
         out.chunk_count = chunk_count
         documents.append(out)
     return DocumentList(documents=documents)
+
+
+def _remove_stored_file(upload_dir: str, user_id: uuid.UUID, document_id: uuid.UUID) -> None:
+    # The stored name is "<document id>.<extension>", so this can only ever match that one file.
+    for path in (Path(upload_dir) / str(user_id)).glob(f"{document_id}.*"):
+        path.unlink(missing_ok=True)
+
+
+@router.delete("/{document_id}", status_code=204)
+async def delete_document(document_id: uuid.UUID, user: CurrentUser, session: DbSession) -> Response:
+    """Delete one of your documents: its text chunks, its vectors and the stored file.
+
+    Reports of earlier investigations keep their text; they just no longer link to the document.
+    """
+    document = await repositories.get_document(session, user.id, document_id)
+    if document is None:
+        raise NotFound("Document not found.")  # same answer whether it does not exist or belongs to someone else
+    await repositories.delete_document(session, document)
+    await asyncio.to_thread(_remove_stored_file, get_settings().UPLOAD_DIR, user.id, document_id)
+    return Response(status_code=204)

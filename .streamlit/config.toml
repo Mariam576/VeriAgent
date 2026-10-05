@@ -1,0 +1,12 @@
+# Settings for the Streamlit interface (ui/app.py).
+[server]
+headless = true
+# Same limit as the API's MAX_UPLOAD_MB, so the upload box does not promise more than the API accepts.
+maxUploadSize = 20
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# Hide the "Deploy" button and developer menu: this app runs on your own computer.
+toolbarMode = "minimal"

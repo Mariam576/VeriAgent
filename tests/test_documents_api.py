@@ -124,3 +124,47 @@ async def test_unreadable_pdf_is_recorded_as_failed(client, user_headers, tmp_pa
 async def test_invalid_user_header_is_rejected(client):
     response = await client.get("/documents", headers={"X-User-Id": "bad user; drop table"})
     assert response.status_code == 400
+
+
+async def test_delete_document_removes_chunks_file_and_keeps_old_reports(client, user_headers, samples_dir, settings):
+    from pathlib import Path
+
+    from app.security.permissions import user_uuid_for
+
+    contract = (await upload(client, user_headers, samples_dir / "Contract.pdf")).json()
+    invoice = (await upload(client, user_headers, samples_dir / "Invoice_102.pdf")).json()
+    stored = Path(settings.UPLOAD_DIR) / str(user_uuid_for(user_headers["X-User-Id"])) / f"{contract['id']}.pdf"
+    assert stored.exists()
+    report = (await client.post("/investigations", headers=user_headers, json={"question": "Compare the invoice with the contract."})).json()
+    assert report["contradictions"]
+
+    intruder = {"X-User-Id": user_headers["X-User-Id"] + "-intruder"}
+    assert (await client.delete(f"/documents/{contract['id']}", headers=intruder)).status_code == 404
+    assert (await client.delete(f"/documents/{contract['id']}", headers=user_headers)).status_code == 204
+    assert (await client.delete(f"/documents/{contract['id']}", headers=user_headers)).status_code == 404
+    assert (await client.delete("/documents/not-a-uuid", headers=user_headers)).status_code == 422
+
+    assert not stored.exists()
+    listing = (await client.get("/documents", headers=user_headers)).json()["documents"]
+    assert [document["id"] for document in listing] == [invoice["id"]]
+    async with get_session_factory()() as session:
+        chunks = await session.scalar(
+            select(func.count(DocumentChunk.id)).where(DocumentChunk.document_id == uuid.UUID(contract["id"]))
+        )
+    assert chunks == 0
+
+    # The earlier report is still readable, and a new search no longer finds the contract.
+    detail = await client.get(f"/investigations/{report['investigation_id']}", headers=user_headers)
+    assert detail.status_code == 200 and detail.json()["report"]["contradictions"]
+    again = (await client.post("/investigations", headers=user_headers, json={"question": "Compare the invoice with the contract."})).json()
+    assert {source["document"] for source in again["sources"]} == {"Invoice_102.pdf"}
+
+
+async def test_findings_carry_the_quote_that_supports_them(client, user_headers, samples_dir):
+    await upload(client, user_headers, samples_dir / "Contract.pdf")
+    report = (await client.post("/investigations", headers=user_headers, json={"question": "What is the total contract value?"})).json()
+    fact = next(f for f in report["key_findings"] if f["type"] == "fact" and "£40,000" in f["statement"])
+    citation = fact["citations"][0]
+    assert (citation["document"], citation["page"]) == ("Contract.pdf", 4)
+    assert "£40,000" in citation["quote"] and len(citation["quote"]) <= 300
+    assert all(source["quote"] is None for source in report["sources"])  # the source list stays a plain list of pages
