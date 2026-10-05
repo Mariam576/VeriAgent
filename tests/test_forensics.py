@@ -129,16 +129,24 @@ def test_invisible_ink_tiny_and_off_page_text():
     assert all(hidden not in text for hidden in ("render mode three", "one point high", "beyond the edge"))
     found = {item.region: item for item in inspect_pdf(data)[0]}
     assert found["render mode three"].type == "hidden_text" and "invisible ink" in found["render mode three"].reason
-    assert found["one point high"].type == "hidden_text" and "smaller than 2 points" in found["one point high"].reason
+    assert found["one point high"].type == "hidden_text" and "smaller than 3 points" in found["one point high"].reason
     assert found["beyond the edge"].type == "off_page_text"
+
+
+def scan(page, *printed: pymupdf.Rect) -> None:
+    """Place a picture of a page on the page: light grey paper with dark marks where something is printed."""
+    pixels = pymupdf.Pixmap(pymupdf.csGRAY, pymupdf.IRect(0, 0, 595, 842))
+    pixels.clear_with(230)
+    for area in printed:
+        for x in range(int(area.x0), int(area.x1), 4):  # strokes, like the letters of a printed line
+            pixels.set_rect(pymupdf.IRect(x, int(area.y0), x + 2, int(area.y1)), (40,))
+    page.insert_image(page.rect, pixmap=pixels)
 
 
 def test_the_text_layer_of_a_scanned_page_is_kept():
     """OCR software puts the recognised text in invisible ink on top of the scan. That is normal, and it is the text."""
     def build(page):
-        pixels = pymupdf.Pixmap(pymupdf.csGRAY, pymupdf.IRect(0, 0, 60, 85))
-        pixels.clear_with(230)
-        page.insert_image(page.rect, pixmap=pixels)
+        scan(page, pymupdf.Rect(60, 70, 200, 82))
         page.insert_text((60, 80), "Total amount due: £14,500", fontsize=11, render_mode=3)
 
     data = pdf(build)
@@ -147,9 +155,7 @@ def test_the_text_layer_of_a_scanned_page_is_kept():
 
 def test_a_few_typed_words_on_top_of_a_scan_are_reported():
     def build(page):
-        pixels = pymupdf.Pixmap(pymupdf.csGRAY, pymupdf.IRect(0, 0, 60, 85))
-        pixels.clear_with(230)
-        page.insert_image(page.rect, pixmap=pixels)
+        scan(page, pymupdf.Rect(60, 70, 190, 82))
         page.insert_text((60, 80), "Invoice total as scanned", fontsize=11, render_mode=3)  # the OCR layer
         page.insert_text((300, 400), "£19,500", fontsize=12, fontname="helv")  # typed on afterwards
 
@@ -255,10 +261,10 @@ def test_a_value_in_another_size_than_its_line_is_reported():
     def build(page):
         invoice(page)
         page.insert_text((60, 520), "Balance carried forward: ", fontsize=11, fontname="helv")
-        page.insert_text((190, 520), "£2,400", fontsize=12.5, fontname="helv")
+        page.insert_text((190, 520), "£2,400", fontsize=11.6, fontname="helv")
 
     [found] = inspect_pdf(pdf(build))[0]
-    assert found.type == "font_mismatch" and "12.5 pt" in found.reason and "11 pt" in found.reason
+    assert found.type == "font_mismatch" and "11.6 pt" in found.reason and "11 pt" in found.reason
 
 
 # =============================================================== file history

@@ -21,6 +21,7 @@ import json
 import re
 from typing import Any
 
+from app.forensics.model import HIDDEN_CONTENT
 from app.schemas.investigation import Calculation, Contradiction, EvidenceItem, RetrievedChunk
 from app.security.guardrails import UNTRUSTED_CLOSE, UNTRUSTED_OPEN, neutralize_delimiters, wrap_untrusted
 
@@ -252,8 +253,9 @@ def build_risk_prompt(
                         "id": item["id"], "document": item["document"], "level": item["level"],
                         "indicators": [
                             {"type": one["type"], "page": one["page"], "reason": neutralize_delimiters(one["reason"]),
-                             # What a hidden instruction says is of no use to the assessment: leave it out.
-                             "region": None if one["type"] == "hidden_instruction" else neutralize_delimiters(one["region"] or "") or None}
+                             # What hidden text says is of no use to the assessment, and it was put
+                             # there to be read by a model: only visible text is passed on.
+                             "region": None if one["type"] in HIDDEN_CONTENT else neutralize_delimiters(one["region"] or "") or None}
                             for one in item.get("indicators", [])
                         ],
                     }

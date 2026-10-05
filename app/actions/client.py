@@ -54,6 +54,9 @@ class ToolOutcome:
     text: str = ""  # what the server answered, as text (untrusted)
     data: dict[str, Any] | None = None  # the structured answer, when the server gave one
     error: str = ""
+    # True when the call was sent and no answer came back. The tool may have done its work:
+    # for something that cannot be undone, "no answer" is not the same as "did not happen".
+    uncertain: bool = False
 
 
 class McpError(Exception):
@@ -125,6 +128,8 @@ async def call_tool(
     """
     from mcp import Client
 
+    sent = False  # becomes True the moment the tool call leaves; before that nothing can have happened
+    name = ""
     try:
         async with asyncio.timeout(timeout):
             async with Client(_connection(endpoint), read_timeout_seconds=timeout) as client:
@@ -137,12 +142,15 @@ async def call_tool(
                 problem = check_arguments(offered[name].input_schema, arguments)
                 if problem:
                     return ToolOutcome(ok=False, tool=name, error=f"The arguments do not fit the tool: {problem}")
+                sent = True
                 result = await client.call_tool(name, arguments)
     except TimeoutError:
-        return ToolOutcome(ok=False, error=f"The MCP server '{endpoint.name}' did not answer within {timeout:g} seconds.")
+        error = f"The MCP server '{endpoint.name}' did not answer within {timeout:g} seconds."
+        return ToolOutcome(ok=False, tool=name if sent else "", error=error, uncertain=sent)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("mcp_call_failed server=%s error=%s", endpoint.name, type(exc).__name__)
-        return ToolOutcome(ok=False, error=f"The MCP server '{endpoint.name}' could not be used: {type(exc).__name__}")
+        logger.warning("mcp_call_failed server=%s error=%s sent=%s", endpoint.name, type(exc).__name__, sent)
+        error = f"The MCP server '{endpoint.name}' could not be used: {type(exc).__name__}"
+        return ToolOutcome(ok=False, tool=name if sent else "", error=error, uncertain=sent)
 
     text = _as_text(result)
     data = result.structured_content if isinstance(getattr(result, "structured_content", None), dict) else None

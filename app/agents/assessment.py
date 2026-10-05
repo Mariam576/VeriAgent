@@ -15,6 +15,7 @@ from fractions import Fraction
 from typing import Any
 
 from app.agents.heuristics import fallback_risk
+from app.forensics.model import HIDDEN_CONTENT
 from app.numbers import NUMBER_CORE, numbers_in_text, parse_number
 from app.rag.citations import citations_from_evidence, unsupported_citations
 from app.schemas.investigation import RISK_ORDER, Calculation, Contradiction, EvidenceItem, RetrievedChunk
@@ -341,9 +342,12 @@ def review_draft(
         | {item["id"] for item in integrity}
     )
     numbers = known_numbers(question, retrieved, evidence, contradictions, calculations)
-    for item in integrity:  # page numbers, and values quoted from the file by the forensic checks
+    for item in integrity:  # page numbers, and visible values quoted from the file by the forensic checks
         for one in item.get("indicators", []):
-            numbers.update(abs(value) for value in numbers_in_text(f"{one.get('reason', '')} {one.get('region') or ''}"))
+            # A number that only exists in hidden text is not a fact about the document. If it
+            # counted as known, a hidden "18,000 was approved" could be repeated in the summary.
+            seen_by_a_reader = "" if one.get("type") in HIDDEN_CONTENT else one.get("region") or ""
+            numbers.update(abs(value) for value in numbers_in_text(f"{one.get('reason', '')} {seen_by_a_reader}"))
         numbers.update(abs(value) for value in numbers_in_text(item.get("document", "")))
     kept_reasons = []
     for index, reason in enumerate(draft.get("reasons", []), start=1):

@@ -247,6 +247,66 @@ async def test_a_failed_action_is_recorded_as_failed(monkeypatch):
     assert record["status"] == "error" and log.records[("inv-1", "A1")]["status"] == "failed"
 
 
+async def test_no_answer_after_the_request_was_sent_is_unknown_not_failed(monkeypatch):
+    """Found in review: a server that created the ticket and answered too late was reported as
+    "failed ... was not completed" - an invitation to create the same issue again by hand."""
+    import asyncio
+
+    server = MCPServer("slow-github")
+    created: list[str] = []
+
+    @server.tool()
+    async def issue_write(method: str, owner: str, repo: str, title: str, body: str = "") -> dict:
+        """Create an issue, then take too long to say so."""
+        created.append(title)
+        await asyncio.sleep(2)
+        return {"url": f"https://github.com/{owner}/{repo}/issues/1"}
+
+    monkeypatch.setattr(mcp_client, "_connection", lambda endpoint: server)
+    target = ActionTarget("github", "GitHub repository acme/books", github_endpoint("https://x/mcp/", "t"), repository="acme/books")
+    log = MemoryActionLog()
+    runner = ActionRunner(target, log, timeout=0.3)
+    [proposal] = runner.propose(report())
+
+    outcome, record = await runner.execute("inv-1", "user-1", proposal)
+    assert created == [proposal["title"]]  # it did happen
+    assert outcome["status"] == "unknown" and outcome["reference"] is None
+    assert "did not answer within 0.3 seconds" in outcome["detail"] and "may have been carried out" in outcome["detail"]
+    assert record["status"] == "error" and record["tool_name"] == "mcp:github/issue_write"
+    assert log.records[("inv-1", "A1")]["status"] == "unknown"
+
+    again, _ = await runner.execute("inv-1", "user-1", proposal)  # the node runs again after a restart
+    assert again["status"] == "unknown" and created == [proposal["title"]]  # still once
+
+
+async def test_done_is_only_said_about_something_that_can_be_pointed_at(monkeypatch):
+    """Found in review: an answer without an error flag and without an id was recorded as "done"."""
+    server = MCPServer("vague-github")
+
+    @server.tool()
+    def issue_write(method: str, owner: str, repo: str, title: str, body: str = "") -> dict:
+        """Answers politely and creates nothing that it names."""
+        return {"message": "Your request has been received."}
+
+    monkeypatch.setattr(mcp_client, "_connection", lambda endpoint: server)
+    target = ActionTarget("github", "GitHub repository acme/books", github_endpoint("https://x/mcp/", "t"), repository="acme/books")
+    log = MemoryActionLog()
+    runner = ActionRunner(target, log)
+    [proposal] = runner.propose(report())
+    outcome, record = await runner.execute("inv-1", "user-1", proposal)
+    assert outcome["status"] == "unknown" and "without naming what it created" in outcome["detail"]
+    assert record["status"] == "error" and record["result"] is None
+    assert log.records[("inv-1", "A1")]["status"] == "unknown"
+
+
+async def test_a_failure_before_anything_was_sent_stays_a_plain_failure(tmp_path):
+    endpoint = McpEndpoint(name="nowhere", transport="stdio", command=sys.executable, args=("-c", "import sys; sys.exit(3)"))
+    outcome = await call_tool(endpoint, [("create_ticket", {"title": "x", "body": "y"})], timeout=10)
+    assert not outcome.ok and not outcome.uncertain  # the tool call never left, so nothing can have happened
+    wrong = await call_tool(ticket_endpoint(str(tmp_path / "t.jsonl")), [("create_ticket", {"title": "No body"})])
+    assert not wrong.ok and not wrong.uncertain
+
+
 # =============================================================== in the graph
 def build(samples_dir, tmp_path, *, pause: bool = True, files: tuple[str, ...] = ()):
     settings = get_settings()

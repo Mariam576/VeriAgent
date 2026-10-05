@@ -45,6 +45,10 @@ UNKNOWN_DETAIL = (
 )
 
 
+SENT_DETAIL = "The request had already been sent, so it may have been carried out. It was not tried again. Check the target system before creating it by hand."
+NO_REFERENCE_DETAIL = "The server answered without naming what it created, so it could not be confirmed. It was not tried again. Check the target system."
+
+
 class ActionLog(Protocol):
     async def start(self, investigation_id: str, user_id: str, proposal: dict[str, Any]) -> dict[str, Any] | None:
         """Write the action down as started. Returns None if that worked, or the existing record."""
@@ -186,9 +190,17 @@ class ActionRunner:
         calls = self.target.calls(proposal)
         result = await call_tool(self.target.endpoint, calls, timeout=self._timeout)
         latency = round((time.perf_counter() - started) * 1000, 1)
-        if result.ok:
-            reference, url = self.target.read_result(result)
+        reference, url = self.target.read_result(result) if result.ok else (None, None)
+        if result.ok and reference:
             outcome.update(status="done", reference=reference, url=url, detail=None)
+        elif result.ok:
+            # The server did not report an error, but named nothing that it created. "Done" is
+            # only ever said about something that can be pointed at.
+            outcome.update(status="unknown", reference=None, url=None, detail=NO_REFERENCE_DETAIL)
+        elif result.uncertain:
+            # The request left and no answer came back: the issue may exist. Saying "failed"
+            # here would invite someone to create it a second time by hand.
+            outcome.update(status="unknown", reference=None, url=None, detail=f"{result.error} {SENT_DETAIL}"[:500])
         else:
             outcome.update(status="failed", reference=None, url=None, detail=result.error[:300])
         await self._log.finish(investigation_id, proposal["id"], outcome)
@@ -205,10 +217,10 @@ class ActionRunner:
         record = {
             "tool_name": f"mcp:{self.target.server}/{tool}",
             "arguments": {"title": proposal["title"], "body_chars": len(proposal["body"]), "target": self.target.label},
-            "result": {"reference": outcome.get("reference"), "url": outcome.get("url")} if result.ok else None,
-            "status": "ok" if result.ok else "error",
+            "result": {"reference": outcome.get("reference"), "url": outcome.get("url")} if outcome["status"] == "done" else None,
+            "status": "ok" if outcome["status"] == "done" else "error",
             "latency_ms": latency,
-            "error": None if result.ok else outcome["detail"],
+            "error": None if outcome["status"] == "done" else outcome["detail"],
         }
         return outcome, record
 

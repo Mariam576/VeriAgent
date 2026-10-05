@@ -1042,6 +1042,11 @@ class InvestigationNodes:
             update.setdefault("limitations", []).append("The check of the files for signs of editing was unavailable for this request.")
             return []
         found = integrity_findings(reports)
+        # Not signs of editing, but things the reader should know about how a file was read
+        # (for example: its pages are scans, so their text could not be checked against the picture).
+        for item in reports:
+            for caveat in item.report.caveats[:3]:
+                update.setdefault("limitations", []).append(f"{item.filename}: {caveat}")
         tracing.record(
             "forensics", "lookup", documents=len(reports),
             flagged=[{"document": item["document"], "level": item["level"], "score": item["score"]} for item in found],
@@ -1214,9 +1219,14 @@ class InvestigationNodes:
             update["events"] = events
         if records:
             update["tool_calls"] = records
-        failed = [item for item in results if item["status"] in ("failed", "unknown")]
-        if failed:
-            update["limitations"] = [f"An approved follow-up action was not completed: {item.get('detail') or item['status']}" for item in failed]
+        notes = [
+            f"An approved follow-up action was not completed: {item.get('detail') or 'no details'}" if item["status"] == "failed"
+            # "Unknown" is not "failed": the issue may exist, and creating it again by hand would duplicate it.
+            else f"It is not known whether an approved follow-up action was carried out: {item.get('detail') or 'no details'}"
+            for item in results if item["status"] in ("failed", "unknown")
+        ]
+        if notes:
+            update["limitations"] = notes
         return update
 
     # =============================================================== Node 10

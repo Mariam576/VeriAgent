@@ -23,7 +23,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-FORENSICS_VERSION = 1
+# Raised whenever the checks change, so that stored reports made by an older version are made again
+# (app/forensics/store.py). 2: visibility is decided by comparing pictures of the page.
+FORENSICS_VERSION = 2
 
 Category = Literal["content", "typography", "consistency", "history"]
 Level = Literal["none", "low", "medium", "high"]
@@ -59,6 +61,13 @@ WEIGHTS: dict[str, tuple[Category, float]] = {
 }
 
 
+# Indicators whose ``region`` is text that a reader of the page cannot see. That text is shown
+# to the person who reviews the report, and to nobody else: it is never given to the language
+# model and its numbers never count as known facts. Whoever hid a sentence in a file wrote it
+# for a machine to find.
+HIDDEN_CONTENT = frozenset({"hidden_instruction", "hidden_text", "covered_text", "replaced_text", "off_page_text"})
+
+
 class Indicator(BaseModel):
     type: str
     category: Category
@@ -76,6 +85,9 @@ class ForensicReport(BaseModel):
     indicators: list[Indicator] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)  # author, producer, dates ... as found in the file
     note: str | None = None
+    # Things a reader of an investigation should know about how this file was read. They are not
+    # signs of editing and do not change the score: "these pages are scans", "this page could not be examined".
+    caveats: list[str] = Field(default_factory=list)
 
 
 def indicator(kind: str, reason: str, *, page: int | None = None, region: str | None = None) -> Indicator:
@@ -102,7 +114,24 @@ def level_of(score: float) -> Level:
     return "low" if score > 0 else "none"
 
 
-def build_report(indicators: list[Indicator], metadata: dict[str, Any] | None = None, note: str | None = None) -> ForensicReport:
+def build_report(
+    indicators: list[Indicator], metadata: dict[str, Any] | None = None, note: str | None = None, caveats: list[str] | None = None
+) -> ForensicReport:
     ordered = sorted(indicators, key=lambda item: -item.weight)[:MAX_INDICATORS]
     score = score_of(ordered)
-    return ForensicReport(score=score, level=level_of(score), indicators=ordered, metadata=metadata or {}, note=note)
+    return ForensicReport(
+        score=score, level=level_of(score), indicators=ordered, metadata=metadata or {}, note=note, caveats=caveats or [],
+    )
+
+
+def page_list(numbers: list[int]) -> str:
+    """[1, 2, 3, 7] -> "pages 1-3 and 7"."""
+    runs: list[list[int]] = []
+    for number in sorted(set(numbers)):
+        if runs and number == runs[-1][-1] + 1:
+            runs[-1].append(number)
+        else:
+            runs.append([number])
+    parts = [str(run[0]) if len(run) == 1 else f"{run[0]}-{run[-1]}" for run in runs]
+    joined = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+    return f"{'page' if len(set(numbers)) == 1 else 'pages'} {joined}"

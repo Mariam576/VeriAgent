@@ -229,8 +229,10 @@ export interface ForensicReport {
   score: number;
   level: "none" | "low" | "medium" | "high";
   indicators: (IntegrityIndicator & { category: string; weight: number })[];
-  metadata: Record<string, string | number>;
+  metadata: Record<string, string | number | number[]>;
   note: string | null;
+  /** How the file was read, where that matters: "these pages are scans", "this page could not be examined". */
+  caveats: string[];
 }
 
 export interface ForensicsOut {

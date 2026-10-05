@@ -48,12 +48,12 @@ def _load_pdf(data: bytes) -> list[PageText]:
     try:
         if document.needs_pass:
             raise DocumentProcessingError("The PDF is password protected. Remove the password and upload it again.")
-        from app.forensics.pdf import visible_text
+        from app.forensics.pdf import read_pdf, remember_inspection
 
-        pages = []
-        for index, page in enumerate(document, start=1):
-            pages.append(PageText(page_number=index, text=clean_text(visible_text(page, index))))
-        return pages
+        # One pass gives the visible text and what the forensic report needs (app/forensics/pdf.py).
+        texts, found, metadata = read_pdf(document, data)
+        remember_inspection(data, found, metadata)
+        return [PageText(page_number=index, text=clean_text(text)) for index, text in enumerate(texts, start=1)]
     except DocumentProcessingError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -70,22 +70,17 @@ def _load_docx(data: bytes) -> list[PageText]:
     except Exception as exc:  # noqa: BLE001
         raise DocumentProcessingError("The Word document could not be opened. It may be damaged.") from exc
 
-    from app.forensics.docx import visible_paragraph_text
+    from app.forensics.docx import read_docx
 
-    def shown(paragraphs) -> list[str]:
-        texts = [visible_paragraph_text(paragraph._p) for paragraph in paragraphs]
-        return [text for text in texts if text.strip()]
-
-    parts = shown(document.paragraphs)
-    for table in document.tables:
-        for row in table.rows:
-            cells = ["\n".join(shown(cell.paragraphs)).strip() for cell in row.cells]
-            cells = [cell for cell in cells if cell]
-            if cells:
-                parts.append(" | ".join(cells))
+    # Headers, the body with its tables and text boxes in the order of the document, footers:
+    # only what Word shows a reader (app/forensics/docx.py).
+    try:
+        lines = read_docx(document).lines
+    except Exception as exc:  # noqa: BLE001
+        raise DocumentProcessingError("The Word document could not be read. It may be damaged.") from exc
     # A .docx file has no fixed pages (they depend on the printer and fonts),
     # so the whole document is reported as page 1.
-    return [PageText(page_number=1, text=clean_text("\n".join(parts)))]
+    return [PageText(page_number=1, text=clean_text("\n".join(lines)))]
 
 
 def _load_txt(data: bytes) -> list[PageText]:

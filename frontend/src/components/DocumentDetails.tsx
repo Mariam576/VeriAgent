@@ -75,6 +75,11 @@ export function DocumentDetails({ document, onClose }: { document: DocumentInfo;
             <span className="muted small">A risk indicator, never proof that a document is forged.</span>
           </p>
           {report.note && <p className="muted small">{report.note}</p>}
+          {(report.caveats ?? []).map((caveat) => (
+            <p key={caveat} className="muted small">
+              {caveat}
+            </p>
+          ))}
           {report.indicators.length > 0 && (
             <ul className="plain">
               {report.indicators.map((indicator, index) => (
