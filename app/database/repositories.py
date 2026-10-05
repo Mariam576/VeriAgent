@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -171,18 +171,67 @@ async def save_investigation_result(
     report: dict[str, Any] | None,
     findings: list[dict[str, Any]],
     tool_calls: list[dict[str, Any]],
+    approval_status: str = "not_required",
+    approval_note: str | None = None,
+    completed: bool = True,
 ) -> None:
+    """Store the outcome of a run.
+
+    An investigation can be saved twice: once as a draft when it pauses for a
+    human decision (``completed=False``) and once when it is final. The second
+    save replaces the findings and tool calls of the first.
+    """
     investigation.status = status
     investigation.risk_level = risk_level
     investigation.confidence_score = confidence_score
     investigation.report = report
-    investigation.completed_at = utcnow()
+    investigation.approval_status = approval_status
+    investigation.approval_note = approval_note
+    if completed:
+        investigation.completed_at = utcnow()
+        if approval_status in ("approved", "rejected", "modified"):
+            investigation.approved_at = utcnow()
 
+    await session.execute(delete(Finding).where(Finding.investigation_id == investigation.id))
+    await session.execute(delete(ToolCall).where(ToolCall.investigation_id == investigation.id))
     for position, finding in enumerate(findings):
         session.add(Finding(investigation_id=investigation.id, position=position, **finding))
     for call in tool_calls:
         session.add(ToolCall(investigation_id=investigation.id, **call))
     await session.commit()
+
+
+async def mark_investigation_failed(session: AsyncSession, investigation_id: uuid.UUID) -> None:
+    await session.execute(
+        update(Investigation)
+        .where(Investigation.id == investigation_id)
+        .values(status="failed", completed_at=utcnow())
+    )
+    await session.commit()
+
+
+async def set_approval_status(session: AsyncSession, investigation_id: uuid.UUID, status: str) -> None:
+    await session.execute(
+        update(Investigation).where(Investigation.id == investigation_id).values(approval_status=status)
+    )
+    await session.commit()
+
+
+async def claim_pending_approval(session: AsyncSession, investigation_id: uuid.UUID) -> bool:
+    """Take the right to decide a paused investigation. Returns False if it is not waiting.
+
+    One UPDATE with the condition in its WHERE clause is atomic: when two
+    people click "Approve" and "Reject" at the same moment, the database lets
+    exactly one of them change ``pending`` to ``deciding``. The other request
+    updates no row and is told that the decision was already taken.
+    """
+    result = await session.execute(
+        update(Investigation)
+        .where(Investigation.id == investigation_id, Investigation.approval_status == "pending")
+        .values(approval_status="deciding")
+    )
+    await session.commit()
+    return result.rowcount == 1
 
 
 # -------------------------------------------------------------------- traces

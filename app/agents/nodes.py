@@ -41,7 +41,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from datetime import datetime, timezone
+
 from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.errors import GraphBubbleUp
+from langgraph.types import interrupt
 
 from app.agents import heuristics, prompts
 from app.agents.assessment import (
@@ -103,6 +107,8 @@ class AgentDeps:
     llm: BaseLLM
     retriever: Retriever
     settings: Settings
+    # True only when the graph has a checkpointer, because pausing needs somewhere to save the state.
+    pause_for_approval: bool = False
 
 
 def traced(name: str) -> Callable[[NodeFunction], NodeFunction]:
@@ -116,6 +122,11 @@ def traced(name: str) -> Callable[[NodeFunction], NodeFunction]:
             started = time.perf_counter()
             try:
                 update = await function(self, state)
+            except GraphBubbleUp:
+                # Not a failure: the node paused the graph on purpose (human approval).
+                logger.info("node_paused node=%s investigation=%s", name, investigation)
+                tracing.record("node", name, (time.perf_counter() - started) * 1000, paused=True)
+                raise
             except Exception as exc:
                 logger.exception("node_failed node=%s investigation=%s", name, investigation)
                 tracing.record(
@@ -159,6 +170,7 @@ class InvestigationNodes:
         self.llm = deps.llm
         self.retriever = deps.retriever
         self.settings = deps.settings
+        self.pause_for_approval = deps.pause_for_approval and deps.settings.ENABLE_HUMAN_APPROVAL
 
     # ================================================================ Node 1
     @traced("analyze_request")
@@ -709,9 +721,8 @@ class InvestigationNodes:
             update["calculations"] = [item for item in state.get("calculations", []) if item["id"] not in drops["calculations"]]
         return update
 
-    # =============================================================== Node 10
-    @traced("final_report")
-    async def final_report(self, state: InvestigationState) -> dict[str, Any]:
+    def _reviewed_state(self, state: InvestigationState) -> tuple[dict[str, Any], list[str]]:
+        """The state as it should be reported: with the reviewer's last corrections applied."""
         working = dict(state)
         limitations: list[str] = []
         review = state.get("review", {})
@@ -722,13 +733,68 @@ class InvestigationNodes:
             working["risk_draft"] = corrected
             limitations.append("The reviewer's remaining objections were resolved by rule: " + "; ".join(review.get("issues", [])[:3]))
             working["limitations"] = list(state.get("limitations", [])) + limitations
+        return working, limitations
 
-        report = build_report(
+    def _build_report(self, working: dict[str, Any]):
+        return build_report(
             working,
             human_approval_enabled=self.settings.ENABLE_HUMAN_APPROVAL,
             llm_provider=self.llm.provider,
             duration_ms=0.0,  # filled in by the service, which times the whole run
         )
+
+    # ================================================================ Node 9
+    @traced("human_approval")
+    async def human_approval(self, state: InvestigationState) -> dict[str, Any]:
+        """Pause for a person when the findings call for it.
+
+        Concept - human-in-the-loop with ``interrupt``:
+            ``interrupt(payload)`` stops the graph right here. LangGraph saves
+            the whole state through the checkpointer and returns control to
+            the caller, together with the payload (the draft report, so the
+            person can see what they are deciding about). Nothing is running
+            while the graph waits, so it can wait for seconds or for days.
+
+            When the person decides, the API resumes the graph with
+            ``Command(resume=decision)``. This node then runs again from its
+            first line, and this time ``interrupt`` returns the decision
+            instead of pausing. Code before ``interrupt`` therefore runs
+            twice, which is why it only reads the state and has no side effects.
+        """
+        working, _ = self._reviewed_state(state)
+        draft = self._build_report({**working, "approval": {"status": "pending"}})
+
+        if not draft.requires_human_review:
+            return {"approval": {"status": "not_required"}}
+        if not self.pause_for_approval:
+            # Pausing is switched off (or there is no checkpointer): only flag it.
+            return {"approval": {"status": "not_requested"}}
+
+        request = {
+            "type": "approval_request",
+            "investigation_id": state.get("investigation_id"),
+            "options": ["approve", "reject", "modify"],
+            "draft_report": draft.model_dump(mode="json"),
+        }
+        # Ask until the answer is usable. An answer that does not make sense
+        # must not crash the node: LangGraph would remember it and replay it on
+        # the next attempt. Asking again is the safe way to refuse it.
+        while True:
+            approval, problem = _parse_decision(interrupt(request))
+            if approval is not None:
+                break
+            request = {**request, "error": problem}
+
+        return {
+            "approval": approval,
+            "events": [event("human_approval", f"Human decision received: {approval['status']}.")],
+        }
+
+    # =============================================================== Node 10
+    @traced("final_report")
+    async def final_report(self, state: InvestigationState) -> dict[str, Any]:
+        working, limitations = self._reviewed_state(state)
+        report = self._build_report(working)
         update: dict[str, Any] = {
             "report": report.model_dump(),
             "final_answer": report.answer_text,
@@ -742,6 +808,34 @@ class InvestigationNodes:
         if limitations:
             update["limitations"] = limitations
         return update
+
+
+def _parse_decision(decision: Any) -> tuple[dict[str, Any] | None, str]:
+    """Validate what a person sent. Returns (approval, "") or (None, what is wrong)."""
+    if not isinstance(decision, dict):
+        return None, "The decision must be an object with a 'decision' field."
+    choice = str(decision.get("decision", "")).strip().lower()
+    status = {"approve": "approved", "reject": "rejected", "modify": "modified"}.get(choice)
+    if status is None:
+        return None, "The decision must be one of: approve, reject, modify."
+    modified_action = _clean_text(decision.get("modified_action"))
+    if status == "modified" and not modified_action:
+        return None, "A 'modify' decision needs the replacement recommendation."
+    return {
+        "status": status,
+        "reviewer": _clean_text(decision.get("reviewer"), 100) or "reviewer",
+        "note": _clean_text(decision.get("note")),
+        "modified_action": modified_action if status == "modified" else None,
+        "decided_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }, ""
+
+
+def _clean_text(value: Any, limit: int = 1000) -> str | None:
+    """Text typed by a reviewer: no control characters, bounded length."""
+    if value is None:
+        return None
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", str(value)).strip()
+    return cleaned[:limit] or None
 
 
 def _flatten_numbers(value: Any) -> list[float]:

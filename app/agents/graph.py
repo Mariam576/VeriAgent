@@ -34,13 +34,23 @@ needs a truly independent point of view; here ordinary nodes are enough.
          |            |      |
          |     correct_findings
          |
+     human_approval          pauses here (interrupt) when a person must decide,
+         |                   and continues after POST /investigations/{id}/approve
      final_report
          |
         END
+
+Concept - checkpointing:
+    When the graph is compiled with a checkpointer, LangGraph saves the state
+    after every node under a ``thread_id`` (here: the investigation id). That
+    is what makes pausing possible: the paused investigation lives in the
+    database, not in memory, so it survives a restart and can be resumed by a
+    later request.
 """
 
 from __future__ import annotations
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
@@ -54,7 +64,12 @@ from app.agents.routing import (
 from app.agents.state import InvestigationState
 
 
-def build_investigation_graph(deps: AgentDeps) -> CompiledStateGraph:
+def build_investigation_graph(
+    deps: AgentDeps, checkpointer: BaseCheckpointSaver | None = None
+) -> CompiledStateGraph:
+    # Without a checkpointer the graph cannot pause, so it must not try to.
+    if checkpointer is None and deps.pause_for_approval:
+        raise ValueError("pause_for_approval needs a checkpointer")
     nodes = InvestigationNodes(deps)
     graph = StateGraph(InvestigationState)
 
@@ -68,6 +83,7 @@ def build_investigation_graph(deps: AgentDeps) -> CompiledStateGraph:
     graph.add_node("assess_risk", nodes.assess_risk)
     graph.add_node("review_findings", nodes.review_findings)
     graph.add_node("correct_findings", nodes.correct_findings)
+    graph.add_node("human_approval", nodes.human_approval)
     graph.add_node("final_report", nodes.final_report)
 
     # --- edges: fixed order
@@ -77,21 +93,22 @@ def build_investigation_graph(deps: AgentDeps) -> CompiledStateGraph:
     graph.add_edge("calculate", "check_sufficiency")
     graph.add_edge("assess_risk", "review_findings")
     graph.add_edge("correct_findings", "review_findings")  # loop: review again after correcting
+    graph.add_edge("human_approval", "final_report")
     graph.add_edge("final_report", END)
 
     # --- conditional edges: the router function picks the next node
     graph.add_conditional_edges("analyze_request", route_after_analysis, ["retrieve", "extract_evidence"])
     graph.add_conditional_edges("detect_contradictions", route_after_contradictions, ["calculate", "check_sufficiency"])
     graph.add_conditional_edges("check_sufficiency", route_after_sufficiency, ["retrieve", "assess_risk"])  # loop
-    graph.add_conditional_edges("review_findings", route_after_review, ["correct_findings", "final_report"])
+    graph.add_conditional_edges("review_findings", route_after_review, ["correct_findings", "human_approval"])
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
 def recursion_limit(max_agent_iterations: int) -> int:
     """Hard backstop on graph steps, on top of the iteration counter in the state.
 
     One retrieval loop is 5 nodes; a correction loop is 2. The straight path is
-    9 nodes. This leaves room for every allowed loop and nothing more.
+    10 nodes. This leaves room for every allowed loop and nothing more.
     """
-    return 12 + 5 * max_agent_iterations + 6
+    return 13 + 5 * max_agent_iterations + 6

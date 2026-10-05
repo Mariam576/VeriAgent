@@ -4,8 +4,11 @@ Concept - short-term memory (Version 1 form):
     Each chat turn is stored in the ``messages`` table. When the next question
     arrives, the last few turns are given to the request-analysis step, which
     rewrites a follow-up such as "What about the payment terms?" into a
-    standalone question. Version 2 replaces this with LangGraph checkpointing,
-    which keeps the whole graph state per conversation thread.
+    standalone question.
+
+    Checkpointing (see ``app/agents/checkpoint.py``) is a different kind of
+    memory: it saves the state of one investigation so that it can pause and
+    resume. The conversation itself stays in the ``messages`` table.
 """
 
 from __future__ import annotations
@@ -43,15 +46,19 @@ async def chat(request: ChatRequest, user: CurrentUser, session: DbSession) -> C
 
     # Stored only after a successful run, so a failed turn does not pollute the history.
     await repositories.add_message(session, conversation_id, "user", request.message.strip())
-    await repositories.add_message(session, conversation_id, "assistant", report.summary)
+    answer = report.summary
+    if report.human_review.status == "pending":
+        answer += " This result is waiting for a human decision before it is final."
+    await repositories.add_message(session, conversation_id, "assistant", answer)
 
     return ChatResponse(
         conversation_id=conversation_id,
         investigation_id=investigation_id,
-        answer=report.summary,
+        answer=answer,
         risk_level=report.risk_level,
         confidence=report.confidence,
         status=report.status,
         requires_human_review=report.requires_human_review,
+        approval_status=report.human_review.status,
         citations=report.sources,
     )

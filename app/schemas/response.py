@@ -60,6 +60,27 @@ class CalculationOut(BaseModel):
     requested_by: str
 
 
+ApprovalStatus = Literal["not_required", "not_requested", "pending", "approved", "rejected", "modified"]
+
+
+class HumanReview(BaseModel):
+    """Human-in-the-loop state of a report.
+
+    not_required   nothing in the findings calls for a person
+    not_requested  a person should look at it, but pausing for approval is switched off
+    pending        the investigation is paused and waits for a decision
+    approved / rejected / modified   the decision a person made
+    """
+
+    required: bool = False
+    status: ApprovalStatus = "not_required"
+    reviewer: str | None = None
+    note: str | None = None
+    decided_at: str | None = None
+    # The agent's own recommendation, kept when a person rejected or replaced it.
+    original_action: str | None = None
+
+
 class ReportStats(BaseModel):
     iterations: int = 0
     llm_calls: int = 0
@@ -84,6 +105,7 @@ class InvestigationReport(BaseModel):
     confidence: float
     evidence_quality: Literal["strong", "moderate", "weak", "none"]
     requires_human_review: bool
+    human_review: HumanReview = Field(default_factory=HumanReview)
     summary: str
     key_findings: list[FindingOut] = Field(default_factory=list)
     contradictions: list[ContradictionOut] = Field(default_factory=list)
@@ -125,7 +147,21 @@ class ChatResponse(BaseModel):
     confidence: float
     status: str
     requires_human_review: bool
+    # "pending" means: call POST /investigations/{investigation_id}/approve to finish.
+    approval_status: ApprovalStatus = "not_required"
     citations: list[CitationOut]
+
+
+class ApprovalRequest(BaseModel):
+    """A person's decision on a paused investigation."""
+
+    decision: Literal["approve", "reject", "modify"] = Field(
+        description="approve = accept the agent's recommendation; reject = do not accept it; modify = replace it."
+    )
+    note: str | None = Field(default=None, max_length=1000, description="Why. Shown in the final report.")
+    modified_action: str | None = Field(
+        default=None, max_length=1000, description="Required for 'modify': the recommendation to use instead."
+    )
 
 
 # ----------------------------------------------------------------- listings
@@ -135,6 +171,7 @@ class InvestigationSummary(BaseModel):
     id: uuid.UUID
     question: str
     status: str
+    approval_status: str = "not_required"
     risk_level: str | None = None
     confidence_score: float | None = None
     created_at: datetime

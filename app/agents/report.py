@@ -28,6 +28,7 @@ from app.schemas.response import (
     CitationOut,
     ContradictionOut,
     FindingOut,
+    HumanReview,
     InvestigationReport,
     ReportStats,
 )
@@ -114,6 +115,29 @@ def _calculation_sentence(contradiction: Contradiction) -> str | None:
         change = contradiction.percentage_change
         sentence += f" ({format_value(abs(change), '%')} {'more' if change > 0 else 'less'})"
     return sentence + "."
+
+
+def human_review_block(required: bool, approval: dict[str, Any] | None, agent_action: str) -> tuple[HumanReview, str]:
+    """Combine "is a person needed?" with the decision a person made, if any.
+
+    Returns the review block and the recommended action to show. A person can
+    replace the agent's recommendation (modify) or refuse it (reject); the
+    agent's own wording is then kept in ``original_action`` for the record.
+    """
+    approval = approval or {}
+    status = approval.get("status") or ("not_requested" if required else "not_required")
+    review = HumanReview(
+        required=required, status=status, reviewer=approval.get("reviewer"),
+        note=approval.get("note"), decided_at=approval.get("decided_at"),
+    )
+    action = agent_action
+    if status == "modified" and approval.get("modified_action"):
+        review.original_action = agent_action
+        action = approval["modified_action"]
+    elif status == "rejected":
+        review.original_action = agent_action
+        action = "The reviewer rejected the agent's recommendation." + (f" Reason: {review.note}" if review.note else "")
+    return review, action
 
 
 def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_provider: str, duration_ms: float) -> InvestigationReport:
@@ -209,6 +233,7 @@ def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_pro
         summary, action = CAPABILITIES, "Upload documents and ask a question about them."
     else:
         summary, action = draft.get("summary", ""), draft.get("recommended_action", "")
+    review, action = human_review_block(human_review, state.get("approval"), action)
 
     report = InvestigationReport(
         investigation_id=state.get("investigation_id", ""),
@@ -219,6 +244,7 @@ def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_pro
         confidence=round(confidence, 2),
         evidence_quality=evidence_quality(evidence, int(state.get("discarded_facts", 0)), missing),  # type: ignore[arg-type]
         requires_human_review=human_review,
+        human_review=review,
         summary=summary,
         key_findings=findings,
         contradictions=contradictions_out,
@@ -244,6 +270,15 @@ def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_pro
     return report
 
 
+def _human_review_line(review: HumanReview) -> str:
+    if review.status == "pending":
+        return "Required - waiting for a decision (approve / reject / modify)"
+    if review.status in ("approved", "rejected", "modified"):
+        line = f"{review.status.capitalize()} by {review.reviewer or 'reviewer'}"
+        return line + (f" - {review.note}" if review.note else "")
+    return "Required" if review.required else "Not required"
+
+
 def render_report(report: InvestigationReport) -> str:
     """The report as readable text, in the layout of spec section 3."""
     if report.status == "not_applicable":
@@ -256,7 +291,7 @@ def render_report(report: InvestigationReport) -> str:
         f"Investigation Status: {report.status_label}",
         f"Overall Risk Level: {report.risk_level.capitalize()}",
         f"Confidence Score: {round(report.confidence * 100)}%",
-        f"Human Review: {'Required' if report.requires_human_review else 'Not required'}",
+        f"Human Review: {_human_review_line(report.human_review)}",
         "",
         "Summary:",
         report.summary,
@@ -276,6 +311,8 @@ def render_report(report: InvestigationReport) -> str:
         lines += ["", "Risk Reasoning (inference):"]
         lines += [f"- {reason.statement}{cites(reason.citations)}" for reason in report.risk_reasons]
     lines += ["", f"Evidence Quality: {report.evidence_quality.capitalize()}", "", "Recommended Action:", report.recommended_action]
+    if report.human_review.original_action:
+        lines.append(f"(The agent had recommended: {report.human_review.original_action})")
     if report.sources:
         lines += ["", "Sources:"]
         lines += [f"- {source.document} — Page {source.page}" for source in report.sources]

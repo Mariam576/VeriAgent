@@ -7,6 +7,15 @@
 It uploads the sample contract, invoice and policy, asks the question and
 prints the report. Uploading the same files again is harmless (duplicates are
 detected), so the script can be run as often as you like.
+
+Human approval
+    The demo investigation finds a high-risk mismatch, so it pauses and waits
+    for a person. The script then asks you to approve, reject or modify. To
+    answer without typing:
+
+    python -m scripts.run_demo --decision approve --note "Checked with procurement"
+    python -m scripts.run_demo --decision modify --action "Pay 40,000 and dispute the rest"
+    python -m scripts.run_demo --decision skip      (leave it waiting)
 """
 
 from __future__ import annotations
@@ -27,12 +36,43 @@ def fail(message: str) -> int:
     return 1
 
 
+def print_report(report: dict) -> None:
+    print("=" * 78)
+    print(report["answer_text"])
+    print("=" * 78)
+
+
+def ask_decision(args: argparse.Namespace) -> dict | None:
+    """The decision to send, or None to leave the investigation waiting."""
+    choice, note, action = args.decision, args.note, args.action
+    if choice is None:
+        if not sys.stdin.isatty():
+            print("\nThis investigation is waiting for a human decision (no terminal to ask in).")
+            return None
+        print("\nThis investigation is paused and waits for your decision.")
+        while choice not in ("approve", "reject", "modify", "skip"):
+            choice = input("Decision [approve / reject / modify / skip]: ").strip().lower()
+        if choice == "modify" and not action:
+            action = input("Recommendation to use instead: ").strip()
+        if choice != "skip" and note is None:
+            note = input("Note (optional): ").strip() or None
+    if choice == "skip":
+        return None
+    decision = {"decision": choice, "note": note}
+    if choice == "modify":
+        decision["modified_action"] = action
+    return decision
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the VeriAgent demo investigation.")
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--user", default="demo-user", help="Value for the X-User-Id header.")
     parser.add_argument("--question", default=DEFAULT_QUESTION)
     parser.add_argument("--with-injection", action="store_true", help="Also upload a note containing a prompt-injection attempt.")
+    parser.add_argument("--decision", choices=["approve", "reject", "modify", "skip"], help="Answer the approval request without asking.")
+    parser.add_argument("--note", default=None, help="Reason for the decision (shown in the final report).")
+    parser.add_argument("--action", default=None, help="For --decision modify: the recommendation to use instead.")
     args = parser.parse_args()
 
     if not (SAMPLES_DIR / "Contract.pdf").exists():
@@ -71,9 +111,22 @@ def main() -> int:
             return fail(f"Investigation failed: {response.status_code} {response.text}")
         report = response.json()
 
-    print("=" * 78)
-    print(report["answer_text"])
-    print("=" * 78)
+        if report["human_review"]["status"] == "pending":
+            print_report(report)
+            decision = ask_decision(args)
+            if decision is None:
+                print(
+                    f"\nLeft waiting. Decide later with:\n"
+                    f"  POST {args.base_url}/investigations/{report['investigation_id']}/approve"
+                )
+                return 0
+            response = client.post(f"/investigations/{report['investigation_id']}/approve", json=decision)
+            if response.status_code != 200:
+                return fail(f"The decision was not accepted: {response.status_code} {response.text}")
+            report = response.json()
+            print("\nFinal report after the decision:\n")
+
+    print_report(report)
     stats = report["stats"]
     print(
         f"Investigation {report['investigation_id']}\n"

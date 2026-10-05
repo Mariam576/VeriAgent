@@ -1,4 +1,4 @@
-"""Investigation endpoints: start one, list them, read the report and findings."""
+"""Investigation endpoints: start one, decide a paused one, list them, read report, findings and trace."""
 
 from __future__ import annotations
 
@@ -6,10 +6,11 @@ import uuid
 
 from fastapi import APIRouter
 
-from app.agents.service import run_investigation
+from app.agents.service import decide_investigation, resume_investigation, run_investigation
 from app.database import repositories
 from app.errors import NotFound
 from app.schemas.response import (
+    ApprovalRequest,
     FindingList,
     InvestigationDetail,
     InvestigationList,
@@ -27,7 +28,12 @@ router = APIRouter(prefix="/investigations", tags=["investigations"])
 
 @router.post("", response_model=InvestigationReport, status_code=201)
 async def create_investigation(request: InvestigationRequest, user: CurrentUser, session: DbSession) -> InvestigationReport:
-    """Run a full investigation over your uploaded documents and return the structured report."""
+    """Run a full investigation over your uploaded documents and return the structured report.
+
+    When the findings need a human decision, the investigation pauses and the
+    report comes back as a draft with ``human_review.status = "pending"``.
+    Send the decision to ``POST /investigations/{id}/approve`` to finish it.
+    """
     _, report = await run_investigation(
         session,
         user=user,
@@ -37,6 +43,37 @@ async def create_investigation(request: InvestigationRequest, user: CurrentUser,
         year=request.year,
     )
     return report
+
+
+@router.post("/{investigation_id}/approve", response_model=InvestigationReport)
+async def approve_investigation(
+    investigation_id: uuid.UUID, request: ApprovalRequest, user: CurrentUser, session: DbSession
+) -> InvestigationReport:
+    """Approve, reject or modify a paused investigation. Returns the final report.
+
+    Answers 409 when the investigation is not waiting for a decision (for
+    example because someone else already decided).
+    """
+    return await decide_investigation(
+        session,
+        user=user,
+        investigation_id=investigation_id,
+        decision=request.decision,
+        note=request.note,
+        modified_action=request.modified_action,
+    )
+
+
+@router.post("/{investigation_id}/resume", response_model=InvestigationReport)
+async def resume_interrupted_investigation(
+    investigation_id: uuid.UUID, user: CurrentUser, session: DbSession
+) -> InvestigationReport:
+    """Continue an investigation that was cut off (for example by a server restart).
+
+    The work done before the interruption is not repeated: the graph continues
+    from the last node whose result was saved by the checkpointer.
+    """
+    return await resume_investigation(session, user=user, investigation_id=investigation_id)
 
 
 @router.get("", response_model=InvestigationList)

@@ -18,8 +18,9 @@ Concept - reducers:
     So a node can return ``{"llm_calls": 1}`` and the counter goes up by one.
 
 Everything stored here is plain JSON-like data (dicts, lists, strings,
-numbers). That keeps the state easy to log and ready for checkpointing
-(pause / resume), which is added in Version 2.
+numbers). That keeps the state easy to log, and it is what allows
+checkpointing: after every node the whole state is saved to PostgreSQL, so an
+investigation can pause for a human decision and resume later.
 """
 
 from __future__ import annotations
@@ -41,6 +42,9 @@ class InvestigationState(TypedDict, total=False):
     history: list[dict[str, str]]  # earlier turns of the conversation: {"role", "content"}
     document_ids: list[str]  # optional: restrict the investigation to these documents
     filters: dict[str, Any]  # optional metadata filters: document_type, year
+    # Long-term memory handed in by the service (read-only for the graph):
+    preferences: dict[str, str]  # user profile, e.g. {"detail_level": "brief"}
+    memories: list[dict[str, Any]]  # related earlier investigations of the same user
 
     # --------------------------------------------------- request analysis
     analysis: dict[str, Any]
@@ -69,6 +73,8 @@ class InvestigationState(TypedDict, total=False):
     review: dict[str, Any]
     review_rounds: int
     requires_human_review: bool
+    # Human decision: {"status", "reviewer", "note", "modified_action", "decided_at"}
+    approval: dict[str, Any]
 
     # -------------------------------------------------------------- output
     report: dict[str, Any]
@@ -93,6 +99,8 @@ def initial_state(
     history: list[dict[str, str]] | None = None,
     document_ids: list[str] | None = None,
     filters: dict[str, Any] | None = None,
+    preferences: dict[str, str] | None = None,
+    memories: list[dict[str, Any]] | None = None,
 ) -> InvestigationState:
     from langchain_core.messages import HumanMessage
 
@@ -105,6 +113,8 @@ def initial_state(
         history=history or [],
         document_ids=document_ids or [],
         filters=filters or {},
+        preferences=preferences or {},
+        memories=memories or [],
         search_queries=[],
         executed_queries=[],
         retrieved_documents=[],

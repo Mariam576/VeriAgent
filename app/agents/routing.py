@@ -33,11 +33,11 @@ def route_after_sufficiency(state: InvestigationState) -> Literal["retrieve", "a
     return "retrieve" if state.get("retrieve_again") else "assess_risk"
 
 
-def route_after_review(state: InvestigationState) -> Literal["correct_findings", "final_report"]:
-    """Approved?  no -> correct and review again (bounded)   yes -> final report."""
+def route_after_review(state: InvestigationState) -> Literal["correct_findings", "human_approval"]:
+    """Approved?  no -> correct and review again (bounded)   yes -> human review, then the final report."""
     review = state.get("review", {})
     if review.get("approved", True):
-        return "final_report"
+        return "human_approval"
     if state.get("review_rounds", 0) > MAX_REVIEW_ROUNDS:
-        return "final_report"  # loop protection; final_report applies the remaining fixes by rule
+        return "human_approval"  # loop protection; the remaining fixes are applied by rule
     return "correct_findings"

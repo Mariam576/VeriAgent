@@ -45,6 +45,7 @@ async def test_demo_investigation_end_to_end(client, user_headers, library):
     assert report["status"] == "review_required"
     assert report["risk_level"] == "high"
     assert report["requires_human_review"] is True
+    assert report["human_review"]["status"] == "pending"  # paused: a person has to decide
     amount = next(c for c in report["contradictions"] if c["type"] == "amount_mismatch")
     assert (amount["value_a"], amount["value_b"], amount["difference"]) == (40000, 58000, 18000)
     assert any(c["type"] == "payment_terms_mismatch" for c in report["contradictions"])
@@ -60,7 +61,7 @@ async def test_demo_investigation_end_to_end(client, user_headers, library):
     detail = (await client.get(f"/investigations/{investigation_id}", headers=user_headers)).json()
     assert detail["status"] == "review_required" and detail["risk_level"] == "high"
     assert detail["question"] == DEMO_QUESTION
-    assert detail["completed_at"] is not None
+    assert detail["approval_status"] == "pending" and detail["completed_at"] is None
     assert detail["report"]["answer_text"] == report["answer_text"]
 
     # --- findings are stored one per row, typed, with their source document and page
@@ -188,7 +189,7 @@ async def test_missing_llm_configuration_gives_a_clear_503(client, user_headers,
     from app.agents import service
     from app.llm.base import LLMConfigurationError
 
-    def broken_graph():
+    async def broken_graph():
         raise LLMConfigurationError("GEMINI_API_KEY is not set. Add it to your .env file.")
 
     monkeypatch.setattr(service, "get_graph", broken_graph)
@@ -245,12 +246,19 @@ async def test_report_is_explicit_when_no_model_answered(client, user_headers, l
     from app.database.session import get_session_factory as session_factory
     from app.embeddings.factory import get_embedding_provider
     from app.rag.retriever import PgVectorRetriever
+    from langgraph.checkpoint.memory import InMemorySaver
+
     from tests.helpers import DownLLM
 
-    graph = build_investigation_graph(AgentDeps(
-        llm=DownLLM(), retriever=PgVectorRetriever(session_factory(), get_embedding_provider()), settings=get_settings(),
-    ))
-    monkeypatch.setattr(service, "get_graph", lambda: graph)
+    graph = build_investigation_graph(
+        AgentDeps(llm=DownLLM(), retriever=PgVectorRetriever(session_factory(), get_embedding_provider()), settings=get_settings()),
+        checkpointer=InMemorySaver(),
+    )
+
+    async def down_graph():
+        return graph
+
+    monkeypatch.setattr(service, "get_graph", down_graph)
 
     report = (await client.post("/investigations", headers=user_headers, json={"question": DEMO_QUESTION})).json()
     assert report["stats"]["llm_calls"] == 0

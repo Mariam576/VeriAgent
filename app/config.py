@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------- Agent
     MAX_AGENT_ITERATIONS: int = Field(default=6, ge=1, le=20)
     ENABLE_HUMAN_APPROVAL: bool = True
+    # Checkpoints of a finished investigation are deleted unless this is on (useful for debugging).
+    KEEP_CHECKPOINTS: bool = False
+    # A run with no progress for this long is treated as interrupted and may be resumed.
+    STALE_RUN_SECONDS: int = Field(default=300, ge=0)
     MAX_QUESTION_CHARS: int = Field(default=2000, ge=10)
 
     # -------------------------------------------------------------- Uploads

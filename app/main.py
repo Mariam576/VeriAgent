@@ -14,6 +14,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app.agents.checkpoint import close_checkpointer, get_checkpointer
+from app.agents.service import reset_graph
 from app.api import chat, documents, health, investigations
 from app.config import get_settings
 from app.database.session import dispose_engine, init_db
@@ -39,7 +41,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         settings.LLM_PROVIDER,
         settings.EMBEDDING_PROVIDER,
     )
+    await get_checkpointer()  # opens its connection pool and creates the checkpoint tables
     yield
+    reset_graph()
+    await close_checkpointer()
     await dispose_engine()
 
 
