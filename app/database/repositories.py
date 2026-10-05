@@ -19,6 +19,7 @@ from app.database.models import (
     Conversation,
     Document,
     DocumentChunk,
+    DocumentForensicsRow,
     Finding,
     Investigation,
     Message,
@@ -155,6 +156,17 @@ async def delete_user(session: AsyncSession, user_id: uuid.UUID) -> None:
 
 
 # ----------------------------------------------------------------- documents
+async def integrity_levels(session: AsyncSession, document_ids: list[uuid.UUID]) -> dict[uuid.UUID, tuple[str, float]]:
+    """{document id: (level, score)} of the forensic reports that exist for these documents."""
+    if not document_ids:
+        return {}
+    result = await session.execute(
+        select(DocumentForensicsRow.document_id, DocumentForensicsRow.level, DocumentForensicsRow.score)
+        .where(DocumentForensicsRow.document_id.in_(document_ids))
+    )
+    return {document_id: (level, score) for document_id, level, score in result.all()}
+
+
 async def get_document_by_hash(session: AsyncSession, user_id: uuid.UUID, file_hash: str) -> Document | None:
     result = await session.execute(
         select(Document).where(Document.user_id == user_id, Document.file_hash == file_hash)

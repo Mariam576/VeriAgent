@@ -23,6 +23,7 @@ from app.security.guardrails import detect_prompt_injection
 RISK_LEVELS = ["low", "medium", "high", "critical"]
 
 _SEVERITY_POINTS = {"low": 1, "medium": 2, "high": 3}
+MAX_INTEGRITY_INDICATORS = 4
 
 
 def clean_ids(identifiers: list[Any] | None) -> list[str]:
@@ -36,17 +37,53 @@ def clean_ids(identifiers: list[Any] | None) -> list[str]:
 
 
 # -------------------------------------------------------------- risk baseline
-def risk_points(contradictions: list[Contradiction], missing_evidence: list[str], suspicious: list[dict]) -> int:
+def integrity_findings(reports: list[Any]) -> list[dict[str, Any]]:
+    """Forensic reports worth mentioning in an investigation: level "medium" or "high" only.
+
+    ``reports``: ``DocumentForensics`` objects (app/forensics/store.py). A "low"
+    score means "saved twice" or "last edited by someone else", which is true of
+    most business files and would only teach the reader to ignore the section.
+    """
+    found = []
+    for item in reports:
+        report = item.report
+        if report.level not in ("medium", "high"):
+            continue
+        found.append({
+            "id": f"F{len(found) + 1}",
+            "document": item.filename,
+            "document_id": item.document_id,
+            "level": report.level,
+            "score": report.score,
+            "indicators": [
+                {"type": one.type, "page": one.page, "reason": one.reason, "region": one.region}
+                for one in report.indicators[:MAX_INTEGRITY_INDICATORS]
+            ],
+        })
+    return found
+
+
+def risk_points(
+    contradictions: list[Contradiction], missing_evidence: list[str], suspicious: list[dict],
+    integrity: list[dict] | None = None,
+) -> int:
     points = sum(_SEVERITY_POINTS.get(item.severity, 1) for item in contradictions)
     # Missing evidence counts once, however many items are listed. A model may
     # describe one gap as two ("no approval for the amount", "no approval for the
     # terms"), and the wording of a list must not decide the risk level.
     points += 1 if missing_evidence else 0
     points += 2 if suspicious else 0  # a document that tries to steer the reviewer is itself a warning sign
+    # Signs that a document was altered count like one contradiction of the same severity,
+    # however many documents or indicators there are: the question is "can these files be trusted?".
+    levels = {item.get("level") for item in integrity or []}
+    points += 3 if "high" in levels else 2 if "medium" in levels else 0
     return points
 
 
-def baseline_risk(contradictions: list[Contradiction], missing_evidence: list[str], suspicious: list[dict]) -> str:
+def baseline_risk(
+    contradictions: list[Contradiction], missing_evidence: list[str], suspicious: list[dict],
+    integrity: list[dict] | None = None,
+) -> str:
     """The minimum risk level that the structured findings justify.
 
         0 points      -> low
@@ -54,7 +91,7 @@ def baseline_risk(contradictions: list[Contradiction], missing_evidence: list[st
         3 - 6 points  -> high
         7+ points     -> critical
     """
-    points = risk_points(contradictions, missing_evidence, suspicious)
+    points = risk_points(contradictions, missing_evidence, suspicious, integrity)
     if points == 0:
         return "low"
     if points <= 2:
@@ -235,6 +272,7 @@ def review_draft(
     calculations: list[Calculation],
     missing_evidence: list[str],
     suspicious: list[dict[str, Any]],
+    integrity: list[dict[str, Any]] | None = None,
 ) -> tuple[list[str], dict[str, Any], dict[str, list[str]]]:
     """Node 8: check the draft assessment against the evidence.
 
@@ -248,13 +286,15 @@ def review_draft(
 
     baseline = draft["baseline_level"]
     ceiling = draft["confidence_ceiling"]
-    has_findings = bool(contradictions or missing_evidence or suspicious)
+    integrity = integrity or []
+    has_findings = bool(contradictions or missing_evidence or suspicious or integrity)
     safe = fallback_risk(
         baseline_level=baseline,
         contradictions=[item.model_dump() for item in contradictions],
         missing=[{"id": f"M{i}", "missing": text} for i, text in enumerate(missing_evidence, start=1)],
         suspicious=suspicious,
         has_evidence=bool(evidence),
+        integrity=integrity,
     )
 
     # 1. Missing citations: every evidence item must point at a retrieved chunk.
@@ -298,8 +338,13 @@ def review_draft(
         | {item.id for item in calculations if item.id not in drops["calculations"]}
         | {f"M{i}" for i in range(1, len(missing_evidence) + 1)}
         | {item["id"] for item in suspicious}
+        | {item["id"] for item in integrity}
     )
     numbers = known_numbers(question, retrieved, evidence, contradictions, calculations)
+    for item in integrity:  # page numbers, and values quoted from the file by the forensic checks
+        for one in item.get("indicators", []):
+            numbers.update(abs(value) for value in numbers_in_text(f"{one.get('reason', '')} {one.get('region') or ''}"))
+        numbers.update(abs(value) for value in numbers_in_text(item.get("document", "")))
     kept_reasons = []
     for index, reason in enumerate(draft.get("reasons", []), start=1):
         ids = clean_ids(reason.get("evidence_ids"))

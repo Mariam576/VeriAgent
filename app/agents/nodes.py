@@ -53,6 +53,7 @@ from app.agents import heuristics, prompts
 from app.agents.assessment import (
     baseline_risk,
     clean_ids,
+    integrity_findings,
     confidence_ceiling,
     known_numbers,
     review_draft,
@@ -64,6 +65,7 @@ from app.comparison.engine import Cited, ProfileFinding, compare_profiles
 from app.comparison.profile import PROFILED_TYPES
 from app.comparison.store import ProfileSource
 from app.config import Settings
+from app.forensics.store import ForensicsSource
 from app.formatting import key_label
 from app.llm.base import BaseLLM, LLMConfigurationError, LLMError
 from app.memory.extraction import (
@@ -134,6 +136,8 @@ class AgentDeps:
     memory: MemoryStore | None = None
     # Document profiles for the detailed comparison. None = only totals and payment terms are compared.
     profiles: ProfileSource | None = None
+    # Forensic reports of the uploaded files. None = signs of editing are not considered.
+    forensics: ForensicsSource | None = None
 
 
 def traced(name: str) -> Callable[[NodeFunction], NodeFunction]:
@@ -234,6 +238,7 @@ class InvestigationNodes:
         self.pause_for_approval = deps.pause_for_approval and deps.settings.ENABLE_HUMAN_APPROVAL
         self.memory = deps.memory if deps.settings.ENABLE_MEMORY else None
         self.profiles = deps.profiles if deps.settings.ENABLE_DOCUMENT_COMPARISON else None
+        self.forensics = deps.forensics if deps.settings.ENABLE_FORENSICS else None
 
     # ================================================================ Node 0
     @traced("load_memory")
@@ -908,13 +913,15 @@ class InvestigationNodes:
         update: dict[str, Any] = {"events": [event("assess_risk", "Assessing risk...")]}
 
         suspicious = suspicious_content(retrieved)
-        baseline = baseline_risk(contradictions, missing, suspicious)
+        integrity = await self._integrity(state, retrieved, update)
+        baseline = baseline_risk(contradictions, missing, suspicious, integrity)
         fallback_kwargs = dict(
             baseline_level=baseline,
             contradictions=[item.model_dump() for item in contradictions],
             missing=[{"id": f"M{i}", "missing": text} for i, text in enumerate(missing, start=1)],
             suspicious=suspicious,
             has_evidence=bool(evidence),
+            integrity=integrity,
         )
 
         source = "rules"
@@ -927,7 +934,7 @@ class InvestigationNodes:
                     system=prompts.system_prompt(prompts.RISK_TASK),
                     user=prompts.build_risk_prompt(
                         _question(state), bool(analysis.get("decision_requested")), evidence, contradictions,
-                        calculations, missing, suspicious, baseline,
+                        calculations, missing, suspicious, baseline, integrity,
                     ),
                     purpose="assess_risk",
                 )
@@ -939,7 +946,9 @@ class InvestigationNodes:
                 logger.warning("assess_risk fell back to rules: %s", exc)
                 assessment = heuristics.fallback_risk(**fallback_kwargs)
                 update["used_fallback"] = True
-                update["limitations"] = ["The language model was unavailable for the risk assessment; a rule-based assessment was used instead."]
+                update.setdefault("limitations", []).append(
+                    "The language model was unavailable for the risk assessment; a rule-based assessment was used instead."
+                )
 
         ceiling = confidence_ceiling(
             evidence=evidence,
@@ -958,6 +967,7 @@ class InvestigationNodes:
 
         update["risk_draft"] = draft
         update["risk_findings"] = suspicious
+        update["integrity_findings"] = integrity
         if suspicious:
             names = ", ".join(sorted({item["document"] for item in suspicious}))
             update.setdefault("limitations", []).append(
@@ -965,6 +975,32 @@ class InvestigationNodes:
                 "document content and was not followed."
             )
         return update
+
+    async def _integrity(
+        self, state: InvestigationState, retrieved: list[RetrievedChunk], update: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Forensic indicators of the documents this investigation read (app/forensics).
+
+        The files were inspected when they were uploaded; this only looks the results up.
+        """
+        if self.forensics is None or state.get("analysis", {}).get("task_type") == "general":
+            return []
+        document_ids = list(dict.fromkeys(chunk.document_id for chunk in retrieved))
+        if not document_ids:
+            return []
+        try:
+            reports = await self.forensics.reports(state["user_id"], document_ids)
+        except Exception as exc:  # noqa: BLE001 - an extra check must not stop the investigation
+            logger.warning("forensic lookup failed: %s: %s", type(exc).__name__, exc)
+            tracing.record("error", "forensics", error=type(exc).__name__)
+            update.setdefault("limitations", []).append("The check of the files for signs of editing was unavailable for this request.")
+            return []
+        found = integrity_findings(reports)
+        tracing.record(
+            "forensics", "lookup", documents=len(reports),
+            flagged=[{"document": item["document"], "level": item["level"], "score": item["score"]} for item in found],
+        )
+        return found
 
     # ================================================================ Node 8
     @traced("review_findings")
@@ -990,6 +1026,7 @@ class InvestigationNodes:
             calculations=[Calculation(**item) for item in state.get("calculations", [])],
             missing_evidence=list(state.get("missing_evidence", [])),
             suspicious=list(state.get("risk_findings", [])),
+            integrity=list(state.get("integrity_findings", [])),
         )
 
     # ------------------------------------------------- correction after review
@@ -1010,7 +1047,13 @@ class InvestigationNodes:
         if drops["evidence"]:
             keep = [item for item in state.get("evidence", []) if item["id"] not in drops["evidence"]]
             update["evidence"] = keep
-            update["contradictions"] = [item.model_dump() for item in find_contradictions([EvidenceItem(**i) for i in keep])]
+            kept_ids = {item["id"] for item in keep}
+            contradictions = find_contradictions([EvidenceItem(**i) for i in keep])
+            # Findings from the document comparison stay as long as all their evidence survived.
+            for item in state.get("contradictions", []):
+                if item.get("origin") == "profile" and set(item.get("evidence_ids", [])) <= kept_ids:
+                    contradictions.append(Contradiction(**{**item, "id": f"X{len(contradictions) + 1}"}))
+            update["contradictions"] = [item.model_dump() for item in contradictions]
         if drops["calculations"]:
             update["calculations"] = [item for item in state.get("calculations", []) if item["id"] not in drops["calculations"]]
         return update

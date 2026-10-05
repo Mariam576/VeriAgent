@@ -1,7 +1,7 @@
 """The document upload pipeline (spec section 12).
 
     validate -> save metadata -> extract text (keep page numbers) -> clean
-    -> chunk -> embed -> store chunks in pgvector
+    -> inspect the file for signs of editing -> chunk -> embed -> store chunks in pgvector
 """
 
 from __future__ import annotations
@@ -17,9 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.database import repositories
-from app.database.models import Document, DocumentChunk, User
+from app.database.models import Document, DocumentChunk, DocumentForensicsRow, User
 from app.embeddings.base import EmbeddingError, EmbeddingProvider
 from app.errors import AppError, DocumentProcessingError, ServiceUnavailable
+from app.forensics.analyze import analyze_document
 from app.rag.chunking import chunk_pages
 from app.rag.loaders import guess_document_type, guess_year, load_pages
 from app.security.validation import validate_upload
@@ -41,11 +42,16 @@ def _write_file(path: Path, data: bytes) -> None:
     path.write_bytes(data)
 
 
-def _extract_and_chunk(data: bytes, extension: str, chunk_size: int, chunk_overlap: int):
+def _extract_and_chunk(
+    data: bytes, extension: str, filename: str, document_type: str | None, chunk_size: int, chunk_overlap: int,
+    inspect: bool,
+):
     """All the CPU-bound work on one document, done together in a worker thread."""
     pages = load_pages(data, extension)
     full_text = "\n".join(page.text for page in pages)
-    return pages, chunk_pages(pages, chunk_size, chunk_overlap), guess_year(full_text)
+    document_type = document_type or guess_document_type(filename, pages[0].text if pages else "")
+    forensics = analyze_document(data, extension, document_type, pages) if inspect else None
+    return pages, chunk_pages(pages, chunk_size, chunk_overlap), guess_year(full_text), document_type, forensics
 
 
 async def ingest_document(
@@ -92,11 +98,10 @@ async def ingest_document(
 
         # 4. Extract and clean text page by page, then 5. chunk it. Parsing is
         #    CPU work, so it runs in a worker thread instead of blocking the event loop.
-        pages, chunks, year = await asyncio.to_thread(
-            _extract_and_chunk, data, extension, settings.CHUNK_SIZE, settings.CHUNK_OVERLAP
+        pages, chunks, year, document.document_type, forensics = await asyncio.to_thread(
+            _extract_and_chunk, data, extension, safe_name, document_type, settings.CHUNK_SIZE,
+            settings.CHUNK_OVERLAP, settings.ENABLE_FORENSICS,
         )
-        if document_type is None:
-            document.document_type = guess_document_type(safe_name, pages[0].text if pages else "")
         if not chunks:
             raise DocumentProcessingError("The document contains no text to index.")
 
@@ -125,6 +130,16 @@ async def ingest_document(
                     },
                 )
             )
+        if forensics is not None:
+            session.add(DocumentForensicsRow(
+                document_id=document.id, version=forensics.version, score=forensics.score, level=forensics.level,
+                report=forensics.model_dump(mode="json"),
+            ))
+            if forensics.indicators:
+                logger.info(
+                    "document_forensics id=%s level=%s score=%.2f indicators=%s",
+                    document.id, forensics.level, forensics.score, [item.type for item in forensics.indicators],
+                )
         document.page_count = len(pages)
         document.status = "ready"
         await session.commit()

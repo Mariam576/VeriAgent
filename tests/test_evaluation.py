@@ -20,8 +20,10 @@ from app.rag.citations import normalize
 # ==================================================================== dataset
 def test_dataset_has_the_size_and_categories_the_spec_asks_for():
     info = describe_dataset()
-    assert 20 <= info["cases"] <= 40
-    assert {"retrieval", "contradiction", "missing_evidence", "prompt_injection"} <= set(info["categories"])
+    # The spec asks for 20 to 40 cases in its five categories; Version 3 adds two categories of its own.
+    core = sum(count for category, count in info["categories"].items() if category not in ("comparison", "forensics"))
+    assert 20 <= core <= 40 and info["cases"] <= 60
+    assert {"retrieval", "contradiction", "missing_evidence", "prompt_injection", "comparison", "forensics"} <= set(info["categories"])
     assert all(count >= 2 for count in info["categories"].values())
     assert len({case.id for case in CASES}) == len(CASES)
 

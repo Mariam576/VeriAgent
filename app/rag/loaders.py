@@ -3,6 +3,12 @@
 Page numbers are kept from the very first step. They travel with every chunk
 all the way to the final report, which is what makes a citation like
 "[Contract.pdf, page 4]" possible.
+
+Only text that a reader can see is extracted. A file can also carry text
+nobody sees: white on white, covered by a box, formatted as "hidden". Such
+text must not become evidence, and it is the easiest place to hide
+instructions for an AI system. What was left out is reported by the forensics
+module (app/forensics).
 """
 
 from __future__ import annotations
@@ -42,9 +48,11 @@ def _load_pdf(data: bytes) -> list[PageText]:
     try:
         if document.needs_pass:
             raise DocumentProcessingError("The PDF is password protected. Remove the password and upload it again.")
+        from app.forensics.pdf import visible_text
+
         pages = []
         for index, page in enumerate(document, start=1):
-            pages.append(PageText(page_number=index, text=clean_text(page.get_text("text"))))
+            pages.append(PageText(page_number=index, text=clean_text(visible_text(page, index))))
         return pages
     except DocumentProcessingError:
         raise
@@ -62,10 +70,17 @@ def _load_docx(data: bytes) -> list[PageText]:
     except Exception as exc:  # noqa: BLE001
         raise DocumentProcessingError("The Word document could not be opened. It may be damaged.") from exc
 
-    parts = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
+    from app.forensics.docx import visible_paragraph_text
+
+    def shown(paragraphs) -> list[str]:
+        texts = [visible_paragraph_text(paragraph._p) for paragraph in paragraphs]
+        return [text for text in texts if text.strip()]
+
+    parts = shown(document.paragraphs)
     for table in document.tables:
         for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            cells = ["\n".join(shown(cell.paragraphs)).strip() for cell in row.cells]
+            cells = [cell for cell in cells if cell]
             if cells:
                 parts.append(" | ".join(cells))
     # A .docx file has no fixed pages (they depend on the printer and fonts),

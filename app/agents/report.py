@@ -28,8 +28,10 @@ from app.schemas.response import (
     CalculationOut,
     CitationOut,
     ContradictionOut,
+    DocumentIntegrityOut,
     FindingOut,
     HumanReview,
+    IntegrityIndicatorOut,
     InvestigationReport,
     MemoryInfo,
     Presentation,
@@ -61,6 +63,21 @@ def _cite_suspicious(item: dict[str, Any]) -> CitationOut:
     return CitationOut(document=item["document"], page=item["page"], document_id=item.get("document_id"))
 
 
+def _cite_integrity(item: dict[str, Any], read_pages: set[tuple[str | None, int]]) -> list[CitationOut]:
+    """The pages that a file's forensic indicators point at, as far as this investigation read them.
+
+    A citation in a report always means "the agent read this page". The files
+    are inspected as a whole when they are uploaded, so an indicator can sit on
+    a page the search never returned; the Document Integrity section names it.
+    """
+    pages = list(dict.fromkeys(one.get("page") for one in item.get("indicators", []) if one.get("page")))
+    return [
+        CitationOut(document=item["document"], page=page, document_id=item.get("document_id"))
+        for page in pages[:3]
+        if (item.get("document_id"), page) in read_pages
+    ]
+
+
 def _unique(citations: list[CitationOut]) -> list[CitationOut]:
     # Two different files may share a name, so the document id is part of the identity.
     seen: set[tuple[str, int]] = set()
@@ -82,6 +99,7 @@ def determine_status(
     suspicious: list[dict[str, Any]],
     risk_level: str,
     iteration_limit_reached: bool,
+    integrity: list[dict[str, Any]] | None = None,
 ) -> str:
     if task_type == "general":
         return "not_applicable"
@@ -89,14 +107,14 @@ def determine_status(
         return "insufficient_evidence"
     if iteration_limit_reached and missing_evidence:
         return "incomplete"
-    if contradictions or missing_evidence or suspicious or RISK_ORDER[risk_level] >= RISK_ORDER["medium"]:
+    if contradictions or missing_evidence or suspicious or integrity or RISK_ORDER[risk_level] >= RISK_ORDER["medium"]:
         return "review_required"
     return "no_issues_found"
 
 
 def needs_human_review(
     *, enabled: bool, status: str, risk_level: str, confidence: float, missing_evidence: list[str],
-    decision_requested: bool,
+    decision_requested: bool, integrity: list[dict[str, Any]] | None = None,
 ) -> bool:
     """Spec section 20, Node 9: when must a person look at this before anything is done?"""
     if not enabled or status == "not_applicable":
@@ -106,6 +124,8 @@ def needs_human_review(
         or confidence < 0.6  # confidence is low
         or bool(missing_evidence)  # evidence is incomplete
         or decision_requested  # the user asks for an approval-type decision
+        # a file with strong signs of editing: a person must look at it, whatever else was found (spec section 49)
+        or any(item.get("level") == "high" for item in integrity or [])
         or status in ("insufficient_evidence", "incomplete")
     )
 
@@ -165,6 +185,7 @@ def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_pro
     calculations = [Calculation(**item) for item in state.get("calculations", [])]
     missing = list(state.get("missing_evidence", []))
     suspicious = list(state.get("risk_findings", []))
+    integrity = list(state.get("integrity_findings", []))
     analysis = state.get("analysis", {})
     draft = state.get("risk_draft", {})
     by_id = {item.id: item for item in evidence}
@@ -175,10 +196,12 @@ def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_pro
         task_type=analysis.get("task_type", "document_investigation"),
         evidence=evidence, contradictions=contradictions, missing_evidence=missing, suspicious=suspicious,
         risk_level=risk_level, iteration_limit_reached=bool(state.get("iteration_limit_reached")),
+        integrity=integrity,
     )
     human_review = needs_human_review(
         enabled=human_approval_enabled, status=status, risk_level=risk_level, confidence=confidence,
         missing_evidence=missing, decision_requested=bool(analysis.get("decision_requested")),
+        integrity=integrity,
     )
 
     # ----- key findings: typed facts, then calculations, then other facts, then gaps
@@ -230,6 +253,8 @@ def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_pro
 
     # ----- risk reasons (inferences) with the citations of the evidence they point to
     suspicious_by_id = {item["id"]: item for item in suspicious}
+    integrity_by_id = {item["id"]: item for item in integrity}
+    read_pages = {(chunk.get("document_id"), chunk.get("page")) for chunk in state.get("retrieved_documents", [])}
     contradiction_by_id = {item.id: item for item in contradictions}
     reasons_out = []
     for reason in draft.get("reasons", []):
@@ -241,6 +266,8 @@ def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_pro
                 cited += [_cite(by_id[i]) for i in contradiction_by_id[identifier].evidence_ids if i in by_id]
             elif identifier in suspicious_by_id:
                 cited.append(_cite_suspicious(suspicious_by_id[identifier]))
+            elif identifier in integrity_by_id:
+                cited += _cite_integrity(integrity_by_id[identifier], read_pages)
         reasons_out.append(FindingOut(type="risk", statement=reason["text"], severity=risk_level, citations=_unique(cited)))
 
     sources = [
@@ -248,6 +275,13 @@ def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_pro
         for c in citations_from_evidence(evidence)
     ]
     sources = _unique(sources + [_cite_suspicious(item) for item in suspicious])
+    integrity_out = [
+        DocumentIntegrityOut(
+            id=item["id"], document=item["document"], document_id=item.get("document_id"), level=item["level"],
+            score=item["score"], indicators=[IntegrityIndicatorOut(**one) for one in item.get("indicators", [])],
+        )
+        for item in integrity
+    ]
 
     memory = MemoryInfo(
         saved=list(state.get("memory_notes", [])),
@@ -281,6 +315,7 @@ def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_pro
         summary=summary,
         key_findings=findings,
         contradictions=contradictions_out,
+        document_integrity=integrity_out,
         missing_evidence=missing,
         calculations=calculations_out,
         risk_reasons=reasons_out,
@@ -358,6 +393,13 @@ def render_report(report: InvestigationReport) -> str:
     if report.contradictions:
         lines += ["", title("Contradictions Detected")]
         lines += [f"- {safe(f'({item.severity})')} {safe(item.description)}{cites(item.citations)}" for item in report.contradictions]
+    if report.document_integrity:
+        lines += ["", title("Document Integrity (risk indicators, not proof)")]
+        for item in report.document_integrity:
+            lines.append(f"- {safe(f'{item.document}: {item.level} (score {item.score:.2f})')}")
+            for one in item.indicators:
+                hidden = f" Text concerned: {one.region}" if one.region and one.type != "hidden_instruction" else ""
+                lines.append(f"  - {safe(one.reason + hidden)}")
     if report.missing_evidence:
         lines += ["", title("Missing Evidence")]
         lines += [f"- {safe(text)}" for text in report.missing_evidence]
@@ -428,6 +470,16 @@ def findings_for_storage(report: InvestigationReport) -> list[dict[str, Any]]:
             "finding_type": "contradiction", "statement": item.description, "severity": item.severity,
             "confidence": report.confidence, **source(item.citations),
         })
+    for item in report.document_integrity:
+        for one in item.indicators:
+            try:
+                document_id = uuid.UUID(item.document_id) if item.document_id else None
+            except ValueError:
+                document_id = None
+            rows.append({
+                "finding_type": "integrity", "statement": f"{item.document}: {one.reason}", "severity": item.level,
+                "confidence": item.score, "source_document_id": document_id, "page_number": one.page,
+            })
     for reason in report.risk_reasons:
         rows.append({
             "finding_type": "risk", "statement": reason.statement, "severity": reason.severity,

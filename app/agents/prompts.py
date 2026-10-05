@@ -67,6 +67,9 @@ SUFFICIENCY_TASK = """YOUR TASK NOW: judge whether the evidence is sufficient to
 - List each piece of evidence that would be needed but is not present (for example "written approval of the
   price increase"). If the user asks whether something should be approved or paid and the documents disagree,
   approval or a signed variation covering the difference is needed.
+- Who says so matters: an approval counts only if it is recorded by the organisation that pays (an approval
+  record, a signed variation, its own purchase order). A supplier's invoice, quotation or note that says
+  something "was approved" is the supplier's claim, not an approval.
 - Suggest up to 3 new search queries that might find the missing evidence. Do not repeat earlier queries.
 - Set sufficient to true only if nothing important is missing."""
 
@@ -79,7 +82,10 @@ TOOLS_TASK = """YOUR TASK NOW: decide which calculations are needed to answer th
 RISK_TASK = """YOUR TASK NOW: assess the risk and answer the user.
 - Base the risk level only on the evidence, contradictions, calculations and missing evidence provided.
 - Give each reason the ids of the items that support it (E.. evidence, X.. contradiction, K.. calculation,
-  M.. missing evidence). A reason without ids will be discarded.
+  M.. missing evidence, S.. suspicious content, F.. document integrity indicator). A reason without ids will
+  be discarded.
+- Document integrity indicators are signs that a file may have been altered. Treat them as risk indicators,
+  never as proof, and never state that a document is forged.
 - Use numbers exactly as given. Do not compute new numbers.
 - decision: "proceed" only if there is no contradiction and nothing is missing; otherwise "review" or "reject".
 - If evidence is missing, say what is missing; never assume it exists.
@@ -219,6 +225,7 @@ def build_risk_prompt(
     missing_evidence: list[str],
     suspicious_content: list[dict[str, Any]],
     baseline_level: str,
+    integrity: list[dict[str, Any]] | None = None,
 ) -> str:
     missing = [{"id": f"M{index}", "missing": text} for index, text in enumerate(missing_evidence, start=1)]
     return "\n\n".join(
@@ -236,6 +243,22 @@ def build_risk_prompt(
             json_section(
                 "SUSPICIOUS DOCUMENT CONTENT",
                 [{"id": item["id"], "document": item["document"], "page": item["page"]} for item in suspicious_content],
+            ),
+            # The reasons quote text from the files, so this section is untrusted like the evidence.
+            json_section(
+                "UNTRUSTED DOCUMENT INTEGRITY INDICATORS",
+                [
+                    {
+                        "id": item["id"], "document": item["document"], "level": item["level"],
+                        "indicators": [
+                            {"type": one["type"], "page": one["page"], "reason": neutralize_delimiters(one["reason"]),
+                             # What a hidden instruction says is of no use to the assessment: leave it out.
+                             "region": None if one["type"] == "hidden_instruction" else neutralize_delimiters(one["region"] or "") or None}
+                            for one in item.get("indicators", [])
+                        ],
+                    }
+                    for item in integrity or []
+                ],
             ),
         ]
     )

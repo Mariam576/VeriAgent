@@ -174,6 +174,19 @@ class DocumentProfileRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class DocumentForensicsRow(Base):
+    """Signs that a file was altered, found when it was uploaded (see app/forensics)."""
+
+    __tablename__ = "document_forensics"
+
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer)
+    score: Mapped[float] = mapped_column(Float, default=0.0)
+    level: Mapped[str] = mapped_column(String(10), default="none")  # none | low | medium | high
+    report: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class UserMemory(Base):
     """Structured long-term memory: one row per preference of a user (key -> value)."""
 

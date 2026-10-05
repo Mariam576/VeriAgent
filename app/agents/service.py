@@ -47,6 +47,7 @@ from app.database import repositories
 from app.database.models import Investigation, User
 from app.database.session import get_session_factory
 from app.embeddings.factory import get_embedding_provider
+from app.forensics.store import get_forensics_store, reset_forensics_store
 from app.errors import Conflict, NotFound, ServiceUnavailable, TooManyRequests, ValidationFailed, safe_error
 from app.llm.factory import get_llm
 from app.memory.semantic import remember_investigation
@@ -86,6 +87,7 @@ async def get_graph() -> CompiledStateGraph:
                 pause_for_approval=True,  # still subject to ENABLE_HUMAN_APPROVAL
                 memory=get_memory_store(),  # still subject to ENABLE_MEMORY
                 profiles=get_profile_store(),  # still subject to ENABLE_DOCUMENT_COMPARISON
+                forensics=get_forensics_store(),  # still subject to ENABLE_FORENSICS
             )
             _graph = build_investigation_graph(deps, checkpointer=await get_checkpointer())
     return _graph
@@ -96,6 +98,7 @@ def reset_graph() -> None:
     global _graph
     _graph = None
     reset_profile_store()
+    reset_forensics_store()
 
 
 def _config(investigation_id: uuid.UUID) -> dict[str, Any]:

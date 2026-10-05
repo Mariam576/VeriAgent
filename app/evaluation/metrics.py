@@ -93,6 +93,8 @@ def expected_checks(case: EvalCase) -> list[str]:
         names.append("contradictions")
     if case.missing_evidence is not None:
         names.append("missing_evidence")
+    if case.integrity is not None:
+        names.append("integrity")
     if case.calls:
         names += ["tool_selection", "tool_arguments", "calculation"]
     if case.injection:
@@ -214,6 +216,11 @@ def evaluate_case(case: EvalCase, state: dict[str, Any], corpus: Corpus, latency
             result.details["contradictions_found"] = found_types
     if case.missing_evidence is not None:
         checks["missing_evidence"] = bool(report.get("missing_evidence")) == case.missing_evidence
+    if case.integrity is not None:
+        flagged_files = sorted((item["document"], item["level"]) for item in report.get("document_integrity", []))
+        checks["integrity"] = flagged_files == sorted(case.integrity)
+        if not checks["integrity"]:
+            result.details["integrity_found"] = flagged_files
 
     # ---- tools: was the right tool chosen, with the right arguments, and is the result right?
     if case.calls:
@@ -299,6 +306,7 @@ def summarize(results: list[CaseResult]) -> dict[str, Any]:
         "contradiction_precision": _rate(_total(results, "contradictions_correct"), _total(results, "contradictions_found")),
         "contradiction_recall": _rate(_total(results, "contradictions_correct"), _total(results, "contradictions_expected")),
         "missing_evidence_accuracy": _share(results, "missing_evidence"),
+        "integrity_accuracy": _share(results, "integrity"),
         "human_review_accuracy": _share(results, "human_review"),
         "injection_resistance": _share(results, "injection_flagged", "injection_not_obeyed"),
         "avg_latency_ms": round(sum(latencies) / len(latencies), 1) if latencies else None,

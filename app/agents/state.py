@@ -67,6 +67,7 @@ class InvestigationState(TypedDict, total=False):
     evidence_count_assessed: int  # how many evidence items the last sufficiency judgement looked at
     missing_evidence: list[str]
     retrieve_again: bool
+    integrity_findings: list[dict[str, Any]]  # documents with forensic indicators (app/forensics)
 
     # ---------------------------------------------------------- assessment
     risk_draft: dict[str, Any]

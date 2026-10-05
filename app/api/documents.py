@@ -17,8 +17,9 @@ from app.rag.ingestion import ingest_document
 from app.comparison.profile import PROFILED_TYPES
 from app.comparison.service import NOT_PROFILED
 from app.comparison.store import get_profile_store
+from app.forensics.store import get_forensics_store
 from app.schemas.comparison import ProfileOut
-from app.schemas.document import DocumentList, DocumentOut
+from app.schemas.document import DocumentList, DocumentOut, ForensicsOut
 from app.security.permissions import CurrentUser, DbSession
 from app.security.validation import validate_document_type
 
@@ -53,16 +54,22 @@ async def upload_document(
     out = DocumentOut.model_validate(result.document)
     out.chunk_count = result.chunk_count
     out.duplicate = result.duplicate
+    levels = await repositories.integrity_levels(session, [result.document.id])
+    if result.document.id in levels:
+        out.integrity_level, out.integrity_score = levels[result.document.id]
     return out
 
 
 @router.get("", response_model=DocumentList)
 async def list_documents(user: CurrentUser, session: DbSession) -> DocumentList:
     rows = await repositories.list_documents(session, user.id)
+    levels = await repositories.integrity_levels(session, [document.id for document, _ in rows])
     documents = []
     for document, chunk_count in rows:
         out = DocumentOut.model_validate(document)
         out.chunk_count = chunk_count
+        if document.id in levels:
+            out.integrity_level, out.integrity_score = levels[document.id]
         documents.append(out)
     return DocumentList(documents=documents)
 
@@ -87,6 +94,26 @@ async def document_profile(document_id: uuid.UUID, user: CurrentUser, session: D
         out.profile = batch.profiles[0].model_dump(mode="json")
         if batch.profiles[0].is_empty:
             out.note = "None of the usual key facts could be read from this document."
+    return out
+
+
+@router.get("/{document_id}/forensics", response_model=ForensicsOut)
+async def document_forensics(document_id: uuid.UUID, user: CurrentUser, session: DbSession) -> ForensicsOut:
+    """Signs that the file was altered: hidden or covered text, odd fonts, file history.
+
+    A risk indicator, never proof. The file is inspected once, when it is uploaded.
+    """
+    document = await repositories.get_document(session, user.id, document_id)
+    if document is None or document.status != "ready":
+        raise NotFound("Document not found.")
+    out = ForensicsOut(document_id=str(document.id), filename=document.filename)
+    user_id = str(user.id)
+    await session.rollback()
+    reports = await get_forensics_store().reports(user_id, [str(document_id)])
+    if reports:
+        out.report = reports[0].report
+    else:
+        out.note = "This file was not inspected (the inspection is switched off, or the file is no longer stored)."
     return out
 
 

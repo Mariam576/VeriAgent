@@ -34,6 +34,9 @@ from app.agents.graph import build_investigation_graph, recursion_limit
 from app.agents.nodes import AgentDeps
 from app.agents.state import initial_state
 from app.comparison.store import MemoryProfileSource, ProfileSource
+from app.forensics.analyze import analyze_document
+from app.forensics.store import ForensicsSource, MemoryForensicsSource
+from app.rag.loaders import PageText, guess_document_type
 from app.config import Settings, get_settings
 from app.embeddings.base import EmbeddingProvider
 from app.evaluation.corpus import Corpus, InMemoryRetriever
@@ -58,6 +61,7 @@ REPORT_LINES: list[tuple[str, str, str, str]] = [
     ("Contradiction precision", "contradiction_precision", "rate", ""),
     ("Contradiction recall", "contradiction_recall", "rate", ""),
     ("Missing-evidence accuracy", "missing_evidence_accuracy", "rate", ""),
+    ("Document-integrity accuracy", "integrity_accuracy", "rate", ""),
     ("Human-review accuracy", "human_review_accuracy", "rate", ""),
     ("Prompt-injection resistance", "injection_resistance", "rate", "100%"),
     ("Average latency", "avg_latency_ms", "ms", ""),
@@ -73,12 +77,15 @@ class EvaluationRun:
     def __init__(
         self, llm: BaseLLM, settings: Settings, retrievers: dict[str, tuple[Retriever, str]],
         profiles: ProfileSource | None = None,
+        forensics: ForensicsSource | None = None,
     ) -> None:
         self._llm = llm
         # With the in-memory search each corpus gets its own profile source (built in run_case);
         # with PostgreSQL one store serves all of them.
         self._profiles = profiles
         self._memory_profiles: dict[str, ProfileSource] = {}
+        self._forensics = forensics
+        self._memory_forensics: dict[str, ForensicsSource] = {}
         # No memory, and (see run_case) no pause: every case stands alone and runs to the end.
         # Human approval stays "enabled" so the report still says when a person should decide.
         self._settings = settings.model_copy(update={"ENABLE_HUMAN_APPROVAL": True, "ENABLE_MEMORY": False})
@@ -90,9 +97,15 @@ class EvaluationRun:
         profiles = self._profiles
         if profiles is None and isinstance(retriever, InMemoryRetriever):
             profiles = self._memory_profiles.setdefault(case.corpus, MemoryProfileSource(retriever.chunks, self._llm))
-        graph = build_investigation_graph(
-            AgentDeps(llm=self._llm, retriever=retriever, settings=self._settings, pause_for_approval=False, profiles=profiles)
-        )
+        forensics = self._forensics
+        if forensics is None and isinstance(retriever, InMemoryRetriever):
+            if case.corpus not in self._memory_forensics:
+                self._memory_forensics[case.corpus] = corpus_forensics(corpus)
+            forensics = self._memory_forensics[case.corpus]
+        graph = build_investigation_graph(AgentDeps(
+            llm=self._llm, retriever=retriever, settings=self._settings, pause_for_approval=False,
+            profiles=profiles, forensics=forensics,
+        ))
         state = initial_state(user_id=user_id, investigation_id=f"eval-{case.id}", question=case.question)
         started = time.perf_counter()
         try:
@@ -111,6 +124,19 @@ class EvaluationRun:
             if on_result is not None:
                 on_result(case, result)
         return results
+
+
+def corpus_forensics(corpus: Corpus) -> MemoryForensicsSource:
+    """Inspect the files of a corpus the way an upload does. Documents written inline have no file to inspect."""
+    source = MemoryForensicsSource()
+    for document in corpus.documents:
+        if document.source_path is None:
+            continue
+        data, extension = document.source_path.read_bytes(), document.source_path.suffix.lower()
+        pages = [PageText(number, text) for number, text in enumerate(document.pages, start=1)]
+        kind = document.document_type or guess_document_type(document.filename, document.pages[0] if document.pages else "")
+        source.add(f"doc:{document.filename}", document.filename, analyze_document(data, extension, kind, pages))
+    return source
 
 
 def memory_retrievers(embedder: EmbeddingProvider | None, settings: Settings, names: set[str]) -> dict[str, tuple[Retriever, str]]:
@@ -250,12 +276,15 @@ async def run_evaluation(
     llm = get_llm()
     user_ids: list[uuid.UUID] = []
     profiles: ProfileSource | None = None
+    forensics: ForensicsSource | None = None
     if backend == "postgres":
         from app.comparison.store import PgProfileStore
         from app.database.session import get_session_factory
+        from app.forensics.store import PgForensicsStore
 
         retrievers, user_ids = await postgres_retrievers(settings, names)
         profiles = PgProfileStore(get_session_factory(), llm)
+        forensics = PgForensicsStore(get_session_factory(), settings.UPLOAD_DIR)
     else:
         retrievers = memory_retrievers(get_embedding_provider(), settings, names)
 
@@ -267,7 +296,7 @@ async def run_evaluation(
     if not quiet:
         print(f"Running {len(cases)} evaluation case(s) with {header['llm']}...\n", flush=True)
     try:
-        run = EvaluationRun(llm, settings, retrievers, profiles)
+        run = EvaluationRun(llm, settings, retrievers, profiles, forensics)
         results = await run.run(cases, None if quiet else lambda case, result: print_case(case, result, verbose))
     finally:
         if user_ids:

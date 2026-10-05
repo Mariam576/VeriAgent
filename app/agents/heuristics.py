@@ -220,6 +220,8 @@ _NOT_A_DEVIATION = {
 MISSING_APPROVAL_RECORD = "An approval record for this item (for example a signed approval or sign-off)"
 _ASKS_IF_APPROVED = re.compile(r"\b(?:was|were|is|has|have|been|already)\b[^?.]{0,60}\b(?:approved|authori[sz]ed|signed off)\b", re.I)
 MISSING_ANY_EVIDENCE = "No relevant evidence was found in the uploaded documents for this request."
+# Documents written by the party that wants to be paid. What they say about approval is a claim.
+_ISSUED_BY_THE_PAYEE = {"invoice", "receipt", "quotation"}
 
 
 def fallback_sufficiency(
@@ -236,7 +238,12 @@ def fallback_sufficiency(
 
     missing: list[str] = []
     follow_up: list[str] = []
-    has_approval = any(_APPROVAL.search(str(item.get("claim", ""))) for item in evidence)
+    # Who says so matters. "Approved by the Finance Director" on the supplier's own invoice is the
+    # supplier's claim; an approval is a record of the organisation that pays.
+    has_approval = any(
+        _APPROVAL.search(str(item.get("claim", ""))) and item.get("document_type") not in _ISSUED_BY_THE_PAYEE
+        for item in evidence
+    )
     kinds = {str(item.get("type", "")) for item in contradictions}
     deviations = kinds - _NOT_A_DEVIATION
     if contradictions and (decision_requested or investigating):
@@ -266,8 +273,10 @@ def fallback_risk(
     missing: list[dict[str, Any]],
     suspicious: list[dict[str, Any]],
     has_evidence: bool,
+    integrity: list[dict[str, Any]] | None = None,
 ) -> RiskAssessment:
     """A cautious, fully templated assessment built only from structured findings."""
+    integrity = integrity or []
     reasons = [
         RiskReason(text=item["description"], evidence_ids=[item["id"], *item.get("evidence_ids", [])])
         for item in contradictions
@@ -283,6 +292,10 @@ def fallback_risk(
         )
         for item in suspicious
     ]
+    reasons += [
+        RiskReason(text=integrity_sentence(item), evidence_ids=[item["id"]])
+        for item in integrity
+    ]
 
     if not has_evidence:
         return RiskAssessment(
@@ -290,7 +303,7 @@ def fallback_risk(
             recommended_action="Upload the relevant documents, or rephrase the question, and run the investigation again.",
             summary="No relevant evidence was found in the uploaded documents, so no conclusion can be drawn.",
         )
-    if contradictions or missing or suspicious:
+    if contradictions or missing or suspicious or integrity:
         sentences = [item["description"] for item in contradictions[:2]]
         if len(contradictions) > 2:
             sentences.append(f"{len(contradictions) - 2} further contradiction(s) are listed below.")
@@ -298,8 +311,13 @@ def fallback_risk(
             sentences.append("Evidence supporting these points was not found: " + "; ".join(item["missing"] for item in missing[:2]) + ".")
         if suspicious:
             sentences.append("A document contains text that reads like instructions to an AI system; it was not followed.")
+        if integrity:
+            names = ", ".join(item["document"] for item in integrity[:3])
+            sentences.append(f"{names} shows signs that the file may have been altered; this is a risk indicator, not proof.")
         action = "Do not approve automatically. Obtain clarification"
         action += " and formal written approval before processing." if missing else " before processing."
+        if integrity:
+            action += " Ask the issuer to confirm the original of each flagged file."
         return RiskAssessment(
             level=baseline_level, confidence=0.9, reasons=reasons, decision="review",  # type: ignore[arg-type]
             recommended_action=action,
@@ -310,6 +328,14 @@ def fallback_risk(
         recommended_action="No action is required based on the retrieved evidence.",
         summary="No contradictions or missing evidence were identified in the retrieved evidence.",
     )
+
+
+def integrity_sentence(item: dict[str, Any]) -> str:
+    """One sentence for a document with forensic indicators (wording: an indicator, never an accusation)."""
+    indicators = item.get("indicators") or []
+    first = f" {indicators[0]['reason']}" if indicators else ""
+    more = f" ({len(indicators) - 1} further indicator(s) are listed under Document Integrity.)" if len(indicators) > 1 else ""
+    return f"{item['document']} shows signs that it may have been altered ({item['level']} risk indicator).{first}{more}"
 
 
 # ================================================== offline mock LLM handlers
@@ -370,6 +396,7 @@ def _mock_risk(system: str, user: str) -> RiskAssessment:
         missing=prompts.read_json_section(user, "MISSING EVIDENCE") or [],
         suspicious=prompts.read_json_section(user, "SUSPICIOUS DOCUMENT CONTENT") or [],
         has_evidence=bool(evidence),
+        integrity=prompts.read_json_section(user, "UNTRUSTED DOCUMENT INTEGRITY INDICATORS") or [],
     )
 
 

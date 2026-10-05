@@ -60,6 +60,24 @@ class ContradictionOut(BaseModel):
     citations: list[CitationOut] = Field(default_factory=list)
 
 
+class IntegrityIndicatorOut(BaseModel):
+    type: str
+    reason: str
+    page: int | None = None
+    region: str | None = None  # the text concerned, as found in the file (untrusted)
+
+
+class DocumentIntegrityOut(BaseModel):
+    """Signs that one file may have been altered. A risk indicator, never proof."""
+
+    id: str  # "F1", "F2", ...
+    document: str
+    document_id: str | None = None
+    level: str  # medium | high
+    score: float
+    indicators: list[IntegrityIndicatorOut] = Field(default_factory=list)
+
+
 class CalculationOut(BaseModel):
     id: str
     description: str
@@ -141,6 +159,7 @@ class InvestigationReport(BaseModel):
     summary: str
     key_findings: list[FindingOut] = Field(default_factory=list)
     contradictions: list[ContradictionOut] = Field(default_factory=list)
+    document_integrity: list[DocumentIntegrityOut] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
     calculations: list[CalculationOut] = Field(default_factory=list)
     risk_reasons: list[FindingOut] = Field(default_factory=list)

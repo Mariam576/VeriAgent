@@ -98,6 +98,11 @@ class Settings(BaseSettings):
     # model call per document, the first time it takes part in a comparison).
     ENABLE_DOCUMENT_COMPARISON: bool = True
 
+    # ------------------------------------------------------------ Forensics
+    # Inspect every uploaded file for signs of editing (hidden or covered text, odd fonts,
+    # file history). No model call; the result is a risk indicator, never proof.
+    ENABLE_FORENSICS: bool = True
+
     # --------------------------------------------------------------- Memory
     ENABLE_MEMORY: bool = True
     MEMORY_TOP_K: int = Field(default=3, ge=1, le=10)
