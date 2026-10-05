@@ -269,3 +269,21 @@ async def test_health_reports_503_when_the_database_is_unreachable(client, monke
     response = await client.get("/health")
     assert response.status_code == 503
     assert response.json()["status"] == "degraded" and response.json()["database"] == "unreachable"
+
+
+async def test_trace_endpoint_shows_what_the_agent_did(client, user_headers, library):
+    report = (await client.post("/investigations", headers=user_headers, json={"question": DEMO_QUESTION})).json()
+    response = await client.get(f"/investigations/{report['investigation_id']}/trace", headers=user_headers)
+    assert response.status_code == 200, response.text
+    trace = response.json()
+
+    kinds = {event["kind"] for event in trace["events"]}
+    assert {"node", "llm", "tool", "retrieval"} <= kinds
+    assert trace["totals"]["llm_calls"] == report["stats"]["llm_calls"]
+    assert trace["totals"]["tool_calls"] == report["stats"]["tool_calls"]
+    assert trace["totals"]["errors"] == 0
+    search = next(event for event in trace["events"] if event["kind"] == "retrieval")
+    assert search["data"]["chunks"][0]["document"] in {"Contract.pdf", "Invoice_102.pdf", "Procurement_Policy.pdf"}
+
+    intruder = {"X-User-Id": user_headers["X-User-Id"] + "-intruder"}
+    assert (await client.get(f"/investigations/{report['investigation_id']}/trace", headers=intruder)).status_code == 404

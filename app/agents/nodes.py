@@ -58,6 +58,7 @@ from app.config import Settings
 from app.formatting import key_label
 from app.llm.base import BaseLLM, LLMConfigurationError, LLMError
 from app.numbers import normalize_unit
+from app.observability import tracing
 from app.rag.citations import is_grounded, normalize
 from app.rag.reranker import select_diverse
 from app.rag.retriever import Retriever, SearchFilters
@@ -115,13 +116,16 @@ def traced(name: str) -> Callable[[NodeFunction], NodeFunction]:
             started = time.perf_counter()
             try:
                 update = await function(self, state)
-            except Exception:
+            except Exception as exc:
                 logger.exception("node_failed node=%s investigation=%s", name, investigation)
+                tracing.record(
+                    "error", name, (time.perf_counter() - started) * 1000,
+                    error=type(exc).__name__, iteration=state.get("iteration", 0),
+                )
                 raise
-            logger.info(
-                "node_exited node=%s investigation=%s latency_ms=%.0f",
-                name, investigation, (time.perf_counter() - started) * 1000,
-            )
+            latency = (time.perf_counter() - started) * 1000
+            logger.info("node_exited node=%s investigation=%s latency_ms=%.0f", name, investigation, latency)
+            tracing.record("node", name, latency, iteration=state.get("iteration", 0))
             return update
 
         return wrapper
@@ -237,7 +241,16 @@ class InvestigationNodes:
             if isinstance(result, BaseException):
                 logger.error("retrieval_failed query=%r error=%s: %s", query[:80], type(result).__name__, result)
                 errors.append(f"Search failed for query '{query[:80]}': {type(result).__name__}")
+                tracing.record("error", "retrieval", query=query[:200], error=type(result).__name__)
                 continue
+            tracing.record(
+                "retrieval", "search", query=query[:200],
+                chunks=[
+                    {"chunk_id": chunk.chunk_id, "document": chunk.filename, "page": chunk.page,
+                     "score": chunk.score, "matched_by": chunk.matched_by}
+                    for chunk in result
+                ],
+            )
             for chunk in result:
                 best = candidates.get(chunk.chunk_id)
                 if chunk.chunk_id not in known_ids and (best is None or chunk.rerank_score > best.rerank_score):

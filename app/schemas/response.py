@@ -70,6 +70,9 @@ class ReportStats(BaseModel):
     tool_calls: int = 0
     duration_ms: float = 0.0
     llm_provider: str = ""
+    # Token usage as reported by the provider (0 when the provider does not report it).
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 class InvestigationReport(BaseModel):
@@ -161,3 +164,21 @@ class StoredFinding(BaseModel):
 class FindingList(BaseModel):
     investigation_id: uuid.UUID
     findings: list[StoredFinding]
+
+
+class TraceEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    run: int
+    seq: int
+    kind: str
+    name: str
+    latency_ms: float | None = None
+    offset_ms: float = 0.0
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class TraceOut(BaseModel):
+    investigation_id: uuid.UUID
+    totals: dict[str, Any]
+    events: list[TraceEventOut]

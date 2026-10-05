@@ -29,6 +29,8 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
+from app.observability import tracing
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
@@ -174,10 +176,17 @@ class BaseLLM(ABC):
             started = time.perf_counter()
             try:
                 result = await asyncio.wait_for(call(), timeout=self._timeout)
+                latency = (time.perf_counter() - started) * 1000
+                trace = tracing.current_trace()
+                usage = trace.take_usage() if trace else {}
                 logger.info(
-                    "llm_call provider=%s model=%s purpose=%s attempt=%d latency_ms=%.0f",
-                    self.provider, self.model, purpose or "-", attempt,
-                    (time.perf_counter() - started) * 1000,
+                    "llm_call provider=%s model=%s purpose=%s attempt=%d latency_ms=%.0f input_tokens=%s output_tokens=%s",
+                    self.provider, self.model, purpose or "-", attempt, latency,
+                    usage.get("input_tokens", "-"), usage.get("output_tokens", "-"),
+                )
+                tracing.record(
+                    "llm", purpose or "-", latency, provider=self.provider, model=self.model,
+                    attempt=attempt, status="ok", **usage,
                 )
                 return result
             except LLMConfigurationError:
@@ -202,6 +211,11 @@ class BaseLLM(ABC):
                 "llm_call_failed provider=%s purpose=%s attempt=%d/%d error=%s: %s",
                 self.provider, purpose or "-", attempt, attempts,
                 type(last_error).__name__, _safe(last_error),
+            )
+            tracing.record(
+                "llm", purpose or "-", (time.perf_counter() - started) * 1000, provider=self.provider,
+                model=self.model, attempt=attempt, status="failed",
+                error=f"{type(last_error).__name__}: {_safe(last_error, 200)}",
             )
             if attempt < attempts:
                 delay = self._backoff * (2 ** (attempt - 1))

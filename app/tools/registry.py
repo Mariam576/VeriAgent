@@ -23,6 +23,7 @@ from typing import Any
 from langchain_core.tools import BaseTool
 from pydantic import ValidationError
 
+from app.observability import tracing
 from app.schemas.investigation import ToolCallRecord
 from app.tools.calculator import CALCULATOR_TOOLS
 
@@ -52,6 +53,7 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> ToolCallRecord:
     def record(status: str, result: dict | None = None, error: str | None = None) -> ToolCallRecord:
         latency = round((time.perf_counter() - started) * 1000, 3)
         logger.info("tool_call name=%s status=%s latency_ms=%.3f", name, status, latency)
+        tracing.record("tool", name, latency, arguments=arguments, status=status, result=result, error=error)
         return ToolCallRecord(
             tool_name=name, arguments=arguments, result=result, status=status, latency_ms=latency, error=error
         )

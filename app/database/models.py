@@ -171,6 +171,25 @@ class Finding(Base):
     investigation: Mapped[Investigation] = relationship(back_populates="findings")
 
 
+class TraceEvent(Base):
+    """One step of an investigation: a node, an LLM call, a tool call, a search or an error."""
+
+    __tablename__ = "trace_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    investigation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("investigations.id", ondelete="CASCADE"), index=True
+    )
+    run: Mapped[int] = mapped_column(Integer, default=1)  # 1 = first run, 2 = after a human decision, ...
+    seq: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String(20))  # node | llm | tool | retrieval | error
+    name: Mapped[str] = mapped_column(String(100))
+    latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    offset_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ToolCall(Base):
     """One row per tool execution. This is the audit trail (observability)."""
 

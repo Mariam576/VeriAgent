@@ -17,6 +17,8 @@ from app.schemas.response import (
     InvestigationRequest,
     InvestigationSummary,
     StoredFinding,
+    TraceEventOut,
+    TraceOut,
 )
 from app.security.permissions import CurrentUser, DbSession
 
@@ -60,4 +62,30 @@ async def get_findings(investigation_id: uuid.UUID, user: CurrentUser, session: 
     return FindingList(
         investigation_id=investigation.id,
         findings=[StoredFinding.model_validate(finding) for finding in findings],
+    )
+
+
+@router.get("/{investigation_id}/trace", response_model=TraceOut)
+async def get_trace(investigation_id: uuid.UUID, user: CurrentUser, session: DbSession) -> TraceOut:
+    """What the agent actually did: nodes, LLM calls with token usage, tool calls, searches, errors."""
+    investigation = await repositories.get_investigation(session, user.id, investigation_id)
+    if investigation is None:
+        raise NotFound("Investigation not found.")
+    events = await repositories.list_trace(session, investigation.id)
+    llm = [event for event in events if event.kind == "llm"]
+    totals = {
+        "events": len(events),
+        "runs": max((event.run for event in events), default=0),
+        "llm_calls": sum(1 for event in llm if event.data.get("status") == "ok"),
+        "llm_failures": sum(1 for event in llm if event.data.get("status") != "ok"),
+        "llm_latency_ms": round(sum(event.latency_ms or 0 for event in llm), 1),
+        "input_tokens": sum(int(event.data.get("input_tokens") or 0) for event in llm),
+        "output_tokens": sum(int(event.data.get("output_tokens") or 0) for event in llm),
+        "tool_calls": sum(1 for event in events if event.kind == "tool"),
+        "errors": sum(1 for event in events if event.kind == "error"),
+    }
+    return TraceOut(
+        investigation_id=investigation.id,
+        totals=totals,
+        events=[TraceEventOut.model_validate(event) for event in events],
     )

@@ -27,6 +27,7 @@ from app.database.session import get_session_factory
 from app.embeddings.factory import get_embedding_provider
 from app.errors import NotFound, ServiceUnavailable
 from app.llm.factory import get_llm
+from app.observability.tracing import json_safe, start_trace
 from app.rag.retriever import PgVectorRetriever
 from app.schemas.response import InvestigationReport
 from app.security.guardrails import redact_secrets
@@ -76,6 +77,7 @@ async def run_investigation(
     investigation = await repositories.create_investigation(session, user.id, question, conversation_id)
     investigation_id = investigation.id
     started = time.perf_counter()
+    trace = start_trace()  # collects every node, LLM call, tool call and search of this run
     logger.info("investigation_started id=%s user=%s", investigation_id, user.id)
 
     try:
@@ -98,6 +100,7 @@ async def run_investigation(
             session, investigation, status="failed", risk_level=None, confidence_score=None,
             report=None, findings=[], tool_calls=[],
         )
+        await repositories.save_trace(session, investigation_id, trace.events)  # the trace matters most when it failed
         if isinstance(exc, GraphRecursionError):
             raise ServiceUnavailable(
                 "The investigation was stopped because it needed too many steps. Try a narrower question."
@@ -110,6 +113,9 @@ async def run_investigation(
         redact_secrets(InvestigationReport(**state["report"]).model_dump_json(), settings)
     )
     report.stats.duration_ms = round((time.perf_counter() - started) * 1000, 1)
+    totals = trace.totals()
+    report.stats.input_tokens = totals["input_tokens"]
+    report.stats.output_tokens = totals["output_tokens"]
     if report.stats.llm_calls == 0 and state.get("used_fallback"):
         # Be explicit when no model answered at all, so a rule-based result is never mistaken for an LLM one.
         report.stats.llm_provider = f"{report.stats.llm_provider} (unavailable - rules used)"
@@ -117,7 +123,7 @@ async def run_investigation(
     tool_calls = [
         {
             "tool_name": str(call["tool_name"])[:100],  # the name may come from the model
-            **{key: call[key] for key in ("arguments", "result", "status", "latency_ms")},
+            **{key: json_safe(call[key]) for key in ("arguments", "result", "status", "latency_ms")},
         }
         for call in state.get("tool_calls", [])
     ]
@@ -131,6 +137,7 @@ async def run_investigation(
         findings=findings_for_storage(report),
         tool_calls=tool_calls,
     )
+    await repositories.save_trace(session, investigation_id, trace.events)
     logger.info(
         "investigation_completed id=%s status=%s risk=%s confidence=%.2f llm_calls=%d tool_calls=%d duration_ms=%.0f",
         investigation_id, report.status, report.risk_level, report.confidence,

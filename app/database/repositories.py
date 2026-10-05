@@ -23,6 +23,7 @@ from app.database.models import (
     Investigation,
     Message,
     ToolCall,
+    TraceEvent,
     User,
     utcnow,
 )
@@ -182,3 +183,32 @@ async def save_investigation_result(
     for call in tool_calls:
         session.add(ToolCall(investigation_id=investigation.id, **call))
     await session.commit()
+
+
+# -------------------------------------------------------------------- traces
+async def save_trace(session: AsyncSession, investigation_id: uuid.UUID, events: list[Any]) -> None:
+    """Store the events of one run. A later run (after a human decision) gets the next run number."""
+    if not events:
+        return
+    last_run = await session.scalar(
+        select(func.max(TraceEvent.run)).where(TraceEvent.investigation_id == investigation_id)
+    )
+    run = (last_run or 0) + 1
+    for event in events:
+        session.add(
+            TraceEvent(
+                investigation_id=investigation_id, run=run, seq=event.seq, kind=event.kind,
+                name=str(event.name)[:100], latency_ms=event.latency_ms, offset_ms=event.offset_ms,
+                data=event.data,
+            )
+        )
+    await session.commit()
+
+
+async def list_trace(session: AsyncSession, investigation_id: uuid.UUID) -> list[TraceEvent]:
+    result = await session.execute(
+        select(TraceEvent)
+        .where(TraceEvent.investigation_id == investigation_id)
+        .order_by(TraceEvent.run, TraceEvent.seq)
+    )
+    return list(result.scalars().all())
