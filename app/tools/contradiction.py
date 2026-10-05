@@ -83,7 +83,9 @@ def find_contradictions(evidence: list[EvidenceItem]) -> list[Contradiction]:
         by_key.setdefault(item.key, {}).setdefault(value, []).append(item)
 
     contradictions: list[Contradiction] = []
-    for key in sorted(by_key):
+    # Money first, then payment terms, then everything else alphabetically.
+    key_order = {KEY_TOTAL_AMOUNT: 0, KEY_PAYMENT_TERMS: 1}
+    for key in sorted(by_key, key=lambda name: (key_order.get(name, 2), name)):
         values = by_key[key]
         if len(values) < 2:
             continue  # everyone agrees, or only one source mentions it

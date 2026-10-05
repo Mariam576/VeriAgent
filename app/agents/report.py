@@ -1,0 +1,314 @@
+"""Node 10 helpers: assemble the final structured report.
+
+The report is built by code from the structured findings in the state. The
+only free text that came from the model (summary, recommended action, risk
+reasons) has already passed the reviewer. Citations are attached here from
+the evidence records, never written by the model.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from app.agents.assessment import evidence_quality
+from app.formatting import format_value, key_label
+from app.rag.citations import citations_from_evidence, format_citation
+from app.schemas.investigation import (
+    KEY_OTHER,
+    KEY_PAYMENT_TERMS,
+    KEY_TOTAL_AMOUNT,
+    RISK_ORDER,
+    Calculation,
+    Contradiction,
+    EvidenceItem,
+)
+from app.schemas.response import (
+    STATUS_LABELS,
+    CalculationOut,
+    CitationOut,
+    ContradictionOut,
+    FindingOut,
+    InvestigationReport,
+    ReportStats,
+)
+
+MAX_OTHER_FACTS = 6
+_KEY_ORDER = {KEY_TOTAL_AMOUNT: 0, KEY_PAYMENT_TERMS: 1}
+_DOC_ORDER = {"contract": 0, "purchase_order": 1, "quotation": 2, "invoice": 3, "receipt": 4, "policy": 5}
+
+CAPABILITIES = (
+    "I am VeriAgent, an evidence-verification agent. Upload business documents (contracts, invoices, "
+    "policies, purchase orders ...) and ask me to review them, compare them, find contradictions or check "
+    "whether there is enough evidence to approve something. Every finding comes with its source page."
+)
+
+
+def _cite(item: EvidenceItem) -> CitationOut:
+    return CitationOut(document=item.filename, page=item.page)
+
+
+def _unique(citations: list[CitationOut]) -> list[CitationOut]:
+    seen: set[tuple[str, int]] = set()
+    result = []
+    for citation in citations:
+        if (citation.document, citation.page) not in seen:
+            seen.add((citation.document, citation.page))
+            result.append(citation)
+    return result
+
+
+def determine_status(
+    *,
+    task_type: str,
+    evidence: list[EvidenceItem],
+    contradictions: list[Contradiction],
+    missing_evidence: list[str],
+    suspicious: list[dict[str, Any]],
+    risk_level: str,
+    iteration_limit_reached: bool,
+) -> str:
+    if task_type == "general":
+        return "not_applicable"
+    if not evidence:
+        return "insufficient_evidence"
+    if iteration_limit_reached and missing_evidence:
+        return "incomplete"
+    if contradictions or missing_evidence or suspicious or RISK_ORDER[risk_level] >= RISK_ORDER["medium"]:
+        return "review_required"
+    return "no_issues_found"
+
+
+def needs_human_review(
+    *, enabled: bool, status: str, risk_level: str, confidence: float, missing_evidence: list[str],
+    decision_requested: bool,
+) -> bool:
+    """Spec section 20, Node 9: when must a person look at this before anything is done?"""
+    if not enabled or status == "not_applicable":
+        return False
+    return (
+        RISK_ORDER[risk_level] >= RISK_ORDER["high"]  # risk is high
+        or confidence < 0.6  # confidence is low
+        or bool(missing_evidence)  # evidence is incomplete
+        or decision_requested  # the user asks for an approval-type decision
+        or status in ("insufficient_evidence", "incomplete")
+    )
+
+
+def _calculation_sentence(contradiction: Contradiction) -> str | None:
+    if contradiction.difference is None:
+        return None
+    unit = contradiction.unit_b or contradiction.unit_a
+    amount = format_value(abs(contradiction.difference), unit)
+    direction = "above" if contradiction.difference > 0 else "below"
+    sentence = (
+        f"Difference in {key_label(contradiction.key)}: {amount}. {contradiction.source_b} is {amount} "
+        f"{direction} {contradiction.source_a}"
+    )
+    if contradiction.percentage_change is not None:
+        change = contradiction.percentage_change
+        sentence += f" ({format_value(abs(change), '%')} {'more' if change > 0 else 'less'})"
+    return sentence + "."
+
+
+def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_provider: str, duration_ms: float) -> InvestigationReport:
+    evidence = [EvidenceItem(**item) for item in state.get("evidence", [])]
+    contradictions = [Contradiction(**item) for item in state.get("contradictions", [])]
+    calculations = [Calculation(**item) for item in state.get("calculations", [])]
+    missing = list(state.get("missing_evidence", []))
+    suspicious = list(state.get("risk_findings", []))
+    analysis = state.get("analysis", {})
+    draft = state.get("risk_draft", {})
+    by_id = {item.id: item for item in evidence}
+
+    risk_level = draft.get("level", "low")
+    confidence = float(draft.get("confidence", 0.0))
+    status = determine_status(
+        task_type=analysis.get("task_type", "document_investigation"),
+        evidence=evidence, contradictions=contradictions, missing_evidence=missing, suspicious=suspicious,
+        risk_level=risk_level, iteration_limit_reached=bool(state.get("iteration_limit_reached")),
+    )
+    human_review = needs_human_review(
+        enabled=human_approval_enabled, status=status, risk_level=risk_level, confidence=confidence,
+        missing_evidence=missing, decision_requested=bool(analysis.get("decision_requested")),
+    )
+
+    # ----- key findings: typed facts, then calculations, then other facts, then gaps
+    typed = sorted(
+        (item for item in evidence if item.key != KEY_OTHER),
+        key=lambda item: (_KEY_ORDER.get(item.key, 9), item.key, _DOC_ORDER.get(item.document_type, 9), item.filename),
+    )
+    others = [item for item in evidence if item.key == KEY_OTHER][:MAX_OTHER_FACTS]
+    findings: list[FindingOut] = [
+        FindingOut(type="fact", statement=item.claim, confidence=confidence, citations=[_cite(item)])
+        for item in typed
+    ]
+    for contradiction in contradictions:
+        sentence = _calculation_sentence(contradiction)
+        if sentence:
+            findings.append(
+                FindingOut(
+                    type="calculation", statement=sentence, severity=contradiction.severity,
+                    citations=_unique([_cite(by_id[i]) for i in contradiction.evidence_ids if i in by_id]),
+                )
+            )
+    findings += [
+        FindingOut(type="fact", statement=item.claim, confidence=confidence, citations=[_cite(item)])
+        for item in others
+    ]
+    findings += [
+        FindingOut(type="missing_evidence", statement=f"Supporting evidence was not found: {text}", severity="medium")
+        for text in missing
+    ]
+
+    contradictions_out = [
+        ContradictionOut(
+            id=item.id, type=item.type, severity=item.severity, description=item.description,
+            value_a=item.value_a, value_b=item.value_b, source_a=item.source_a, source_b=item.source_b,
+            difference=item.difference, percentage_change=item.percentage_change,
+            citations=_unique([_cite(by_id[i]) for i in item.evidence_ids if i in by_id]),
+        )
+        for item in contradictions
+    ]
+    calculations_out = [
+        CalculationOut(
+            id=item.id, description=item.label, tool_name=item.tool_name, arguments=item.arguments,
+            result=item.result, requested_by=item.requested_by,
+        )
+        for item in calculations
+        if item.status == "ok"
+    ]
+
+    # ----- risk reasons (inferences) with the citations of the evidence they point to
+    suspicious_by_id = {item["id"]: item for item in suspicious}
+    contradiction_by_id = {item.id: item for item in contradictions}
+    reasons_out = []
+    for reason in draft.get("reasons", []):
+        cited: list[CitationOut] = []
+        for identifier in reason.get("evidence_ids", []):
+            if identifier in by_id:
+                cited.append(_cite(by_id[identifier]))
+            elif identifier in contradiction_by_id:
+                cited += [_cite(by_id[i]) for i in contradiction_by_id[identifier].evidence_ids if i in by_id]
+            elif identifier in suspicious_by_id:
+                cited.append(CitationOut(document=suspicious_by_id[identifier]["document"], page=suspicious_by_id[identifier]["page"]))
+        reasons_out.append(FindingOut(type="risk", statement=reason["text"], severity=risk_level, citations=_unique(cited)))
+
+    sources = [CitationOut(document=c.document, page=c.page) for c in citations_from_evidence(evidence)]
+    sources = _unique(sources + [CitationOut(document=s["document"], page=s["page"]) for s in suspicious])
+
+    if status == "not_applicable":
+        summary, action = CAPABILITIES, "Upload documents and ask a question about them."
+    else:
+        summary, action = draft.get("summary", ""), draft.get("recommended_action", "")
+
+    report = InvestigationReport(
+        investigation_id=state.get("investigation_id", ""),
+        question=state.get("question", ""),
+        status=status,
+        status_label=STATUS_LABELS.get(status, status),
+        risk_level=risk_level,
+        confidence=round(confidence, 2),
+        evidence_quality=evidence_quality(evidence, int(state.get("discarded_facts", 0)), missing),  # type: ignore[arg-type]
+        requires_human_review=human_review,
+        summary=summary,
+        key_findings=findings,
+        contradictions=contradictions_out,
+        missing_evidence=missing,
+        calculations=calculations_out,
+        risk_reasons=reasons_out,
+        recommended_action=action,
+        sources=sources,
+        limitations=list(dict.fromkeys(state.get("limitations", []))),
+        stats=ReportStats(
+            iterations=int(state.get("iteration", 0)),
+            llm_calls=int(state.get("llm_calls", 0)),
+            retrieval_rounds=int(state.get("retrieval_rounds", 0)),
+            retrieved_chunks=len(state.get("retrieved_documents", [])),
+            evidence_items=len(evidence),
+            discarded_facts=int(state.get("discarded_facts", 0)),
+            tool_calls=len(state.get("tool_calls", [])),
+            duration_ms=round(duration_ms, 1),
+            llm_provider=llm_provider,
+        ),
+    )
+    report.answer_text = render_report(report)
+    return report
+
+
+def render_report(report: InvestigationReport) -> str:
+    """The report as readable text, in the layout of spec section 3."""
+    if report.status == "not_applicable":
+        return report.summary
+
+    def cites(citations: list[CitationOut]) -> str:
+        return "".join(" " + format_citation(c.document, c.page) for c in citations)
+
+    lines = [
+        f"Investigation Status: {report.status_label}",
+        f"Overall Risk Level: {report.risk_level.capitalize()}",
+        f"Confidence Score: {round(report.confidence * 100)}%",
+        f"Human Review: {'Required' if report.requires_human_review else 'Not required'}",
+        "",
+        "Summary:",
+        report.summary,
+    ]
+    labels = {"fact": "Fact", "calculation": "Calculation", "missing_evidence": "Missing evidence"}
+    if report.key_findings:
+        lines += ["", "Key Findings:"]
+        for number, finding in enumerate(report.key_findings, start=1):
+            lines.append(f"{number}. [{labels.get(finding.type, finding.type)}] {finding.statement}{cites(finding.citations)}")
+    if report.contradictions:
+        lines += ["", "Contradictions Detected:"]
+        lines += [f"- ({item.severity}) {item.description}{cites(item.citations)}" for item in report.contradictions]
+    if report.missing_evidence:
+        lines += ["", "Missing Evidence:"]
+        lines += [f"- {text}" for text in report.missing_evidence]
+    if report.risk_reasons:
+        lines += ["", "Risk Reasoning (inference):"]
+        lines += [f"- {reason.statement}{cites(reason.citations)}" for reason in report.risk_reasons]
+    lines += ["", f"Evidence Quality: {report.evidence_quality.capitalize()}", "", "Recommended Action:", report.recommended_action]
+    if report.sources:
+        lines += ["", "Sources:"]
+        lines += [f"- {source.document} — Page {source.page}" for source in report.sources]
+    if report.limitations:
+        lines += ["", "Limitations:"]
+        lines += [f"- {text}" for text in report.limitations]
+    return "\n".join(lines)
+
+
+def findings_for_storage(report: InvestigationReport, document_ids: dict[str, str]) -> list[dict[str, Any]]:
+    """Flatten the report into rows for the ``findings`` table."""
+    import uuid
+
+    def source(citations: list[CitationOut]) -> dict[str, Any]:
+        if not citations:
+            return {"source_document_id": None, "page_number": None}
+        first = citations[0]
+        document_id = document_ids.get(first.document)
+        return {
+            "source_document_id": uuid.UUID(document_id) if document_id else None,
+            "page_number": first.page,
+        }
+
+    rows: list[dict[str, Any]] = []
+    for finding in report.key_findings:
+        rows.append({
+            "finding_type": finding.type, "statement": finding.statement, "severity": finding.severity,
+            "confidence": finding.confidence, **source(finding.citations),
+        })
+    for item in report.contradictions:
+        rows.append({
+            "finding_type": "contradiction", "statement": item.description, "severity": item.severity,
+            "confidence": report.confidence, **source(item.citations),
+        })
+    for reason in report.risk_reasons:
+        rows.append({
+            "finding_type": "risk", "statement": reason.statement, "severity": reason.severity,
+            "confidence": report.confidence, **source(reason.citations),
+        })
+    if report.recommended_action and report.status != "not_applicable":
+        rows.append({
+            "finding_type": "recommendation", "statement": report.recommended_action, "severity": None,
+            "confidence": report.confidence, "source_document_id": None, "page_number": None,
+        })
+    return rows

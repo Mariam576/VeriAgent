@@ -62,28 +62,34 @@ def _score(query: str, chunk: RetrievedChunk) -> float:
     return 0.7 * max(chunk.score, 0.0) + 0.3 * lexical_overlap(query, chunk.text)
 
 
-def rerank(query: str, candidates: list[RetrievedChunk], top_n: int) -> list[RetrievedChunk]:
-    """Return the best ``top_n`` candidates, best first."""
-    if top_n <= 0 or not candidates:
+def select_diverse(ranked: list[RetrievedChunk], top_n: int) -> list[RetrievedChunk]:
+    """Pick ``top_n`` chunks from a best-first list, keeping every document represented.
+
+    First the best chunk of each document, then the remaining places by score.
+    """
+    if top_n <= 0:
         return []
-
-    scored = [chunk.model_copy(update={"rerank_score": round(_score(query, chunk), 6)}) for chunk in candidates]
-    scored.sort(key=lambda chunk: chunk.rerank_score, reverse=True)
-
-    # First the best chunk of each document, then fill up by score.
     selected: list[RetrievedChunk] = []
     seen_documents: set[str] = set()
-    for chunk in scored:
+    for chunk in ranked:
         if chunk.document_id not in seen_documents and len(selected) < top_n:
             selected.append(chunk)
             seen_documents.add(chunk.document_id)
     chosen_ids = {chunk.chunk_id for chunk in selected}
-    for chunk in scored:
+    for chunk in ranked:
         if len(selected) >= top_n:
             break
         if chunk.chunk_id not in chosen_ids:
             selected.append(chunk)
             chosen_ids.add(chunk.chunk_id)
-
     selected.sort(key=lambda chunk: chunk.rerank_score, reverse=True)
     return selected
+
+
+def rerank(query: str, candidates: list[RetrievedChunk], top_n: int) -> list[RetrievedChunk]:
+    """Return the best ``top_n`` candidates, best first."""
+    if top_n <= 0 or not candidates:
+        return []
+    scored = [chunk.model_copy(update={"rerank_score": round(_score(query, chunk), 6)}) for chunk in candidates]
+    scored.sort(key=lambda chunk: chunk.rerank_score, reverse=True)
+    return select_diverse(scored, top_n)
