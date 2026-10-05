@@ -27,6 +27,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from datetime import datetime, timezone
 from typing import Any
 
@@ -45,8 +46,9 @@ from app.database import repositories
 from app.database.models import Investigation, User
 from app.database.session import get_session_factory
 from app.embeddings.factory import get_embedding_provider
-from app.errors import Conflict, NotFound, ServiceUnavailable, ValidationFailed
+from app.errors import Conflict, NotFound, ServiceUnavailable, ValidationFailed, safe_error
 from app.llm.factory import get_llm
+from app.memory.semantic import remember_investigation
 from app.memory.store import get_memory_store
 from app.observability.tracing import json_safe, start_trace
 from app.rag.retriever import PgVectorRetriever
@@ -121,13 +123,13 @@ async def _delete_checkpoints(graph: CompiledStateGraph | None, investigation_id
 
 
 async def _run(
-    session: AsyncSession, investigation: Investigation, graph_input: Any
+    session: AsyncSession, investigation: Investigation, graph_input: Any, *, mode: str
 ) -> AsyncIterator[dict[str, Any]]:
     """Run (or continue) the graph for one investigation.
 
-    ``graph_input`` is the initial state for a new investigation,
-    ``Command(resume=...)`` to deliver a human decision, or ``None`` to
-    continue from the last checkpoint.
+    ``graph_input`` is the initial state for a new investigation (mode
+    "start"), ``Command(resume=...)`` to deliver a human decision ("decide"),
+    or ``None`` to continue from the last checkpoint ("resume").
 
     Yields ``{"type": "progress", "node", "message"}`` and
     ``{"type": "tool", "tool_name", "status"}`` events while the graph works,
@@ -140,17 +142,21 @@ async def _run(
         raise Conflict("This investigation is being worked on right now. Try again in a moment.")
     _active.add(key)
     try:
-        async for item in _run_exclusive(session, investigation, graph_input):
-            yield item
+        # aclosing(): when our caller stops reading, close the inner generator NOW, so it
+        # can record the interruption. Python would otherwise close it "some time later".
+        async with aclosing(_run_exclusive(session, investigation, graph_input, mode)) as events:
+            async for item in events:
+                yield item
     finally:
         _active.discard(key)
 
 
 async def _run_exclusive(
-    session: AsyncSession, investigation: Investigation, graph_input: Any
+    session: AsyncSession, investigation: Investigation, graph_input: Any, mode: str
 ) -> AsyncIterator[dict[str, Any]]:
     settings = get_settings()
     investigation_id = investigation.id
+    user_id = str(investigation.user_id)
     was_waiting = investigation.approval_status in ("pending", "deciding")
     earlier_stats = (investigation.report or {}).get("stats", {})
     started = time.perf_counter()
@@ -159,18 +165,22 @@ async def _run_exclusive(
     graph: CompiledStateGraph | None = None
 
     try:
+        # Hand the request's database connection back to the pool while the graph
+        # works: the graph's own searches and checkpoints need connections too.
+        await session.commit()
         graph = await get_graph()  # inside the try: a missing API key surfaces here
         skip = False
         if graph_input is None:
             before = await graph.aget_state(config)
             # Nothing left to run: the graph finished, only storing the result was cut off.
-            skip = not before.next
+            # (A node that was cut off mid-way shows up in ``tasks`` even when ``next`` is empty.)
+            skip = not before.next and not before.tasks
         if not skip:
             # Two streams at once: "custom" carries "node X started" (sent by the node
             # itself while it works), "updates" carries what each node returned.
             announced: dict[str, str] = {}
-            async for mode, chunk in graph.astream(graph_input, config=config, stream_mode=["updates", "custom"]):
-                if mode == "custom":
+            async for stream_mode, chunk in graph.astream(graph_input, config=config, stream_mode=["updates", "custom"]):
+                if stream_mode == "custom":
                     if isinstance(chunk, dict) and chunk.get("type") == "node_started":
                         node = str(chunk.get("node", ""))
                         label = STAGE_LABELS.get(node)
@@ -192,64 +202,70 @@ async def _run_exclusive(
         waiting = _waiting_requests(snapshot)
         state = snapshot.values
         raw_report = waiting[0]["draft_report"] if waiting else state["report"]
+        if waiting:
+            yield {"type": "progress", "node": "human_approval", "message": "Waiting for a human decision..."}
+
+        # Output validation: the whole report passes through the redaction filter,
+        # so nothing that looks like a key or password leaves the system.
+        report = InvestigationReport.model_validate_json(
+            redact_secrets(InvestigationReport(**raw_report).model_dump_json(), settings)
+        )
+        totals = trace.totals()
+        # An investigation can span several runs (pause -> decision); add them up.
+        report.stats.duration_ms = round(
+            float(earlier_stats.get("duration_ms") or 0) + (time.perf_counter() - started) * 1000, 1
+        )
+        report.stats.input_tokens = int(earlier_stats.get("input_tokens") or 0) + totals["input_tokens"]
+        report.stats.output_tokens = int(earlier_stats.get("output_tokens") or 0) + totals["output_tokens"]
+        if report.stats.llm_calls == 0 and state.get("used_fallback"):
+            # Be explicit when no model answered at all, so a rule-based result is never mistaken for an LLM one.
+            report.stats.llm_provider = f"{report.stats.llm_provider} (unavailable - rules used)"
+        report.answer_text = render_report(report)
+
+        paused = report.human_review.status == "pending"
+        tool_calls = [
+            {
+                "tool_name": str(call["tool_name"])[:100],  # the name may come from the model
+                **{key: json_safe(call[key]) for key in ("arguments", "result", "status", "latency_ms")},
+            }
+            for call in state.get("tool_calls", [])
+        ]
+        await repositories.save_investigation_result(
+            session,
+            investigation,
+            status=report.status,
+            risk_level=report.risk_level,
+            confidence_score=report.confidence,
+            report=report.model_dump(mode="json"),
+            findings=findings_for_storage(report),
+            tool_calls=tool_calls,
+            approval_status=report.human_review.status,
+            approval_note=report.human_review.note,
+            completed=not paused,
+        )
+    except (asyncio.CancelledError, GeneratorExit):
+        # The caller went away (the browser closed the stream, or the server is stopping).
+        # shield(): finish recording what happened even though this task is being cancelled.
+        await asyncio.shield(_record_stop(session, graph, investigation, trace, mode, was_waiting, None))
+        raise
     except Exception as exc:
         logger.error(
             "investigation_failed id=%s error=%s: %s", investigation_id, type(exc).__name__,
             redact_secrets(str(exc), settings),
         )
-        await session.rollback()
-        await _record_failure(session, graph, investigation_id, was_waiting)
-        await repositories.save_trace(session, investigation_id, trace.events)  # the trace matters most when it failed
+        await _record_stop(session, graph, investigation, trace, mode, was_waiting, exc)
         if isinstance(exc, GraphRecursionError):
             raise ServiceUnavailable(
                 "The investigation was stopped because it needed too many steps. Try a narrower question."
             ) from exc
         raise
 
-    if waiting:
-        yield {"type": "progress", "node": "human_approval", "message": "Waiting for a human decision..."}
-
-    # Output validation: the whole report passes through the redaction filter,
-    # so nothing that looks like a key or password leaves the system.
-    report = InvestigationReport.model_validate_json(
-        redact_secrets(InvestigationReport(**raw_report).model_dump_json(), settings)
-    )
-    totals = trace.totals()
-    # An investigation can span several runs (pause -> decision); add them up.
-    report.stats.duration_ms = round(
-        float(earlier_stats.get("duration_ms") or 0) + (time.perf_counter() - started) * 1000, 1
-    )
-    report.stats.input_tokens = int(earlier_stats.get("input_tokens") or 0) + totals["input_tokens"]
-    report.stats.output_tokens = int(earlier_stats.get("output_tokens") or 0) + totals["output_tokens"]
-    if report.stats.llm_calls == 0 and state.get("used_fallback"):
-        # Be explicit when no model answered at all, so a rule-based result is never mistaken for an LLM one.
-        report.stats.llm_provider = f"{report.stats.llm_provider} (unavailable - rules used)"
-    report.answer_text = render_report(report)
-
-    paused = report.human_review.status == "pending"
-    tool_calls = [
-        {
-            "tool_name": str(call["tool_name"])[:100],  # the name may come from the model
-            **{key: json_safe(call[key]) for key in ("arguments", "result", "status", "latency_ms")},
-        }
-        for call in state.get("tool_calls", [])
-    ]
-    await repositories.save_investigation_result(
-        session,
-        investigation,
-        status=report.status,
-        risk_level=report.risk_level,
-        confidence_score=report.confidence,
-        report=report.model_dump(mode="json"),
-        findings=findings_for_storage(report),
-        tool_calls=tool_calls,
-        approval_status=report.human_review.status,
-        approval_note=report.human_review.note,
-        completed=not paused,
-    )
-    await repositories.save_trace(session, investigation_id, trace.events)
+    # ---- the result is stored; what follows can no longer fail the investigation
     if not paused:
+        # Only now, so memory never tells of an outcome the database does not have.
+        await remember_investigation(get_memory_store(), settings, user_id, report)
         await _delete_checkpoints(graph, investigation_id)  # the result is in the normal tables now
+    await _save_trace(session, investigation_id, trace)
     logger.info(
         "investigation_%s id=%s status=%s risk=%s confidence=%.2f approval=%s llm_calls=%d tool_calls=%d duration_ms=%.0f",
         "paused" if paused else "completed", investigation_id, report.status, report.risk_level, report.confidence,
@@ -258,23 +274,60 @@ async def _run_exclusive(
     yield {"type": "report", "report": report}
 
 
-async def _record_failure(
-    session: AsyncSession, graph: CompiledStateGraph | None, investigation_id: uuid.UUID, was_waiting: bool
+async def _save_trace(session: AsyncSession, investigation_id: uuid.UUID, trace: Any) -> None:
+    try:
+        await repositories.save_trace(session, investigation_id, trace.events)
+    except Exception as exc:  # noqa: BLE001 - a trace is diagnostics; losing it must not lose the result
+        await session.rollback()
+        logger.warning("Could not save the trace of %s: %s", investigation_id, type(exc).__name__)
+
+
+async def _record_stop(
+    session: AsyncSession,
+    graph: CompiledStateGraph | None,
+    investigation: Investigation,
+    trace: Any,
+    mode: str,
+    was_waiting: bool,
+    error: BaseException | None,
 ) -> None:
-    """Leave the investigation in a state that says truthfully what can happen next."""
-    if was_waiting and graph is not None:
-        try:
-            still_waiting = bool(_waiting_requests(await graph.aget_state(_config(investigation_id))))
-        except Exception:  # noqa: BLE001
-            still_waiting = False
-        if still_waiting:
-            # The decision was not applied; the person can make it again.
+    """A run ended without a stored result. Leave the investigation in a state that says truthfully what can happen next.
+
+    ``error`` is None when the run was cancelled (the caller went away).
+
+        still waiting for the decision  -> "pending": the decision was not applied and can be made again
+        cancelled, or the decision was
+        recorded and a later step failed -> "interrupted": POST /investigations/{id}/resume continues at once
+        anything else                    -> "failed": a start that failed, or a resume that failed again
+                                            (so a broken investigation is not retried forever)
+    """
+    investigation_id = investigation.id
+    try:
+        await session.rollback()
+        still_waiting, has_progress = False, False
+        if graph is not None:
+            try:
+                snapshot = await graph.aget_state(_config(investigation_id))
+                still_waiting, has_progress = bool(_waiting_requests(snapshot)), bool(snapshot.values)
+            except Exception:  # noqa: BLE001
+                pass
+        if error is None:
+            reason = "The run was cut off before it finished (the connection was closed)."
+        else:
+            reason = safe_error(error)[1]["message"]
+            if isinstance(error, GraphRecursionError):
+                reason = "The investigation needed too many steps."
+
+        if was_waiting and still_waiting:
             await repositories.set_approval_status(session, investigation_id, "pending")
-        # Otherwise the decision is saved in the checkpoint and only the last
-        # steps are missing: POST /investigations/{id}/resume finishes them.
-        return
-    await repositories.mark_investigation_failed(session, investigation_id)
-    await _delete_checkpoints(graph, investigation_id)
+        elif has_progress and (error is None or mode == "decide"):
+            await repositories.mark_investigation_interrupted(session, investigation_id, reason)
+        else:
+            await repositories.mark_investigation_failed(session, investigation_id, reason)
+            await _delete_checkpoints(graph, investigation_id)
+        await _save_trace(session, investigation_id, trace)  # the trace matters most when something went wrong
+    except Exception as exc:  # noqa: BLE001 - never hide the original error behind a bookkeeping error
+        logger.error("Could not record why investigation %s stopped: %s", investigation_id, type(exc).__name__)
 
 
 async def _last_report(events: AsyncIterator[dict[str, Any]]) -> InvestigationReport:
@@ -327,8 +380,9 @@ async def stream_investigation(
         document_ids=[str(document_id) for document_id in document_ids],
         filters={name: value for name, value in filters.items() if value is not None},
     )
-    async for item in _run(session, investigation, state):
-        yield item
+    async with aclosing(_run(session, investigation, state, mode="start")) as events:
+        async for item in events:
+            yield item
 
 
 async def run_investigation(session: AsyncSession, **kwargs: Any) -> tuple[Investigation, InvestigationReport]:
@@ -362,16 +416,18 @@ async def decide_investigation(
         raise NotFound("Investigation not found.")
     if str(investigation_id) in _active:
         raise Conflict("This investigation is being worked on right now. Try again in a moment.")
+    if investigation.status == "interrupted":
+        raise Conflict("A decision was already recorded and the run was cut off. Use POST /investigations/{id}/resume to finish it.")
     if not await repositories.claim_pending_approval(session, investigation_id):
         raise Conflict("This investigation is not waiting for a decision.")
-    await session.refresh(investigation)
+    investigation.approval_status = "deciding"  # what the claim just wrote
 
     # ``Command(resume=...)`` continues the paused graph; the value becomes the
     # return value of ``interrupt()`` inside the human_approval node.
     command = Command(
         resume={"decision": decision, "note": note, "modified_action": modified_action, "reviewer": user.name}
     )
-    report = await _last_report(_run(session, investigation, command))
+    report = await _last_report(_run(session, investigation, command, mode="decide"))
     if report.human_review.status == "pending":
         # The graph refused the decision and is waiting again (see the human_approval node).
         raise ValidationFailed("The decision could not be applied. Check 'decision' and 'modified_action'.")
@@ -388,34 +444,52 @@ async def resume_investigation(
 ) -> InvestigationReport:
     """Continue an investigation whose run was cut off, from its last checkpoint.
 
-    Only a run that has made no progress for a while may be resumed; otherwise
-    two workers could run the same investigation at once.
+    Two situations:
+
+    * status "interrupted": the server itself recorded that the run stopped
+      (the stream was closed, or a step failed after the decision was saved).
+      It can be resumed at once.
+    * status "running" (or a decision stuck in "deciding") with no progress for
+      STALE_RUN_SECONDS: the process died without being able to record
+      anything. The waiting time is what stops two workers from running the
+      same investigation at once.
+
+    A resume that fails marks the investigation failed, so nothing is retried forever.
     """
     settings = get_settings()
     investigation = await repositories.get_investigation(session, user.id, investigation_id)
     if investigation is None:
         raise NotFound("Investigation not found.")
-    if investigation.status != "running" and investigation.approval_status != "deciding":
+    interrupted = investigation.status == "interrupted"
+    cut_off = investigation.status == "running" or investigation.approval_status == "deciding"
+    if investigation.status == "failed" or investigation.completed_at is not None or not (interrupted or cut_off):
         raise Conflict("This investigation was not interrupted, so there is nothing to resume.")
     if str(investigation_id) in _active:
         raise Conflict("This investigation is being worked on right now. Try again in a moment.")
 
     graph = await get_graph()
     snapshot = await graph.aget_state(_config(investigation_id))
-    last_progress = investigation.created_at
-    if snapshot.created_at:
-        last_progress = datetime.fromisoformat(snapshot.created_at)
-    idle_seconds = (datetime.now(timezone.utc) - last_progress).total_seconds()
-    limit = settings.STALE_RUN_SECONDS if stale_after_seconds is None else stale_after_seconds
-    if idle_seconds < limit:
-        raise Conflict(
-            f"This investigation made progress {int(idle_seconds)} seconds ago and may still be running. "
-            f"It can be resumed after {int(limit)} seconds without progress."
-        )
+    if interrupted:
+        if not await repositories.claim_interrupted(session, investigation_id):  # atomic: only one resume wins
+            raise Conflict("This investigation is already being resumed.")
+        investigation.status = "running"
+    else:
+        last_progress = investigation.created_at
+        if snapshot.created_at:
+            last_progress = datetime.fromisoformat(snapshot.created_at)
+        idle_seconds = (datetime.now(timezone.utc) - last_progress).total_seconds()
+        limit = settings.STALE_RUN_SECONDS if stale_after_seconds is None else stale_after_seconds
+        if idle_seconds < limit:
+            raise Conflict(
+                f"This investigation made progress {int(idle_seconds)} seconds ago and may still be running. "
+                f"It can be resumed after {int(limit)} seconds without progress."
+            )
     if not snapshot.values:
         # It stopped before the first node finished: there is nothing saved to continue from.
-        await repositories.mark_investigation_failed(session, investigation_id)
+        await repositories.mark_investigation_failed(
+            session, investigation_id, "It stopped before anything was saved, so it could not be resumed."
+        )
         raise Conflict("Nothing was saved for this investigation before it stopped. Please start it again.")
 
     logger.info("investigation_resumed id=%s next=%s", investigation_id, ",".join(snapshot.next) or "-")
-    return await _last_report(_run(session, investigation, None))
+    return await _last_report(_run(session, investigation, None, mode="resume"))

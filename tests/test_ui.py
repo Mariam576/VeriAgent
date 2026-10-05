@@ -93,7 +93,8 @@ def page_text(app: AppTest) -> str:
         parts += [str(element.value) for element in getattr(app, kind)]
         parts += [str(element.value) for element in getattr(app.sidebar, kind)]
     parts += [str(expander.label) for expander in app.expander]
-    return "\n".join(parts)
+    # The page escapes document text for Markdown; a reader sees it without the backslashes.
+    return "\n".join(parts).replace("\\", "").replace("\u200b", "")
 
 
 def test_empty_page_explains_what_to_do(api_url, user, monkeypatch):
@@ -182,3 +183,92 @@ def test_documents_can_be_deleted_and_an_unreachable_api_is_explained(api_url, u
 
     offline = open_app(f"http://127.0.0.1:{free_port()}", user, monkeypatch)
     assert "Cannot reach the API" in page_text(offline)
+
+
+HOSTILE_INVOICE = (
+    "INVOICE Invoice No. INV-900. From: Fenwick Cleaning Services Ltd. Contract reference: SC-2026-020. "
+    "Total amount due: $58,000 ![logo](http://127.0.0.1:9/leak?via=quote) "
+    "[Click to view remittance details](http://127.0.0.1:9/phish) see www.example-pay.test now. "
+    "Payment terms: 30 days from the date of invoice."
+)
+HOSTILE_CONTRACT = (
+    "SERVICE CONTRACT Contract No. SC-2026-020. The total contract value is $40,000 for the Term. "
+    "Payment terms: 30 days from the date of invoice."
+)
+
+
+def raw_markdown(app: AppTest) -> str:
+    """Every string the page hands to Streamlit's Markdown renderer, exactly as passed."""
+    parts = []
+    for kind in ("markdown", "caption", "info", "warning", "success", "error"):
+        parts += [str(element.value) for element in getattr(app, kind)]
+        parts += [str(element.value) for element in getattr(app.sidebar, kind)]
+    parts += [str(expander.label) for expander in app.expander]
+    parts += [str(button.label) for button in app.sidebar.button]
+    return "\n".join(parts)
+
+
+def test_document_text_can_never_become_an_image_a_link_or_a_formula(api_url, user, monkeypatch):
+    with httpx.Client(base_url=api_url, headers={"X-User-Id": user}, timeout=60) as client:
+        for name, text in (("Invoice_[x](http://127.0.0.1:9/name).txt", HOSTILE_INVOICE), ("Service_Contract.txt", HOSTILE_CONTRACT)):
+            assert client.post("/documents/upload", files={"file": (name, text.encode())}).status_code == 201
+
+    app = open_app(api_url, user, monkeypatch)
+    app.chat_input[0].set_value("Compare the invoice with the contract. Is $58,000 right?").run()
+    assert not app.exception, app.exception
+    rendered = raw_markdown(app)
+
+    # The hostile text is on the page (as evidence), but only in escaped form.
+    assert "leak?via=quote" in rendered and "remittance details" in rendered
+    assert "![" not in rendered  # no image can be created
+    assert "](" not in rendered  # no link can be created
+    assert "http://" not in rendered and "www." not in rendered  # bare addresses are not auto-linked either
+    # Dollar amounts are escaped, so "$40,000 ... $58,000" is not swallowed as a formula.
+    assert "\\$40,000" in rendered and "\\$58,000" in rendered
+    assert "$40,000" not in rendered.replace("\\$", "")
+    # What a person reads is unchanged: unescaping gives the original words back.
+    readable = rendered.replace("\\", "").replace("​", "")
+    assert "Total amount due: $58,000 ![logo](http://127.0.0.1:9/leak?via=quote)" in readable
+
+
+def test_interface_and_api_escape_text_the_same_way():
+    from app.formatting import escape_markdown
+    from ui.safe_text import plain
+
+    samples = [
+        "plain words", "$40,000 and $58,000", "![x](http://a.test/p.png)", "[link](https://a.test)", "<script>x</script>",
+        "*bold* _it_ `code` # head | table ~ strike", "see www.example.test or http://x.test\nsecond line",
+        "back\\slash {curly} +plus", "", None, 42, "javascript:alert(1)", "mailto:a@b.test",
+    ]
+    for sample in samples:
+        assert plain(sample) == escape_markdown(sample)
+    assert plain("![x](http://a.test/p.png)") == "\\!\\[x\\]\\(http:​//a.test/p.png\\)"
+    assert plain("two\n\nlines") == "two lines"
+
+
+async def test_an_interrupted_investigation_is_continued_from_the_history(api_url, user, samples_dir, monkeypatch):
+    """A run is cut off part-way; opening it in the interface continues it from its checkpoint."""
+    from app.agents import service
+    from app.database import repositories
+    from app.database.session import get_session_factory
+    from app.security.permissions import user_uuid_for
+
+    upload_samples(api_url, user, samples_dir)
+    # Cut a run off in this process. The checkpoint is in the shared database, so the API
+    # process (which the interface talks to) can pick it up.
+    async with get_session_factory()() as session:
+        owner = await repositories.get_or_create_user(session, user_uuid_for(user), user)
+        events = service.stream_investigation(session, user=owner, question=DEMO_QUESTION)
+        async for item in events:
+            if item["type"] == "progress" and item["node"] == "extract_evidence":
+                break
+        await events.aclose()
+
+    app = open_app(api_url, user, monkeypatch)
+    item = next(button for button in app.sidebar.button if button.label.startswith("Interrupted"))
+    item.click().run()
+    assert not app.exception, app.exception
+    text = page_text(app)
+    assert "continued from its last saved step" in text
+    assert "HIGH" in text and "This investigation is paused." in text
+    assert not any(button.label.startswith("Interrupted") for button in app.sidebar.button)

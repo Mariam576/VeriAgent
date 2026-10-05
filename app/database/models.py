@@ -165,14 +165,17 @@ class Investigation(Base):
         ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True
     )
     question: Mapped[str] = mapped_column(Text)
+    # running | interrupted | failed | or the status of the report (review_required, no_issues_found, ...)
     status: Mapped[str] = mapped_column(String(30), default="running")
+    # Why the investigation failed or was interrupted, in words that are safe to show.
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
     risk_level: Mapped[str | None] = mapped_column(String(20), nullable=True)
     confidence_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # The full structured report, so GET /investigations/{id} can return it later.
     report: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
-    # Human-in-the-loop: not_required | pending | approved | rejected | modified
+    # Human-in-the-loop: not_required | not_requested | pending | deciding | approved | rejected | modified
     approval_status: Mapped[str] = mapped_column(String(20), default="not_required", server_default="not_required")
     approval_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

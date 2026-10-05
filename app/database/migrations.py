@@ -41,11 +41,31 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
             "ALTER TABLE investigations ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ",
         ],
     ),
+    (
+        "v2_003_investigation_error",
+        ["ALTER TABLE investigations ADD COLUMN IF NOT EXISTS error TEXT"],
+    ),
+    (
+        "v2_004_backfill_review_flag",
+        [
+            # Version 1 reports only had a yes/no "requires_human_review". Carry that over,
+            # so an old report that needed a person still says so after the upgrade.
+            "UPDATE investigations SET approval_status = 'not_requested' "
+            "WHERE approval_status = 'not_required' AND report ->> 'requires_human_review' = 'true' "
+            "AND report -> 'human_review' IS NULL",
+        ],
+    ),
 ]
+
+# Any fixed number: it only has to be the same in every API process.
+MIGRATION_LOCK_ID = 7_316_204
 
 
 async def run_migrations(conn: AsyncConnection) -> list[str]:
     """Apply every migration that has not been recorded yet. Returns the names applied."""
+    # If two API processes start at the same moment, the second waits here until the
+    # first has finished (the lock is released when the surrounding transaction ends).
+    await conn.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": MIGRATION_LOCK_ID})
     await conn.execute(
         text(
             "CREATE TABLE IF NOT EXISTS schema_migrations ("

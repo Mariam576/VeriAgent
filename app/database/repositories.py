@@ -35,9 +35,12 @@ async def get_or_create_user(session: AsyncSession, user_id: uuid.UUID, name: st
     await session.execute(
         pg_insert(User).values(id=user_id, name=name).on_conflict_do_nothing(index_elements=[User.id])
     )
-    await session.commit()
     user = await session.get(User, user_id)
     assert user is not None
+    # Commit last: that hands the database connection back to the pool. Reading
+    # after the commit would keep one connection checked out for the whole request,
+    # and requests that need a second one (memory, streaming) could then starve the pool.
+    await session.commit()
     return user
 
 
@@ -182,6 +185,7 @@ async def save_investigation_result(
     save replaces the findings and tool calls of the first.
     """
     investigation.status = status
+    investigation.error = None
     investigation.risk_level = risk_level
     investigation.confidence_score = confidence_score
     investigation.report = report
@@ -192,22 +196,54 @@ async def save_investigation_result(
         if approval_status in ("approved", "rejected", "modified"):
             investigation.approved_at = utcnow()
 
+    # A cited document may have been deleted since the evidence was read (for example
+    # while the investigation waited for a decision). The finding keeps its text; only
+    # the link to the document is dropped, because the row it pointed to is gone.
+    cited = {finding["source_document_id"] for finding in findings if finding.get("source_document_id")}
+    existing: set[uuid.UUID] = set()
+    if cited:
+        result = await session.execute(select(Document.id).where(Document.id.in_(cited)))
+        existing = set(result.scalars().all())
+
     await session.execute(delete(Finding).where(Finding.investigation_id == investigation.id))
     await session.execute(delete(ToolCall).where(ToolCall.investigation_id == investigation.id))
     for position, finding in enumerate(findings):
+        if finding.get("source_document_id") not in existing:
+            finding = {**finding, "source_document_id": None}
         session.add(Finding(investigation_id=investigation.id, position=position, **finding))
     for call in tool_calls:
         session.add(ToolCall(investigation_id=investigation.id, **call))
     await session.commit()
 
 
-async def mark_investigation_failed(session: AsyncSession, investigation_id: uuid.UUID) -> None:
+async def mark_investigation_failed(session: AsyncSession, investigation_id: uuid.UUID, reason: str | None = None) -> None:
     await session.execute(
         update(Investigation)
         .where(Investigation.id == investigation_id)
-        .values(status="failed", completed_at=utcnow())
+        .values(status="failed", error=reason, completed_at=utcnow())
     )
     await session.commit()
+
+
+async def mark_investigation_interrupted(session: AsyncSession, investigation_id: uuid.UUID, reason: str) -> None:
+    """A run stopped part-way but its checkpoint is intact: POST /investigations/{id}/resume continues it."""
+    await session.execute(
+        update(Investigation)
+        .where(Investigation.id == investigation_id, Investigation.completed_at.is_(None))
+        .values(status="interrupted", error=reason)
+    )
+    await session.commit()
+
+
+async def claim_interrupted(session: AsyncSession, investigation_id: uuid.UUID) -> bool:
+    """Take the right to resume an interrupted investigation (atomic, like claim_pending_approval)."""
+    result = await session.execute(
+        update(Investigation)
+        .where(Investigation.id == investigation_id, Investigation.status == "interrupted")
+        .values(status="running", error=None)
+    )
+    await session.commit()
+    return result.rowcount == 1
 
 
 async def set_approval_status(session: AsyncSession, investigation_id: uuid.UUID, status: str) -> None:

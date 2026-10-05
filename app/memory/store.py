@@ -24,6 +24,7 @@ from app.database.models import SemanticMemory, UserMemory, utcnow
 from app.embeddings.base import EmbeddingProvider
 
 MAX_NOTES_LISTED = 200
+MAX_NOTES_PER_USER = 500
 
 
 def _uuid_or_none(value: str | None) -> uuid.UUID | None:
@@ -108,6 +109,14 @@ class PgMemoryStore:
         ).returning(SemanticMemory.id)
         async with self._session_factory() as session:
             note_id = (await session.execute(statement)).scalar_one()
+            # Keep memory bounded: beyond the limit, the oldest notes of this user make room.
+            oldest = (
+                select(SemanticMemory.id)
+                .where(SemanticMemory.user_id == uuid.UUID(user_id))
+                .order_by(SemanticMemory.created_at.desc())
+                .offset(MAX_NOTES_PER_USER)
+            )
+            await session.execute(delete(SemanticMemory).where(SemanticMemory.id.in_(oldest)))
             await session.commit()
         return str(note_id)
 

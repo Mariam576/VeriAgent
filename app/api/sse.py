@@ -24,15 +24,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import traceback
 from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi.responses import StreamingResponse
 
 from app.config import get_settings
-from app.embeddings.base import EmbeddingError
-from app.errors import AppError
-from app.llm.base import LLMConfigurationError, LLMError
+from app.errors import safe_error
 from app.security.guardrails import redact_secrets
 
 logger = logging.getLogger(__name__)
@@ -43,15 +42,7 @@ _DONE = object()
 
 def error_payload(exc: BaseException) -> tuple[int, dict[str, str]]:
     """HTTP status and safe {"code", "message"} for any error. Internal details never leave the server."""
-    settings = get_settings()
-    if isinstance(exc, AppError):
-        return exc.status_code, {"code": exc.code, "message": exc.message}
-    if isinstance(exc, LLMError):
-        code = "llm_not_configured" if isinstance(exc, LLMConfigurationError) else "llm_unavailable"
-        return 503, {"code": code, "message": redact_secrets(str(exc), settings)}  # provider errors must never leak a key
-    if isinstance(exc, EmbeddingError):
-        return 503, {"code": "embeddings_unavailable", "message": redact_secrets(str(exc), settings)}
-    return 500, {"code": "internal_error", "message": "Something went wrong on the server."}
+    return safe_error(exc)
 
 
 def format_sse(event: str, data: dict[str, Any]) -> str:
@@ -77,7 +68,8 @@ async def sse_body(events: AsyncIterator[tuple[str, dict[str, Any]]]) -> AsyncIt
         except Exception as exc:  # noqa: BLE001 - reported to the client as an "error" event
             status, payload = error_payload(exc)
             if status >= 500 and payload["code"] == "internal_error":
-                logger.exception("Unhandled error while streaming: %s", exc)
+                details = "".join(traceback.format_exception(exc))
+                logger.error("Unhandled error while streaming:\n%s", redact_secrets(details, get_settings()))
             await queue.put(("error", payload))
         finally:
             await queue.put(_DONE)

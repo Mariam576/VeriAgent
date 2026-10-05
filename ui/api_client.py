@@ -82,6 +82,10 @@ class ApiClient:
         payload = {"decision": decision, "note": note or None, "modified_action": modified_action or None}
         return self._request("POST", f"/investigations/{investigation_id}/approve", json=payload)
 
+    def resume(self, investigation_id: str) -> dict[str, Any]:
+        """Continue an investigation that was cut off. Returns its report."""
+        return self._request("POST", f"/investigations/{investigation_id}/resume")
+
     def chat_stream(self, message: str, conversation_id: str | None) -> Iterator[tuple[str, dict[str, Any]]]:
         """Send one chat turn and yield (event name, data) pairs as the server sends them.
 

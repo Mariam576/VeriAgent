@@ -27,7 +27,7 @@ async def test_trace_records_nodes_llm_calls_tools_and_searches(samples_dir):
     assert [event.seq for event in trace.events] == list(range(1, len(trace.events) + 1))
 
     nodes = [event.name for event in trace.events if event.kind == "node"]
-    assert nodes[:2] == ["load_memory", "analyze_request"] and nodes[-2:] == ["final_report", "save_memory"]
+    assert nodes[:2] == ["load_memory", "analyze_request"] and nodes[-1] == "final_report"
     assert nodes.count("retrieve") == 2  # the loop is visible in the trace
     assert all(event.latency_ms is not None and event.latency_ms >= 0 for event in trace.events if event.kind == "node")
 

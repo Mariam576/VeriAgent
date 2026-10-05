@@ -61,14 +61,20 @@ from app.agents.state import InvestigationState
 from app.config import Settings
 from app.formatting import key_label
 from app.llm.base import BaseLLM, LLMConfigurationError, LLMError
-from app.memory.extraction import MEMORY_TASK, accepted_memory, build_memory_prompt, fallback_memory, might_contain_memory
+from app.memory.extraction import (
+    MEMORY_TASK,
+    accepted_memory,
+    build_memory_prompt,
+    fallback_memory,
+    is_only_memory,
+    might_contain_memory,
+)
 from app.memory.profile import describe as describe_preference
 from app.memory.profile import with_defaults
-from app.memory.semantic import investigation_note
 from app.memory.store import MemoryStore
 from app.numbers import normalize_unit
 from app.observability import tracing
-from app.rag.citations import is_grounded, normalize
+from app.rag.citations import is_grounded, normalize, numbers_not_in_source
 from app.rag.reranker import select_diverse
 from app.rag.retriever import Retriever, SearchFilters
 from app.schemas.investigation import (
@@ -86,8 +92,7 @@ from app.schemas.investigation import (
     SufficiencyAssessment,
 )
 from app.schemas.memory import MemoryCandidate
-from app.schemas.response import InvestigationReport
-from app.security.guardrails import dedupe_keep_order, redact_secrets
+from app.security.guardrails import dedupe_keep_order, trusted_part
 from app.tools.calculator import CALCULATOR_TOOLS
 from app.tools.contradiction import find_contradictions
 from app.tools.registry import execute_tool
@@ -168,7 +173,6 @@ STAGE_LABELS: dict[str, str | None] = {
     "correct_findings": "Correcting findings...",
     "human_approval": None,
     "final_report": "Generating report...",
-    "save_memory": None,
 }
 
 
@@ -263,7 +267,9 @@ class InvestigationNodes:
                         saved_ids.append(await self.memory.add_note(user_id, first, source="user"))
                         notes.append(f"Noted for later: {first}")
                     tracing.record("memory", "save", memory_type=kind)
-                    memory_only = candidate.only_memory
+                    # Skipping the investigation is too important to leave to the model:
+                    # it happens only when the model AND the code rule agree that nothing else was asked.
+                    memory_only = candidate.only_memory and is_only_memory(question)
 
             update["preferences"] = with_defaults(await self.memory.get_preferences(user_id))
             if not memory_only:
@@ -289,27 +295,6 @@ class InvestigationNodes:
                 decision_requested=False, standalone_question=question, search_queries=[],
             ).model_dump()
         return update
-
-    # ============================================================== Node 11
-    @traced("save_memory")
-    async def save_memory(self, state: InvestigationState) -> dict[str, Any]:
-        """After the final report: leave one note about this investigation in semantic memory."""
-        if self.memory is None or not state.get("report"):
-            return {}
-        note = investigation_note(InvestigationReport(**state["report"]))
-        if note is None:
-            return {}  # small talk and plain look-ups are not worth remembering
-        try:
-            await self.memory.add_note(
-                state["user_id"], redact_secrets(note, self.settings),
-                source="investigation", investigation_id=state.get("investigation_id"),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("save_memory failed: %s: %s", type(exc).__name__, exc)
-            tracing.record("error", "memory", error=type(exc).__name__)
-            return {}
-        tracing.record("memory", "save", memory_type="investigation")
-        return {"events": [event("save_memory", "Saved a note about this investigation to memory.")]}
 
     # ================================================================ Node 1
     @traced("analyze_request")
@@ -485,6 +470,7 @@ class InvestigationNodes:
         seen_typed = {(item.document_id, item.key, item.value_number) for item in existing if item.key != KEY_OTHER}
         accepted: list[EvidenceItem] = []
         discarded = 0
+        trusted: dict[str, str] = {}  # chunk id -> the part of its text that precedes any injected instruction
 
         for fact in facts:
             if len(existing) + len(accepted) >= MAX_EVIDENCE_ITEMS:
@@ -495,6 +481,17 @@ class InvestigationNodes:
             if chunk is None or not claim or not is_grounded(fact.quote, fact.value_number, chunk.text):
                 discarded += 1
                 logger.info("fact_discarded ref=%s reason=%s", fact.chunk_ref, "unknown_ref" if chunk is None else "not_grounded")
+                continue
+            # The quote is real, but does the claim add a number the document never states?
+            if numbers_not_in_source(claim, chunk.text):
+                discarded += 1
+                logger.info("fact_discarded ref=%s reason=number_not_in_source", fact.chunk_ref)
+                continue
+            # Text that follows an instruction aimed at the agent is not evidence, whatever it claims.
+            trusted_text = trusted.setdefault(chunk.chunk_id, trusted_part(chunk.text))
+            if trusted_text != chunk.text and not is_grounded(fact.quote, fact.value_number, trusted_text):
+                discarded += 1
+                logger.info("fact_discarded ref=%s reason=inside_injected_text", fact.chunk_ref)
                 continue
 
             key = _clean_key(fact.key)

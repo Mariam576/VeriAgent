@@ -41,9 +41,8 @@ needs a truly independent point of view; here ordinary nodes are enough.
          |                   and continues after POST /investigations/{id}/approve
      final_report
          |
-     save_memory             one note about this investigation, for later sessions
-         |
-        END
+        END                  (the service then stores the result and, once that
+                              succeeded, a note about it in long-term memory)
 
 Concept - checkpointing:
     When the graph is compiled with a checkpointer, LangGraph saves the state
@@ -92,7 +91,6 @@ def build_investigation_graph(
     graph.add_node("correct_findings", nodes.correct_findings)
     graph.add_node("human_approval", nodes.human_approval)
     graph.add_node("final_report", nodes.final_report)
-    graph.add_node("save_memory", nodes.save_memory)
 
     # --- edges: fixed order
     graph.add_edge(START, "load_memory")
@@ -102,8 +100,7 @@ def build_investigation_graph(
     graph.add_edge("assess_risk", "review_findings")
     graph.add_edge("correct_findings", "review_findings")  # loop: review again after correcting
     graph.add_edge("human_approval", "final_report")
-    graph.add_edge("final_report", "save_memory")
-    graph.add_edge("save_memory", END)
+    graph.add_edge("final_report", END)
 
     # --- conditional edges: the router function picks the next node
     graph.add_conditional_edges("load_memory", route_after_memory, ["analyze_request", "final_report"])
@@ -119,6 +116,6 @@ def recursion_limit(max_agent_iterations: int) -> int:
     """Hard backstop on graph steps, on top of the iteration counter in the state.
 
     One retrieval loop is 5 nodes; a correction loop is 2. The straight path is
-    12 nodes. This leaves room for every allowed loop and nothing more.
+    11 nodes. This leaves room for every allowed loop and nothing more.
     """
-    return 15 + 5 * max_agent_iterations + 6
+    return 14 + 5 * max_agent_iterations + 6

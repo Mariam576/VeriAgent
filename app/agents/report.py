@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.agents.assessment import evidence_quality
-from app.formatting import format_number, format_value, key_label
+from app.formatting import escape_markdown, format_number, format_value, key_label
 from app.memory.profile import with_defaults
 from app.rag.citations import citations_from_evidence, format_citation
 from app.schemas.investigation import (
@@ -308,16 +308,20 @@ def render_report(report: InvestigationReport) -> str:
 
     Two stored preferences shape it (see app/memory/profile.py):
     ``detail_level`` decides which sections are written out and
-    ``response_format`` whether section titles are plain or Markdown.
+    ``response_format`` whether the text is plain or Markdown.
     The structured report itself is always complete; only this text changes.
+
+    In Markdown, everything that comes from documents, the model or a person is
+    escaped (``escape_markdown``), so only the layout written here is formatting.
     """
-    if report.status == "not_applicable":
-        return report.summary
     detail = report.presentation.detail_level
     markdown = report.presentation.response_format == "markdown"
+    safe = escape_markdown if markdown else str  # str: plain text needs no escaping
+    if report.status == "not_applicable":
+        return safe(report.summary)
 
     def cites(citations: list[CitationOut]) -> str:
-        return "".join(" " + format_citation(c.document, c.page) for c in citations)
+        return "".join(" " + safe(format_citation(c.document, c.page)) for c in citations)
 
     def title(text: str) -> str:
         return f"## {text}" if markdown else f"{text}:"
@@ -329,47 +333,48 @@ def render_report(report: InvestigationReport) -> str:
         field("Investigation Status", report.status_label),
         field("Overall Risk Level", report.risk_level.capitalize()),
         field("Confidence Score", f"{round(report.confidence * 100)}%"),
-        field("Human Review", _human_review_line(report.human_review)),
+        field("Human Review", safe(_human_review_line(report.human_review))),
         "",
         title("Summary"),
-        report.summary,
+        safe(report.summary),
     ]
     labels = {"fact": "Fact", "calculation": "Calculation", "missing_evidence": "Missing evidence"}
     if report.key_findings and detail != "brief":
         lines += ["", title("Key Findings")]
         for number, finding in enumerate(report.key_findings, start=1):
-            lines.append(f"{number}. [{labels.get(finding.type, finding.type)}] {finding.statement}{cites(finding.citations)}")
+            label = safe(f"[{labels.get(finding.type, finding.type)}]")
+            lines.append(f"{number}. {label} {safe(finding.statement)}{cites(finding.citations)}")
     if report.contradictions:
         lines += ["", title("Contradictions Detected")]
-        lines += [f"- ({item.severity}) {item.description}{cites(item.citations)}" for item in report.contradictions]
+        lines += [f"- {safe(f'({item.severity})')} {safe(item.description)}{cites(item.citations)}" for item in report.contradictions]
     if report.missing_evidence:
         lines += ["", title("Missing Evidence")]
-        lines += [f"- {text}" for text in report.missing_evidence]
+        lines += [f"- {safe(text)}" for text in report.missing_evidence]
     if report.calculations and detail == "detailed":
         lines += ["", title("Calculations (deterministic tools)")]
         for item in report.calculations:
             arguments = ", ".join(f"{name}={_number_text(value)}" for name, value in item.arguments.items())
-            lines.append(f"- {item.description}: {item.tool_name}({arguments}) = {_number_text(item.result)}")
+            lines.append("- " + safe(f"{item.description}: {item.tool_name}({arguments}) = {_number_text(item.result)}"))
     if report.risk_reasons and detail != "brief":
         lines += ["", title("Risk Reasoning (inference)")]
-        lines += [f"- {reason.statement}{cites(reason.citations)}" for reason in report.risk_reasons]
+        lines += [f"- {safe(reason.statement)}{cites(reason.citations)}" for reason in report.risk_reasons]
     if detail != "brief":
         lines += ["", field("Evidence Quality", report.evidence_quality.capitalize())]
-    lines += ["", title("Recommended Action"), report.recommended_action]
+    lines += ["", title("Recommended Action"), safe(report.recommended_action)]
     if report.human_review.original_action:
-        lines.append(f"(The agent had recommended: {report.human_review.original_action})")
+        lines.append(safe(f"(The agent had recommended: {report.human_review.original_action})"))
     if report.sources:
         lines += ["", title("Sources")]
-        lines += [f"- {source.document} — Page {source.page}" for source in report.sources]
+        lines += [f"- {safe(f'{source.document} — Page {source.page}')}" for source in report.sources]
     if report.memory.recalled:
         lines += ["", title("From Earlier Investigations (memory, not evidence)")]
-        lines += [f"- {note.text}" for note in report.memory.recalled]
+        lines += [f"- {safe(note.text)}" for note in report.memory.recalled]
     if report.memory.saved:
         lines += ["", title("Memory")]
-        lines += [f"- {text}" for text in report.memory.saved]
+        lines += [f"- {safe(text)}" for text in report.memory.saved]
     if report.limitations:
         lines += ["", title("Limitations")]
-        lines += [f"- {text}" for text in report.limitations]
+        lines += [f"- {safe(text)}" for text in report.limitations]
     if detail == "detailed":
         stats = report.stats
         lines += [

@@ -47,6 +47,12 @@ _REMEMBER_FACT = re.compile(
 _ABOUT_ANSWERS = re.compile(
     r"\b(?:answers?|repl(?:y|ies)|responses?|reports?|summar(?:y|ies)|output|results?|it|things)\b", re.IGNORECASE
 )
+# Words that start a request. In front of a memory phrase they mean "do this AND remember that".
+_REQUEST = re.compile(
+    r"\b(?:compare|review|check|verify|investigate|calculate|analy[sz]e|examine|audit|find|search|look|show|"
+    r"tell|list|summari[sz]e|explain|approve|reject|pay|what|which|who|whom|when|where|why|how)\b",
+    re.IGNORECASE,
+)
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
 _VALUE_PATTERNS: dict[str, dict[str, re.Pattern[str]]] = {
@@ -90,14 +96,36 @@ def _split_sentences(message: str) -> list[str]:
     return [sentence.strip() for sentence in _SENTENCE_END.split(message.strip()) if sentence.strip()]
 
 
+def is_only_memory(message: str) -> bool:
+    """True when, apart from the thing to remember, the message asks for nothing.
+
+    This decides whether the investigation is skipped, so it is decided by
+    code and it errs on the side of investigating: any question mark, any
+    sentence without a memory phrase, or a request in front of the memory
+    phrase ("Compare the invoice with the contract and remember that ...")
+    means there is still something to do.
+    """
+    for sentence in _split_sentences(message):
+        marker = _GATE.search(sentence)
+        if marker is None:
+            if len(sentence.split()) >= 2:
+                return False  # a sentence that is not about remembering anything
+        elif sentence.rstrip().endswith("?") or _REQUEST.search(sentence[: marker.start()]):
+            return False
+    return True
+
+
 def fallback_memory(message: str) -> MemoryCandidate:
     """Rule-based extraction: used by the offline mock LLM and when the model is unavailable."""
     nothing = MemoryCandidate(should_save=False, memory_type="none", key=None, value=None, text=None, only_memory=False)
-    sentences = _split_sentences(message)
-    marked = [sentence for sentence in sentences if _GATE.search(sentence)]
+    # A question is never a memory: "Does the report always show short terms?" asks, it does not instruct.
+    marked = [
+        sentence for sentence in _split_sentences(message)
+        if _GATE.search(sentence) and not sentence.rstrip().endswith("?")
+    ]
     if not marked:
         return nothing
-    only_memory = len(marked) == len(sentences)
+    only_memory = is_only_memory(message)
 
     for sentence in marked:
         if not _ABOUT_ANSWERS.search(sentence):
@@ -110,7 +138,7 @@ def fallback_memory(message: str) -> MemoryCandidate:
                     )
     for sentence in marked:
         match = _REMEMBER_FACT.search(sentence)
-        if match and not sentence.rstrip().endswith("?"):
+        if match:
             fact = match.group(1).strip().rstrip(".").strip()
             if len(fact.split()) >= 4:
                 return MemoryCandidate(

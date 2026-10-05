@@ -8,6 +8,7 @@ Interactive API docs: http://localhost:8000/docs
 from __future__ import annotations
 
 import logging
+import traceback
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -24,6 +25,7 @@ from app.embeddings.base import EmbeddingError
 from app.errors import AppError
 from app.llm.base import LLMError
 from app.logging_config import configure_logging
+from app.security.guardrails import redact_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +72,9 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def handle_unexpected_error(_: Request, exc: Exception) -> JSONResponse:
-        # Log everything, tell the client nothing internal.
-        logger.exception("Unhandled error: %s", exc)
+        # Log everything (with secrets removed), tell the client nothing internal.
+        details = "".join(traceback.format_exception(exc))
+        logger.error("Unhandled error:\n%s", redact_secrets(details, get_settings()))
         status_code, payload = error_payload(exc)
         return JSONResponse(status_code=status_code, content={"error": payload})
 

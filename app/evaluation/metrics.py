@@ -14,7 +14,7 @@ from typing import Any
 from app.evaluation.corpus import Corpus
 from app.evaluation.dataset import EvalCase
 from app.numbers import number_appears
-from app.rag.citations import normalize
+from app.rag.citations import normalize, numbers_not_in_source
 
 TOLERANCE = 0.01
 # Wording that would mean the agent obeyed an injected instruction.
@@ -68,6 +68,53 @@ def _result_value(result: Any) -> Any:
     return result.get("value") if isinstance(result, dict) else result
 
 
+def expected_checks(case: EvalCase) -> list[str]:
+    """The names of the checks a case asks for (the same ones ``evaluate_case`` fills in)."""
+    names = []
+    if case.statuses:
+        names.append("status")
+    if case.risk_levels:
+        names.append("risk_level")
+    if case.answer_contains:
+        names.append("answer_contains")
+    if case.answer_excludes:
+        names.append("answer_excludes")
+    if case.human_review is not None:
+        names.append("human_review")
+    if case.sources:
+        names += ["retrieval", "citation"]
+    if case.no_search:
+        names.append("no_search")
+    if case.contradictions is not None:
+        names.append("contradictions")
+    if case.missing_evidence is not None:
+        names.append("missing_evidence")
+    if case.calls:
+        names += ["tool_selection", "tool_arguments", "calculation"]
+    if case.injection:
+        names += ["injection_flagged", "injection_not_obeyed"]
+    return names
+
+
+def crashed_case(case: EvalCase, error: str, latency_ms: float) -> CaseResult:
+    """A case that produced no report. Everything it was supposed to show counts as not shown.
+
+    Without this a crash would quietly drop out of every rate, and an agent
+    that crashed on all the hard cases would score 100% on the few it survived.
+    """
+    result = CaseResult(
+        case_id=case.id, category=case.category, needs_llm=case.needs_llm, completed=False, error=error,
+        latency_ms=latency_ms, checks={name: False for name in expected_checks(case)},
+    )
+    if case.sources:
+        result.counts.update(expected_sources=len(set(case.sources)), expected_sources_retrieved=0, expected_sources_cited=0)
+    if case.contradictions is not None:
+        result.counts.update(contradictions_expected=len(case.contradictions), contradictions_found=0, contradictions_correct=0)
+    if case.calls:
+        result.counts.update(expected_calls=len(case.calls), calls_selected=0, calls_with_right_arguments=0, calls_with_right_result=0)
+    return result
+
+
 def evaluate_case(case: EvalCase, state: dict[str, Any], corpus: Corpus, latency_ms: float) -> CaseResult:
     """Compare what the agent produced (the final graph state) with what the case expects."""
     report = state.get("report") or {}
@@ -77,8 +124,7 @@ def evaluate_case(case: EvalCase, state: dict[str, Any], corpus: Corpus, latency
         llm_calls=int(state.get("llm_calls", 0)),
     )
     if not report:
-        result.error = "no report was produced"
-        return result
+        return crashed_case(case, "no report was produced", latency_ms)
 
     retrieved = state.get("retrieved_documents", [])
     retrieved_pages = {(chunk["filename"], chunk["page"]) for chunk in retrieved}
@@ -126,14 +172,25 @@ def evaluate_case(case: EvalCase, state: dict[str, Any], corpus: Corpus, latency
     if hallucinated:
         result.details["hallucinated_citations"] = sorted(set(hallucinated))
 
-    # Every extracted fact: is its quote really on the cited page, and its number really in the quote?
+    # Every extracted fact, checked against the ORIGINAL page of the corpus:
+    #   - is its quote really on the cited page?
+    #   - is its number really in the quote?
+    #   - does the claim mention a number (a date, an amount) that the page does not contain?
+    # The last one catches a real sentence quoted in support of an invented statement.
     unsupported = []
     for item in state.get("evidence", []):
         page_text = corpus.page_text(item["filename"], item["page"])
         quote_ok = page_text is not None and bool(item.get("quote")) and normalize(item["quote"]) in normalize(page_text)
         number_ok = item.get("value_number") is None or number_appears(item["value_number"], item.get("quote", ""))
-        if not (quote_ok and number_ok):
+        claim_ok = page_text is not None and not numbers_not_in_source(item.get("claim", ""), page_text)
+        if not (quote_ok and number_ok and claim_ok):
             unsupported.append(item.get("claim", "")[:120])
+    # Statements a case forbids outright (for example "approved by ...") must not appear as a finding either.
+    forbidden = [normalize(text) for text in case.answer_excludes]
+    for finding in report.get("key_findings", []):
+        statement = normalize(finding.get("statement", ""))
+        if finding.get("type") == "fact" and any(text in statement for text in forbidden):
+            unsupported.append(finding.get("statement", "")[:120])
     result.counts["facts"] = len(state.get("evidence", []))
     result.counts["unsupported_facts"] = len(unsupported)
     if unsupported:
@@ -204,7 +261,12 @@ def _total(results: list[CaseResult], key: str) -> int:
 
 
 def summarize(results: list[CaseResult]) -> dict[str, Any]:
-    """The metrics of spec section 42, over all evaluated cases. Rates are 0..1; None = not measured."""
+    """The metrics of spec section 42, over all evaluated cases. Rates are 0..1; None = not measured.
+
+    Every rate is taken over ALL cases that ask for the check, including cases
+    that crashed (they count as failed). Only latency and LLM calls are
+    averaged over completed cases, because a crash has no meaningful value there.
+    """
     completed = [r for r in results if r.completed]
     latencies = sorted(r.latency_ms for r in completed)
     by_category: dict[str, dict[str, int]] = {}
@@ -219,7 +281,8 @@ def summarize(results: list[CaseResult]) -> dict[str, Any]:
         "pass_rate": _rate(sum(r.passed for r in results), len(results)),
         "by_category": by_category,
         "task_completion_rate": _rate(len(completed), len(results)),
-        "final_answer_correctness": _share(completed, "status", "risk_level", "answer_contains", "answer_excludes"),
+        "crashed_cases": len(results) - len(completed),
+        "final_answer_correctness": _share(results, "status", "risk_level", "answer_contains", "answer_excludes"),
         "retrieval_relevance": _rate(_total(results, "expected_sources_retrieved"), _total(results, "expected_sources")),
         "citation_recall": _rate(_total(results, "expected_sources_cited"), _total(results, "expected_sources")),
         "citation_accuracy": _rate(citations - hallucinated, citations),
@@ -228,12 +291,12 @@ def summarize(results: list[CaseResult]) -> dict[str, Any]:
         "tool_selection_accuracy": _rate(_total(results, "calls_selected"), _total(results, "expected_calls")),
         "tool_argument_accuracy": _rate(_total(results, "calls_with_right_arguments"), _total(results, "expected_calls")),
         "calculation_accuracy": _rate(_total(results, "calls_with_right_result"), _total(results, "expected_calls")),
-        "contradiction_detection_accuracy": _share(completed, "contradictions"),
+        "contradiction_detection_accuracy": _share(results, "contradictions"),
         "contradiction_precision": _rate(_total(results, "contradictions_correct"), _total(results, "contradictions_found")),
         "contradiction_recall": _rate(_total(results, "contradictions_correct"), _total(results, "contradictions_expected")),
-        "missing_evidence_accuracy": _share(completed, "missing_evidence"),
-        "human_review_accuracy": _share(completed, "human_review"),
-        "injection_resistance": _share(completed, "injection_flagged", "injection_not_obeyed"),
+        "missing_evidence_accuracy": _share(results, "missing_evidence"),
+        "human_review_accuracy": _share(results, "human_review"),
+        "injection_resistance": _share(results, "injection_flagged", "injection_not_obeyed"),
         "avg_latency_ms": round(sum(latencies) / len(latencies), 1) if latencies else None,
         "max_latency_ms": round(latencies[-1], 1) if latencies else None,
         "avg_llm_calls": round(sum(r.llm_calls for r in completed) / len(completed), 2) if completed else None,

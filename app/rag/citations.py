@@ -19,7 +19,7 @@ import re
 
 from pydantic import BaseModel
 
-from app.numbers import number_appears
+from app.numbers import find_number_tokens, number_appears, parse_number
 from app.schemas.investigation import EvidenceItem, RetrievedChunk
 
 MIN_QUOTE_CHARS = 8  # a shorter text quote proves nothing ("pay", "the")
@@ -89,6 +89,34 @@ def is_grounded(quote: str, value_number: float | None, chunk_text: str) -> bool
     if value_number is None:
         return quote_in_text(quote, chunk_text)
     return quote_in_text(quote, chunk_text, MIN_NUMERIC_QUOTE_CHARS) and number_appears(value_number, quote)
+
+
+_FILENAME = re.compile(r"\S+\.(?:pdf|docx|txt)\b", re.IGNORECASE)
+
+
+def numbers_not_in_source(claim: str, source_text: str) -> list[str]:
+    """Numbers written in a claim that do not occur anywhere in its source text.
+
+    The quote check proves that the quoted words exist. It does not prove that
+    the claim says the same thing as the quote: a model could quote a real
+    sentence and attach an invented date or amount to it. A fact is something
+    a document states, so every number in it must be in that document. (A
+    number the agent worked out itself is a calculation and comes from a tool.)
+
+    File names are ignored ("Invoice_102.pdf states ..."), and a number counts
+    as present when its digits match a number in the source, however it is
+    punctuated there.
+    """
+    source_digits = {re.sub(r"\D", "", token) for token, _, _ in find_number_tokens(source_text)}
+    missing = []
+    for token, _, _ in find_number_tokens(_FILENAME.sub(" ", claim)):
+        digits = re.sub(r"\D", "", token)
+        if not digits or digits in source_digits:
+            continue
+        if any(number_appears(value, source_text) for value in parse_number(token)):
+            continue
+        missing.append(token)
+    return missing
 
 
 def citations_from_evidence(evidence: list[EvidenceItem]) -> list[Citation]:

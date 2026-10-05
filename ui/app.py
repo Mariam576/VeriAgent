@@ -16,6 +16,12 @@ Concept - how Streamlit works:
     The whole script runs again from top to bottom every time you click or
     type something. Anything that must survive those reruns (the chat so
     far, the report on screen) is kept in ``st.session_state``.
+
+Security rule of this file:
+    Streamlit renders strings as Markdown. Every string that comes from the
+    API (and so, in the end, from a document, a model or a person) goes
+    through ``plain()`` before it is shown, so it can never become an image,
+    a link or formatting. Only text written in this file is Markdown.
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ui.api_client import ApiClient, ApiError  # noqa: E402
+from ui.safe_text import plain  # noqa: E402
 
 API_URL = os.environ.get("VERIAGENT_API_URL", "http://localhost:8000")
 RISK_COLORS = {"low": "green", "medium": "orange", "high": "red", "critical": "red"}
@@ -51,7 +58,7 @@ st.set_page_config(page_title="VeriAgent", page_icon=":mag:", layout="wide")
 def init_state() -> None:
     defaults: dict[str, Any] = {
         "user": "demo-user",
-        "messages": [],  # the chat on screen: {"role", "content"}
+        "messages": [],  # the chat on screen: {"role", "content", "trusted"}
         "conversation_id": None,  # lets the API resolve follow-up questions
         "report": None,  # the report shown in the result panel
         "notice": None,  # a one-off message shown after a rerun: (kind, text)
@@ -75,12 +82,12 @@ def show_notice() -> None:
     notice = st.session_state.notice
     if notice:
         kind, text = notice
-        {"success": st.success, "error": st.error, "info": st.info}[kind](text)
+        {"success": st.success, "error": st.error, "info": st.info}[kind](plain(text))
         st.session_state.notice = None
 
 
 def cite(citation: dict[str, Any]) -> str:
-    return f"{citation['document']} — Page {citation['page']}"
+    return f"{plain(citation['document'])} — Page {int(citation['page'])}"
 
 
 def amount(value: Any) -> str:
@@ -97,27 +104,27 @@ def sidebar(api: ApiClient) -> None:
 
         try:
             health = api.health()
-            st.caption(f"API: {health['status']} · model: {health['llm_provider']} ({health['llm_model']})")
+            st.caption(f"API: {plain(health['status'])} · model: {plain(health['llm_provider'])} ({plain(health['llm_model'])})")
             if health["llm_provider"] == "mock":
                 st.info("Running with the offline mock model. Set LLM_PROVIDER=gemini and GEMINI_API_KEY in .env for real reasoning.")
         except ApiError as exc:
-            st.error(str(exc))
+            st.error(plain(exc))
             st.stop()
 
         st.subheader("Documents")
         try:
             documents = api.documents()
         except ApiError as exc:
-            st.error(str(exc))
+            st.error(plain(exc))
             documents = []
         if not documents:
             st.caption("Nothing uploaded yet.")
         for document in documents:
             name, delete = st.columns([6, 1], vertical_alignment="center")
-            status = "" if document["status"] == "ready" else f" · {document['status']}"
+            status = "" if document["status"] == "ready" else f" · {plain(document['status'])}"
             name.markdown(
-                f"**{document['filename']}**  \n"
-                f":gray[{document['document_type']} · {document['page_count']} page(s){status}]"
+                f"**{plain(document['filename'])}**  \n"
+                f":gray[{plain(document['document_type'])} · {int(document['page_count'])} page(s){status}]"
             )
             if delete.button(":material/delete:", key=f"delete-document-{document['id']}", help="Delete this document", type="tertiary"):
                 run(lambda document=document: api.delete_document(document["id"]), f"Deleted {document['filename']}.")
@@ -133,17 +140,20 @@ def sidebar(api: ApiClient) -> None:
         try:
             history = api.investigations()[:15]
         except ApiError as exc:
-            st.error(str(exc))
+            st.error(plain(exc))
             history = []
         if not history:
             st.caption("No investigations yet.")
         for item in history:
-            risk = (item.get("risk_level") or item["status"]).capitalize()
+            if item["status"] in ("interrupted", "running", "failed"):
+                state = item["status"].capitalize()  # no result yet: say what happened instead of a risk level
+            else:
+                state = (item.get("risk_level") or item["status"]).capitalize()
             waiting = " · waiting for a decision" if item["approval_status"] == "pending" else ""
             if st.button(
-                f"{risk}{waiting}: {item['question'][:60]}", key=f"history-{item['id']}", width="stretch"
+                f"{plain(state)}{waiting}: {plain(item['question'][:60])}", key=f"history-{item['id']}", width="stretch"
             ):
-                open_investigation(api, item["id"])
+                open_investigation(api, item)
 
         memory_panel(api)
 
@@ -188,13 +198,23 @@ def upload_files(api: ApiClient, files: list[Any]) -> None:
     st.rerun()
 
 
-def open_investigation(api: ApiClient, investigation_id: str) -> None:
+def open_investigation(api: ApiClient, item: dict[str, Any]) -> None:
+    """Show an earlier investigation. One that was cut off is continued from its checkpoint first."""
     try:
-        detail = api.investigation(investigation_id)
-        if detail.get("report"):
-            st.session_state.report = detail["report"]
+        if item["status"] == "interrupted":
+            with st.spinner("This investigation was cut off. Continuing from where it stopped..."):
+                st.session_state.report = api.resume(item["id"])
+            notify("success", "The investigation was continued from its last saved step.")
         else:
-            notify("info", f"That investigation has no report (status: {detail['status']}).")
+            detail = api.investigation(item["id"])
+            if detail.get("report"):
+                st.session_state.report = detail["report"]
+            elif detail["status"] == "running":
+                # Either still working, or its server stopped. The API decides which (it refuses while it may be alive).
+                st.session_state.report = api.resume(item["id"])
+            else:
+                reason = f" {detail['error']}" if detail.get("error") else ""
+                notify("info", f"That investigation has no report (status: {detail['status']}).{reason}")
     except ApiError as exc:
         notify("error", str(exc))
     st.rerun()
@@ -205,7 +225,7 @@ def memory_panel(api: ApiClient) -> None:
         try:
             memory = api.memory()
         except ApiError as exc:
-            st.error(str(exc))
+            st.error(plain(exc))
             return
         if not memory["enabled"]:
             st.caption("Long-term memory is switched off (ENABLE_MEMORY=false).")
@@ -214,8 +234,8 @@ def memory_panel(api: ApiClient) -> None:
         for preference in memory["preferences"]:
             options = preference["allowed_values"]
             choice = st.selectbox(
-                preference["key"].replace("_", " ").capitalize(), options,
-                index=options.index(preference["value"]), help=preference["description"],
+                plain(preference["key"].replace("_", " ").capitalize()), options,
+                index=options.index(preference["value"]), help=plain(preference["description"]),
                 # The stored value is part of the key: when it changes on the server (for example
                 # because you told the chat "keep answers brief"), the box shows the new value.
                 key=f"preference-{preference['key']}-{preference['value']}-{st.session_state.user}",
@@ -227,7 +247,7 @@ def memory_panel(api: ApiClient) -> None:
             st.caption("No notes yet.")
         for note in memory["notes"]:
             text, delete = st.columns([6, 1], vertical_alignment="center")
-            text.markdown(f":gray[{note['created_at'][:10]} · {note['source']}]  \n{note['text']}")
+            text.markdown(f":gray[{plain(note['created_at'][:10])} · {plain(note['source'])}]  \n{plain(note['text'])}")
             if delete.button(":material/delete:", key=f"delete-note-{note['id']}", help="Forget this note", type="tertiary"):
                 run(lambda note=note: api.delete_note(note["id"]), "Note deleted.")
         new_note = st.text_input("Remember a fact", placeholder="Vendor ABC was flagged for duplicate invoices in 2025.", key="new-note")
@@ -244,14 +264,15 @@ def chat_panel(api: ApiClient, prompt: str | None) -> None:
         )
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+            # "trusted" marks the few messages this file wrote itself; everything else is shown literally.
+            st.markdown(message["content"] if message.get("trusted") else plain(message["content"]))
     if prompt:
         ask(api, prompt)
 
 
 def ask(api: ApiClient, prompt: str) -> None:
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(plain(prompt))
     answer, failure = None, None
     with st.chat_message("assistant"):
         # The status box shows the safe progress events as they arrive (streaming).
@@ -261,10 +282,10 @@ def ask(api: ApiClient, prompt: str) -> None:
                     if event == "started":
                         st.session_state.conversation_id = data["conversation_id"]
                     elif event == "progress":
-                        status.update(label=data["message"])
-                        st.write(data["message"])
+                        status.update(label=plain(data["message"]))
+                        st.markdown(plain(data["message"]))
                     elif event == "tool":
-                        st.write(f"Tool `{data['tool_name']}`: {data['status']}")
+                        st.markdown(f"Tool {plain(data['tool_name'])}: {plain(data['status'])}")
                     elif event == "report":
                         st.session_state.report = data
                     elif event == "answer":
@@ -293,54 +314,57 @@ def result_panel(api: ApiClient) -> None:
         st.caption("The report of the latest investigation appears here.")
         return
     if report["status"] == "not_applicable":
-        st.info(report["summary"])
+        st.info(plain(report["summary"]))
         return
 
-    st.caption(report["question"])
+    st.caption(plain(report["question"]))
     risk, confidence, status = st.columns(3)
-    risk.markdown(f"**Risk level**  \n:{RISK_COLORS.get(report['risk_level'], 'gray')}[**{report['risk_level'].upper()}**]")
+    risk.markdown(f"**Risk level**  \n:{RISK_COLORS.get(report['risk_level'], 'gray')}[**{plain(report['risk_level'].upper())}**]")
     confidence.markdown(f"**Confidence**  \n**{round(report['confidence'] * 100)}%**")
-    status.markdown(f"**Status**  \n{report['status_label']}")
-    st.markdown(report["summary"])
+    status.markdown(f"**Status**  \n{plain(report['status_label'])}")
+    st.markdown(plain(report["summary"]))
 
     approval_block(api, report)
 
     st.markdown("**Recommendation**")
-    st.info(report["recommended_action"] or "No recommendation.")
+    st.info(plain(report["recommended_action"]) or "No recommendation.")
     original = report["human_review"].get("original_action")
     if original:
-        st.caption(f"The agent had recommended: {original}")
+        st.caption(f"The agent had recommended: {plain(original)}")
 
     if report["contradictions"]:
         st.markdown(f"**Contradictions ({len(report['contradictions'])})**")
         for item in report["contradictions"]:
-            with st.expander(f"{item['severity'].upper()} · {item['description']}"):
-                st.markdown(f"**Finding:** {item['description']}")
-                st.markdown(f"**Risk:** {item['severity'].capitalize()}")
-                st.markdown(f"**Values:** {item['source_a']}: {amount(item['value_a'])} · {item['source_b']}: {amount(item['value_b'])}")
+            with st.expander(f"{plain(item['severity'].upper())} · {plain(item['description'])}"):
+                st.markdown(f"**Finding:** {plain(item['description'])}")
+                st.markdown(f"**Risk:** {plain(item['severity'].capitalize())}")
+                st.markdown(
+                    f"**Values:** {plain(item['source_a'])}: {plain(amount(item['value_a']))} · "
+                    f"{plain(item['source_b'])}: {plain(amount(item['value_b']))}"
+                )
                 if item.get("difference") is not None:
                     change = f" ({amount(item['percentage_change'])}%)" if item.get("percentage_change") is not None else ""
-                    st.markdown(f"**Difference (calculated by a tool):** {amount(item['difference'])}{change}")
+                    st.markdown(f"**Difference (calculated by a tool):** {plain(amount(item['difference']) + change)}")
                 evidence(item["citations"])
 
     if report["missing_evidence"]:
         st.markdown(f"**Missing evidence ({len(report['missing_evidence'])})**")
         for text in report["missing_evidence"]:
-            st.warning(text)
+            st.warning(plain(text))
 
     findings = [finding for finding in report["key_findings"] if finding["type"] != "missing_evidence"]
     if findings:
         st.markdown(f"**Key findings ({len(findings)})**")
         for finding in findings:
             label = FINDING_LABELS.get(finding["type"], finding["type"])
-            with st.expander(f"{label} · {finding['statement'][:110]}"):
-                st.markdown(finding["statement"])
+            with st.expander(f"{plain(label)} · {plain(finding['statement'][:110])}"):
+                st.markdown(plain(finding["statement"]))
                 evidence(finding["citations"])
 
     if report["risk_reasons"]:
         with st.expander(f"Risk reasoning ({len(report['risk_reasons'])}) - the agent's inference"):
             for reason in report["risk_reasons"]:
-                st.markdown(f"- {reason['statement']}")
+                st.markdown(f"- {plain(reason['statement'])}")
 
     if report["calculations"]:
         with st.expander(f"Calculations ({len(report['calculations'])}) - done by deterministic tools"):
@@ -365,20 +389,19 @@ def result_panel(api: ApiClient) -> None:
     if recalled:
         with st.expander(f"From earlier investigations ({len(recalled)}) - memory, not evidence"):
             for note in recalled:
-                st.markdown(f"- {note['text']}")
+                st.markdown(f"- {plain(note['text'])}")
     for text in report["memory"]["saved"]:
-        st.caption(text)
+        st.caption(plain(text))
 
     if report["limitations"]:
         with st.expander(f"Limitations ({len(report['limitations'])})"):
             for text in report["limitations"]:
-                st.markdown(f"- {text}")
+                st.markdown(f"- {plain(text)}")
 
     with st.expander("Full report as text"):
-        if report["presentation"]["response_format"] == "markdown":
-            st.markdown(report["answer_text"])
-        else:
-            st.text(report["answer_text"])
+        # st.text shows the characters as they are. (In Markdown format the API has already
+        # escaped everything that came from documents, but nothing is rendered here anyway.)
+        st.text(report["answer_text"])
 
     with st.expander("What the agent did (trace)"):
         stats = report["stats"]
@@ -400,7 +423,7 @@ def result_panel(api: ApiClient) -> None:
                     hide_index=True, width="stretch",
                 )
             except ApiError as exc:
-                st.error(str(exc))
+                st.error(plain(exc))
 
 
 def evidence(citations: list[dict[str, Any]]) -> None:
@@ -412,7 +435,7 @@ def evidence(citations: list[dict[str, Any]]) -> None:
     for citation in citations:
         st.markdown(f"- {cite(citation)}")
         if citation.get("quote"):
-            st.caption(f"“{citation['quote']}”")
+            st.caption(f"“{plain(citation['quote'])}”")
 
 
 def approval_block(api: ApiClient, report: dict[str, Any]) -> None:
@@ -431,17 +454,20 @@ def approval_block(api: ApiClient, report: dict[str, Any]) -> None:
                 try:
                     final = api.decide(report["investigation_id"], decision, note.strip(), modified_action.strip())
                 except ApiError as exc:
-                    st.error(str(exc))
+                    st.error(plain(exc))
                     return
                 st.session_state.report = final
                 st.session_state.messages.append(
-                    {"role": "assistant", "content": f"Decision recorded: **{final['human_review']['status']}**. The report is final."}
+                    {
+                        "role": "assistant", "trusted": True,
+                        "content": f"Decision recorded: **{plain(final['human_review']['status'])}**. The report is final.",
+                    }
                 )
                 st.rerun()
     elif review["status"] in ("approved", "rejected", "modified"):
-        text = f"Human review: **{review['status']}** by {review.get('reviewer') or 'reviewer'}"
+        text = f"Human review: **{plain(review['status'])}** by {plain(review.get('reviewer') or 'reviewer')}"
         if review.get("note"):
-            text += f" — {review['note']}"
+            text += f" — {plain(review['note'])}"
         st.success(text)
     elif review["status"] == "not_requested":
         st.warning("A person should review this result before acting on it.")

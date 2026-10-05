@@ -12,7 +12,7 @@ import uuid
 from fastapi import APIRouter, Query, Response
 
 from app.config import get_settings
-from app.errors import NotFound, ValidationFailed
+from app.errors import Conflict, NotFound, ValidationFailed
 from app.memory.extraction import clean_note
 from app.memory.profile import PREFERENCES, validate_preference
 from app.memory.store import get_memory_store
@@ -28,6 +28,12 @@ from app.schemas.memory import (
 from app.security.permissions import CurrentUser
 
 router = APIRouter(prefix="/memory", tags=["memory"])
+
+
+def _require_enabled() -> None:
+    """Writing and searching need memory to be on. Looking at and deleting what is stored always works."""
+    if not get_settings().ENABLE_MEMORY:
+        raise Conflict("Long-term memory is switched off (ENABLE_MEMORY=false).")
 
 
 def _preference_list(stored: dict[str, str]) -> list[PreferenceInfo]:
@@ -58,6 +64,7 @@ async def get_memory(user: CurrentUser) -> MemoryOverview:
 @router.put("/preferences/{key}", response_model=PreferenceInfo)
 async def set_preference(key: str, request: PreferenceUpdate, user: CurrentUser) -> PreferenceInfo:
     """Set a preference, for example ``detail_level`` = ``brief``."""
+    _require_enabled()
     key, value = validate_preference(key, request.value)
     store = get_memory_store()
     await store.set_preference(str(user.id), key, value)
@@ -76,6 +83,7 @@ async def reset_preference(key: str, user: CurrentUser) -> Response:
 @router.post("/notes", response_model=MemoryNote, status_code=201)
 async def add_note(request: MemoryNoteCreate, user: CurrentUser) -> MemoryNote:
     """Remember a lasting fact, for example "Vendor ABC was flagged for duplicate invoices in 2025"."""
+    _require_enabled()
     text = clean_note(request.text, get_settings())
     if text is None:
         raise ValidationFailed("A note must be a statement of at least 10 characters, not a question.")
@@ -93,6 +101,7 @@ async def search_memory(
     min_similarity: float | None = Query(default=None, ge=0.0, le=1.0),
 ) -> MemorySearchResult:
     """Semantic search over your notes: the same recall the agent uses, so you can see what it would find."""
+    _require_enabled()
     settings = get_settings()
     results = await get_memory_store().search_notes(
         str(user.id), q, top_k=settings.MEMORY_TOP_K,

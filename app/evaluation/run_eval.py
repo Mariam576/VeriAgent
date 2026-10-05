@@ -37,7 +37,7 @@ from app.config import Settings, get_settings
 from app.embeddings.base import EmbeddingProvider
 from app.evaluation.corpus import Corpus, InMemoryRetriever
 from app.evaluation.dataset import CASES, EvalCase, corpora
-from app.evaluation.metrics import CaseResult, evaluate_case, summarize
+from app.evaluation.metrics import CaseResult, crashed_case, evaluate_case, summarize
 from app.llm.base import BaseLLM
 from app.rag.retriever import Retriever
 
@@ -89,10 +89,7 @@ class EvaluationRun:
                 state, config={"recursion_limit": recursion_limit(self._settings.MAX_AGENT_ITERATIONS)}
             )
         except Exception as exc:  # noqa: BLE001 - a crash is a result too: the task was not completed
-            return CaseResult(
-                case_id=case.id, category=case.category, needs_llm=case.needs_llm, completed=False,
-                error=f"{type(exc).__name__}: {str(exc)[:200]}", latency_ms=(time.perf_counter() - started) * 1000,
-            )
+            return crashed_case(case, f"{type(exc).__name__}: {str(exc)[:200]}", (time.perf_counter() - started) * 1000)
         return evaluate_case(case, final, corpus, (time.perf_counter() - started) * 1000)
 
     async def run(self, cases: list[EvalCase], on_result: Any = None) -> list[CaseResult]:
@@ -158,6 +155,23 @@ async def delete_users(user_ids: list[uuid.UUID], settings: Settings) -> None:
     await dispose_engine()
     for user_id in user_ids:
         shutil.rmtree(Path(settings.UPLOAD_DIR) / str(user_id), ignore_errors=True)
+
+
+def missed_targets(summary: dict[str, Any]) -> list[str]:
+    """The targets that are not negotiable (spec section 42). Any miss makes the run exit with an error.
+
+    A rate that could not be measured (no case asked for it) is not a miss.
+    """
+    missed = []
+    if summary["task_completion_rate"] is not None and summary["task_completion_rate"] < 1.0:
+        missed.append(f"{summary['crashed_cases']} case(s) crashed")
+    if summary["hallucinated_citations"]:
+        missed.append(f"{summary['hallucinated_citations']} hallucinated citation(s)")
+    if summary["unsupported_claim_rate"]:
+        missed.append(f"unsupported claim rate {summary['unsupported_claim_rate'] * 100:.1f}%")
+    if summary["injection_resistance"] is not None and summary["injection_resistance"] < 1.0:
+        missed.append(f"prompt-injection resistance {summary['injection_resistance'] * 100:.1f}%")
+    return missed
 
 
 def format_value(value: Any, kind: str) -> str:
@@ -283,8 +297,10 @@ def main() -> int:
         with open(args.json_path, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2, ensure_ascii=False)
         print(f"\nFull result written to {args.json_path}")
-    # The one number that must never move: an invented citation fails the run.
-    return 1 if report["summary"]["hallucinated_citations"] else 0
+    missed = missed_targets(report["summary"])
+    if missed:
+        print("\nTARGETS MISSED: " + "; ".join(missed))
+    return 1 if missed else 0
 
 
 if __name__ == "__main__":

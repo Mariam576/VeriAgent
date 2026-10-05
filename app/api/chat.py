@@ -18,6 +18,7 @@ same code.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from typing import Any
 
 from fastapi import APIRouter
@@ -53,37 +54,42 @@ async def chat_events(session: AsyncSession, user: User, request: ChatRequest) -
     history = [{"role": message.role, "content": message.content} for message in earlier]
 
     investigation_id = None
-    async for item in stream_investigation(
+    investigation = stream_investigation(
         session, user=user, question=request.message, conversation_id=conversation_id, history=history
-    ):
-        if item["type"] == "started":
-            investigation_id = item["investigation"].id
-            yield {**item, "conversation_id": conversation_id}
-            continue
-        yield item
-        if item["type"] != "report":
-            continue
-        report = item["report"]
-        answer = report.summary
-        if report.human_review.status == "pending":
-            answer += " This result is waiting for a human decision before it is final."
-        # Stored only after a successful run, so a failed turn does not pollute the history.
-        await repositories.add_message(session, conversation_id, "user", request.message.strip())
-        await repositories.add_message(session, conversation_id, "assistant", answer)
-        yield {
-            "type": "answer",
-            "response": ChatResponse(
-                conversation_id=conversation_id,
-                investigation_id=investigation_id,
-                answer=answer,
-                risk_level=report.risk_level,
-                confidence=report.confidence,
-                status=report.status,
-                requires_human_review=report.requires_human_review,
-                approval_status=report.human_review.status,
-                citations=report.sources,
-            ),
-        }
+    )
+    async with aclosing(investigation) as events:  # closes the run promptly if our caller stops reading
+        async for item in events:
+            if item["type"] == "started":
+                investigation_id = item["investigation"].id
+                yield {**item, "conversation_id": conversation_id}
+                continue
+            if item["type"] != "report":
+                yield item
+                continue
+            report = item["report"]
+            answer = report.summary
+            if report.human_review.status == "pending":
+                answer += " This result is waiting for a human decision before it is final."
+            # Stored only after a successful run, so a failed turn does not pollute the history.
+            # Stored before the report is sent, so a client that stops reading at the report
+            # still has the turn in its conversation.
+            await repositories.add_message(session, conversation_id, "user", request.message.strip())
+            await repositories.add_message(session, conversation_id, "assistant", answer)
+            yield item
+            yield {
+                "type": "answer",
+                "response": ChatResponse(
+                    conversation_id=conversation_id,
+                    investigation_id=investigation_id,
+                    answer=answer,
+                    risk_level=report.risk_level,
+                    confidence=report.confidence,
+                    status=report.status,
+                    requires_human_review=report.requires_human_review,
+                    approval_status=report.human_review.status,
+                    citations=report.sources,
+                ),
+            }
 
 
 def chat_event(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:

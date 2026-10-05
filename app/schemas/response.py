@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.investigation import RiskLevel
 
@@ -19,6 +19,7 @@ STATUS_LABELS = {
     "incomplete": "Incomplete",
     "not_applicable": "Not Applicable",
     "running": "Running",
+    "interrupted": "Interrupted",
     "failed": "Failed",
 }
 
@@ -146,6 +147,14 @@ class InvestigationReport(BaseModel):
     # The same content as one readable text block (what a chat window shows).
     answer_text: str = ""
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reports_from_version_1(cls, data: Any) -> Any:
+        """Version 1 stored only a yes/no flag. Keep its meaning when such a report is read back."""
+        if isinstance(data, dict) and "human_review" not in data and data.get("requires_human_review"):
+            return {**data, "human_review": {"required": True, "status": "not_requested"}}
+        return data
+
 
 # ------------------------------------------------------------------ requests
 class InvestigationRequest(BaseModel):
@@ -199,6 +208,7 @@ class InvestigationSummary(BaseModel):
     question: str
     status: str
     approval_status: str = "not_required"
+    error: str | None = None  # why it failed or was interrupted, when it did
     risk_level: str | None = None
     confidence_score: float | None = None
     created_at: datetime

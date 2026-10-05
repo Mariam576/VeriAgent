@@ -14,7 +14,7 @@ from app.config import get_settings
 from app.errors import ValidationFailed
 from app.memory.extraction import accepted_memory, clean_note, fallback_memory, might_contain_memory
 from app.memory.profile import normalize_preference, validate_preference, with_defaults
-from app.memory.semantic import investigation_note
+from app.memory.semantic import investigation_note, remember_investigation
 from app.schemas.memory import MemoryCandidate
 from app.schemas.response import InvestigationReport
 from tests.helpers import InMemoryMemoryStore, InMemoryRetriever, ScriptedLLM, run_graph, sample_library
@@ -130,7 +130,7 @@ async def test_without_a_memory_store_the_graph_behaves_as_before(samples_dir):
     state = await run_graph(DEMO_QUESTION, sample_library(samples_dir))
     assert state["report"]["memory"] == {"saved": [], "recalled": []}
     assert state["report"]["presentation"] == {"detail_level": "standard", "response_format": "text"}
-    assert not any(event["node"] in ("load_memory", "save_memory") for event in state["events"])
+    assert not any(event["node"] == "load_memory" for event in state["events"])
 
 
 async def test_a_message_that_only_states_a_preference_is_saved_and_confirmed():
@@ -204,9 +204,18 @@ async def test_a_stated_fact_becomes_a_note_and_is_recalled_later():
     assert other["report"]["memory"]["recalled"] == []
 
 
+async def remember(memory, state, settings=None) -> bool:
+    """What the service does once the result is stored."""
+    return await remember_investigation(
+        memory, settings or get_settings(), state["user_id"], InvestigationReport(**state["report"])
+    )
+
+
 async def test_a_finished_investigation_leaves_one_note_and_the_next_one_recalls_it(samples_dir):
     memory = InMemoryMemoryStore()
-    await run_graph(DEMO_QUESTION, sample_library(samples_dir), memory=memory)
+    first = await run_graph(DEMO_QUESTION, sample_library(samples_dir), memory=memory)
+    assert memory.notes == []  # the graph itself never writes the note ...
+    assert await remember(memory, first) is True  # ... the service does, after storing the result
     assert len(memory.notes) == 1
     note = memory.notes[0]
     assert note["source"] == "investigation" and note["investigation_id"] == "inv-1"
@@ -217,6 +226,7 @@ async def test_a_finished_investigation_leaves_one_note_and_the_next_one_recalls
     again = await run_graph(DEMO_QUESTION, sample_library(samples_dir), llm, memory=memory)
     recalled = again["report"]["memory"]["recalled"]
     assert len(recalled) == 1 and recalled[0]["text"] == note["text"] and recalled[0]["similarity"] >= 0.3
+    await remember(memory, again)
     assert len(memory.notes) == 1  # the same outcome is not stored twice
     # Recalled notes are shown to the reader but never sent to the language model.
     all_prompts = " ".join(system + user for prompts in llm.prompts.values() for system, user in prompts)
@@ -228,12 +238,13 @@ async def test_a_finished_investigation_leaves_one_note_and_the_next_one_recalls
 
 async def test_small_talk_and_plain_lookups_leave_no_note(samples_dir):
     memory = InMemoryMemoryStore()
-    await run_graph("hello", InMemoryRetriever(), memory=memory)
-    await run_graph("What is the weather like?", InMemoryRetriever(), memory=memory)  # no evidence at all
+    for question in ("hello", "What is the weather like?"):  # the second finds no evidence at all
+        state = await run_graph(question, InMemoryRetriever(), memory=memory)
+        assert await remember(memory, state) is False
     assert memory.notes == []
 
 
-async def test_a_paused_investigation_is_remembered_only_after_the_decision(samples_dir):
+async def test_a_paused_investigation_is_not_remembered_until_it_is_decided(samples_dir):
     memory, settings = InMemoryMemoryStore(), get_settings()
     graph = build_investigation_graph(
         AgentDeps(
@@ -244,11 +255,21 @@ async def test_a_paused_investigation_is_remembered_only_after_the_decision(samp
     )
     config = {"configurable": {"thread_id": "inv-1"}, "recursion_limit": recursion_limit(settings.MAX_AGENT_ITERATIONS)}
     await graph.ainvoke(initial_state(user_id="user-1", investigation_id="inv-1", question=DEMO_QUESTION), config)
-    assert memory.notes == []  # waiting for a person: not finished, nothing to remember yet
+    snapshot = await graph.aget_state(config)
+    draft = InvestigationReport(**snapshot.tasks[0].interrupts[0].value["draft_report"])
+    assert await remember_investigation(memory, settings, "user-1", draft) is False  # waiting for a person
 
-    await graph.ainvoke(Command(resume={"decision": "reject", "note": "Wrong contract version"}), config)
-    assert len(memory.notes) == 1
+    final = await graph.ainvoke(Command(resume={"decision": "reject", "note": "Wrong contract version"}), config)
+    assert await remember(memory, final) is True
     assert "Human decision: rejected (Wrong contract version)." in memory.notes[0]["text"]
+
+
+async def test_remembering_never_fails_the_investigation(samples_dir):
+    memory = InMemoryMemoryStore()
+    state = await run_graph(DEMO_QUESTION, sample_library(samples_dir), memory=memory)
+    memory.fail = True
+    assert await remember(memory, state) is False  # logged, not raised
+    assert await remember_investigation(None, get_settings(), "user-1", InvestigationReport(**state["report"])) is False
 
 
 async def test_a_broken_memory_store_does_not_stop_the_investigation(samples_dir):
@@ -264,7 +285,8 @@ async def test_memory_can_be_switched_off_in_the_settings(samples_dir):
     memory = InMemoryMemoryStore()
     settings = get_settings().model_copy(update={"ENABLE_MEMORY": False})
     await run_graph("From now on keep your answers brief.", InMemoryRetriever(), settings=settings, memory=memory)
-    await run_graph(DEMO_QUESTION, sample_library(samples_dir), settings=settings, memory=memory)
+    state = await run_graph(DEMO_QUESTION, sample_library(samples_dir), settings=settings, memory=memory)
+    assert await remember(memory, state, settings) is False
     assert memory.preferences == {} and memory.notes == []
 
 
@@ -427,3 +449,122 @@ async def test_chat_remembers_a_preference_and_an_investigation(client, user_hea
     assert forgotten.json() == {"preferences": 1, "notes": 1}
     overview = (await client.get("/memory", headers=user_headers)).json()
     assert overview["notes"] == [] and all(not item["is_set"] for item in overview["preferences"])
+
+
+# ============================================ review findings that must stay fixed
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Compare the invoice with the contract and remember that Vendor ABC was flagged for duplicate invoices in 2025.",
+        "Does the report always show short payment terms?",
+        "I would prefer the short answer: is the invoice above the contract value?",
+        "From now on keep your answers brief. Is the invoice above the contract value?",
+        "Remember that Vendor ABC was flagged in 2025. What does the contract say about payment?",
+    ],
+)
+def test_a_message_that_also_asks_something_is_never_only_a_memory(message):
+    from app.memory.extraction import is_only_memory
+
+    assert is_only_memory(message) is False
+    assert fallback_memory(message).only_memory is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "From now on keep your answers brief.",
+        "Keep it brief from now on.",
+        "Please remember that Vendor ABC was flagged for duplicate invoices in 2025.",
+        "I prefer detailed reports. By default, use markdown.",
+    ],
+)
+def test_a_message_that_only_states_something_to_remember_is_recognised(message):
+    from app.memory.extraction import is_only_memory
+
+    assert is_only_memory(message) is True
+
+
+def test_a_question_is_never_stored_as_a_preference():
+    assert fallback_memory("Does the report always show short payment terms?").should_save is False
+    assert fallback_memory("I would prefer the short answer: is the invoice above the contract value?").should_save is False
+
+
+async def test_a_request_with_a_fact_to_remember_is_investigated_and_remembered(samples_dir):
+    memory = InMemoryMemoryStore()
+    state = await run_graph(
+        "Compare the invoice with the contract and remember that Vendor ABC was flagged for duplicate invoices in 2025.",
+        sample_library(samples_dir), memory=memory,
+    )
+    assert state["report"]["status"] == "review_required" and state["report"]["contradictions"]
+    assert [note["text"] for note in memory.notes] == ["Vendor ABC was flagged for duplicate invoices in 2025."]
+    assert state["report"]["memory"]["saved"] == ["Noted for later: Vendor ABC was flagged for duplicate invoices in 2025."]
+
+
+async def test_the_model_alone_cannot_skip_an_investigation(samples_dir):
+    """The model claims the message is only a memory; the code rule disagrees, so the question is answered."""
+    memory = InMemoryMemoryStore()
+    llm = ScriptedLLM({MemoryCandidate: candidate(key="detail_level", value="brief", only_memory=True)})
+    state = await run_graph(
+        "From now on keep your answers brief. Is the invoice above the contract value?",
+        sample_library(samples_dir), llm, memory=memory,
+    )
+    assert memory.preferences == {"user-1": {"detail_level": "brief"}}
+    assert "RequestAnalysis" in llm.calls and state["report"]["status"] == "review_required"
+
+
+def test_more_kinds_of_secrets_are_removed_and_json_stays_valid(settings):
+    import json
+
+    from app.security.guardrails import redact_secrets
+
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+    secrets = {
+        "header": f"Authorization: Bearer {jwt}",
+        "github": "use ghp_abcdefghijklmnopqrstuvwxyz0123456789 for the repo",
+        "aws": "key id AKIAIOSFODNN7EXAMPLE",
+        "password": "The portal password: hunter2secret, ask Dana",
+        "assignment": "api_key=abcd1234efgh",
+    }
+    cleaned = redact_secrets(json.dumps(secrets), settings)
+    for leaked in (jwt, "ghp_abcdefghijklmnopqrstuvwxyz0123456789", "AKIAIOSFODNN7EXAMPLE", "hunter2secret", "abcd1234efgh"):
+        assert leaked not in cleaned
+    parsed = json.loads(cleaned)  # the JSON around the secrets is untouched
+    assert set(parsed) == set(secrets) and parsed["password"] == "The portal password: [REDACTED], ask Dana"
+    # Ordinary business text is left alone.
+    plain = "Payment terms: 30 days. Total amount due: £58,000. The token economy report is attached."
+    assert redact_secrets(plain, settings) == plain
+    assert clean_note("The vendor portal login is password: hunter2secret for Dana.", settings) == (
+        "The vendor portal login is password: [REDACTED] for Dana."
+    )
+
+
+@pytest.mark.integration
+async def test_when_memory_is_off_the_api_stores_and_searches_nothing(client, user_headers, monkeypatch):
+    note = (await client.post("/memory/notes", headers=user_headers, json={"text": "Vendor ABC was flagged in 2025."})).json()
+    monkeypatch.setattr(get_settings(), "ENABLE_MEMORY", False)
+
+    for response in (
+        await client.put("/memory/preferences/detail_level", headers=user_headers, json={"value": "brief"}),
+        await client.post("/memory/notes", headers=user_headers, json={"text": "Another lasting fact to keep."}),
+        await client.get("/memory/search", headers=user_headers, params={"q": "Vendor ABC"}),
+    ):
+        assert response.status_code == 409 and "switched off" in response.json()["error"]["message"]
+
+    # What is already stored can still be seen and removed.
+    overview = (await client.get("/memory", headers=user_headers)).json()
+    assert overview["enabled"] is False and [item["id"] for item in overview["notes"]] == [note["id"]]
+    assert (await client.delete(f"/memory/notes/{note['id']}", headers=user_headers)).status_code == 204
+
+
+@pytest.mark.integration
+async def test_notes_per_user_are_capped_and_the_oldest_make_room(client, user_headers, monkeypatch):
+    from app.memory import store
+
+    monkeypatch.setattr(store, "MAX_NOTES_PER_USER", 3)
+    for number in range(1, 6):
+        response = await client.post(
+            "/memory/notes", headers=user_headers, json={"text": f"Lasting fact number {number} about the vendor."}
+        )
+        assert response.status_code == 201
+    notes = (await client.get("/memory", headers=user_headers)).json()["notes"]
+    assert [note["text"][:21] for note in notes] == ["Lasting fact number 5", "Lasting fact number 4", "Lasting fact number 3"]
