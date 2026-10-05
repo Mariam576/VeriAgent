@@ -6,12 +6,16 @@ ENGINEERING SERVICES LTD." are one company. On the other hand "Brightline
 Engineering Solutions Ltd" is a different company whose name merely looks
 alike, and that is exactly what a fake supplier would choose.
 
-So the comparison has three outcomes, not two:
+So the comparison has more outcomes than "equal" and "not equal":
 
-    same        equal once spelling noise is removed, or one is a short form of the other
-    similar     nearly the same letters but not the same words (a typing error, or a look-alike)
-    different   anything else
-    unknown     one of the names is empty, so nothing can be said
+    same         equal once spelling noise is removed (capitals, "Ltd" for "Limited", "&" for "and")
+    short_form   one name is the other with words left out or added: "Redbridge Lifts" and
+                 "Redbridge Lifts Services Ltd". Usually the same company, written short on a
+                 letterhead - but adding a word is also how a look-alike company is named
+                 ("... Services", "... Holdings", "... 2026"), so it is worth a look
+    similar      nearly the same letters but not the same words (a typing error, or a look-alike)
+    different    anything else
+    unknown      one of the names is empty, so nothing can be said
 """
 
 from __future__ import annotations
@@ -21,7 +25,9 @@ import unicodedata
 from difflib import SequenceMatcher
 from typing import Literal
 
-NameMatch = Literal["same", "similar", "different", "unknown"]
+NameMatch = Literal["same", "short_form", "similar", "different", "unknown"]
+# The outcomes that mean "probably the same company". Used where the question is which documents belong together.
+RELATED = ("same", "short_form", "similar")
 
 # Legal forms and filler words say nothing about which company is meant.
 LEGAL_FORMS = (
@@ -53,7 +59,7 @@ def compare_names(first: str | None, second: str | None) -> NameMatch:
     # agree, because that is the distinctive one ("Services" alone would match half of all suppliers).
     shorter, longer = sorted((a, b), key=len)
     if shorter[0] == longer[0] and set(shorter) < set(longer):
-        return "same"
+        return "short_form"
     if SequenceMatcher(None, " ".join(a), " ".join(b)).ratio() >= SIMILAR_RATIO:
         return "similar"
     return "different"

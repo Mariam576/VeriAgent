@@ -63,7 +63,7 @@ from app.agents.assessment import (
 from app.agents.report import action_list, build_report, render_report
 from app.agents.reviewer import review_claims, reviewable
 from app.agents.state import InvestigationState
-from app.comparison.engine import Cited, ProfileFinding, compare_profiles
+from app.comparison.engine import Cited, ProfileFinding, compare_profiles, unrelated_pairs
 from app.comparison.profile import PROFILED_TYPES
 from app.comparison.store import ProfileSource
 from app.config import Settings
@@ -115,6 +115,8 @@ MAX_LLM_TOOL_CALLS = 5
 MAX_REVIEW_ROUNDS = 2
 MAX_PROFILED_DOCUMENTS = 6  # one model call per document the first time, so keep the set small
 MAX_PROFILE_EVIDENCE = 24  # evidence items a comparison may add on top of the extracted facts
+# How a passage is marked that the search did not find but the document comparison fetched to cite a value.
+CITED_BY_COMPARISON = "comparison"
 # A comparison finding may rest on a total or on payment terms that the evidence already holds under its own key.
 _SAME_FACT = {"document_total": "total_amount", "document_payment_terms": "payment_terms_days"}
 
@@ -123,6 +125,28 @@ _CHUNK_REF = re.compile(r"\bC\d+\b", re.IGNORECASE)
 _NOTHING = {"none", "n/a", "na", "nothing", "nil", "no", "-", "not applicable", "nothing is missing", "none identified"}
 
 NodeFunction = Callable[[Any, InvestigationState], Awaitable[dict[str, Any]]]
+
+
+def _between_unrelated(item: Contradiction, evidence: dict[str, EvidenceItem], unrelated: set[tuple[str, str]]) -> bool:
+    """Does this contradiction only hold bills against a contract or order they do not belong to?
+
+    Side A of a contradiction is the reference, side B the documents checked
+    against it. It is dropped when every document on side B is known to be
+    unrelated to every contract and purchase order on side A.
+    """
+    if item.value_a is None or item.value_b is None:
+        return False
+    items = [evidence[identifier] for identifier in item.evidence_ids if identifier in evidence]
+    checked = {
+        entry.document_id for entry in items
+        if entry.value_number is not None and abs(entry.value_number - item.value_b) < 0.005
+    }
+    references = {
+        entry.document_id for entry in items
+        if entry.value_number is not None and abs(entry.value_number - item.value_a) < 0.005
+        and entry.document_type in ("contract", "purchase_order")
+    }
+    return bool(checked) and bool(references) and all((bill, reference) in unrelated for bill in checked for reference in references)
 
 
 @dataclass
@@ -396,7 +420,10 @@ class InvestigationNodes:
             return_exceptions=True,
         )
 
-        known_ids = {chunk.chunk_id for chunk in existing}
+        # Passages that the document comparison fetched only to cite a value were never read for
+        # facts. They do not count as "already found": a search may find them, and then they are read.
+        cited_only = {chunk.chunk_id for chunk in existing if chunk.matched_by == [CITED_BY_COMPARISON]}
+        known_ids = {chunk.chunk_id for chunk in existing} - cited_only
         candidates: dict[str, RetrievedChunk] = {}
         errors: list[str] = []
         for query, result in zip(pending, results):
@@ -425,15 +452,24 @@ class InvestigationNodes:
         if not existing:
             reserve = min(self.settings.RERANK_TOP_K, budget // 3)
             budget = max(budget - reserve, 1)
-        room = max(budget - len(existing), 0)
+        # ... and they do not use up the budget either: it is a limit on what the search may bring in.
+        room = max(budget - (len(existing) - len(cited_only)), 0)
         selected = select_diverse(sorted(candidates.values(), key=lambda c: c.rerank_score, reverse=True), room)
+        found_again = {chunk.chunk_id: chunk for chunk in selected if chunk.chunk_id in cited_only}
+        # A passage that was only cited keeps its place and its reference number; it now also counts as found.
+        existing = [
+            chunk if chunk.chunk_id not in found_again
+            else found_again[chunk.chunk_id].model_copy(update={"ref": chunk.ref})
+            for chunk in existing
+        ]
+        brand_new = [chunk for chunk in selected if chunk.chunk_id not in found_again]
         new_chunks = [
             chunk.model_copy(update={"ref": f"C{len(existing) + index}"})
-            for index, chunk in enumerate(selected, start=1)
+            for index, chunk in enumerate(brand_new, start=1)
         ]
 
         update["retrieved_documents"] = [chunk.model_dump() for chunk in existing + new_chunks]
-        update["new_chunk_ids"] = [chunk.chunk_id for chunk in new_chunks]
+        update["new_chunk_ids"] = [chunk.chunk_id for chunk in selected]
         update["events"] = [
             event("retrieve", "Searching documents..."),
             event("retrieve", f"{len(new_chunks)} relevant evidence item(s) found..."),
@@ -604,6 +640,13 @@ class InvestigationNodes:
 
         if self.profiles is not None and state.get("analysis", {}).get("task_type") == "document_investigation":
             detailed = await self._compare_documents(state, evidence, update)
+            # An invoice that the profiles show to be another piece of business (another supplier, no
+            # reference to this contract) is not held against that contract's total either.
+            unrelated = {tuple(pair) for pair in update.get("unrelated_documents", state.get("unrelated_documents", []))}
+            if unrelated:
+                by_id = {item.id: item for item in evidence}
+                contradictions = [item for item in contradictions if not _between_unrelated(item, by_id, unrelated)]
+            contradictions = [item.model_copy(update={"id": f"X{index}"}) for index, item in enumerate(contradictions, start=1)]
             contradictions += [
                 item.model_copy(update={"id": f"X{len(contradictions) + index}"})
                 for index, item in enumerate(detailed, start=1)
@@ -655,6 +698,7 @@ class InvestigationNodes:
             ]
 
         findings = compare_profiles(batch.profiles)
+        update["unrelated_documents"] = [list(pair) for pair in sorted(unrelated_pairs(batch.profiles))]
         added_evidence = 0
         page_cache: dict[tuple[str, int], list[RetrievedChunk]] = {}
 
@@ -707,7 +751,7 @@ class InvestigationNodes:
                 if item is None:
                     assert chunk is not None
                     if all(known.chunk_id != chunk.chunk_id for known in retrieved):
-                        chunk = chunk.model_copy(update={"ref": f"C{len(retrieved) + 1}"})
+                        chunk = chunk.model_copy(update={"ref": f"C{len(retrieved) + 1}", "matched_by": [CITED_BY_COMPARISON]})
                         retrieved.append(chunk)
                     else:
                         chunk = next(known for known in retrieved if known.chunk_id == chunk.chunk_id)
@@ -926,7 +970,8 @@ class InvestigationNodes:
             query for query in dedupe_keep_order(assessment.follow_up_queries)[:MAX_FOLLOW_UP_QUERIES]
             if normalize(query) not in already_run
         ]
-        room_left = len(state.get("retrieved_documents", [])) < self.settings.MAX_RETRIEVED_CHUNKS
+        searched = [chunk for chunk in state.get("retrieved_documents", []) if chunk.get("matched_by") != [CITED_BY_COMPARISON]]
+        room_left = len(searched) < self.settings.MAX_RETRIEVED_CHUNKS
         if not sufficient and new_queries and not room_left:
             update.setdefault("limitations", []).append(
                 f"The limit of {self.settings.MAX_RETRIEVED_CHUNKS} retrieved chunks was reached, so no further "

@@ -7,7 +7,8 @@ The pattern is the same as for evidence extraction (Node 3):
 For every value the model must give the page and a word-for-word quote. Code
 then checks that
 
-    * the quote really stands on that page (before any injected instruction),
+    * the quote really stands on that page (before any injected instruction), in one piece:
+      a "..." may skip a few words inside a sentence, never a number and never to another sentence,
     * a number is written inside its quote,
     * a name or reference number is written inside its quote,
     * a date can be read from its quote.
@@ -39,7 +40,7 @@ from app.comparison.profile import (
     LineItem,
     ProfileField,
 )
-from app.comparison.rules import build_profile_with_rules
+from app.comparison.rules import build_profile_with_rules, enrich
 from app.llm.base import BaseLLM, LLMConfigurationError, LLMError
 from app.numbers import normalize_unit, number_appears
 from app.rag.citations import normalize, quote_in_text
@@ -185,7 +186,7 @@ def ground_extraction(
             if fact.field in _TEXT_FIELDS:
                 text = (fact.text or "").strip()
                 limit = MAX_NAME_CHARS if fact.field in ("supplier", "customer", "party") else MAX_IDENTIFIER_CHARS
-                if text and len(text) <= limit and quote_in_text(quote, page_text) and _contains(text, quote):
+                if text and len(text) <= limit and quote_in_text(quote, page_text, strict_gaps=True) and _contains(text, quote):
                     role = fact.field if fact.field in ("supplier", "customer") else None
                     value = ProfileField(text=text, role=role, page=fact.page, quote=quote)  # type: ignore[arg-type]
             elif fact.field in _DATE_FIELDS:
@@ -193,14 +194,14 @@ def ground_extraction(
                 in_quote = find_dates(quote)
                 wanted = {reading for found in find_dates(fact.text or "") for reading in found.readings}
                 match = next((found for found in in_quote if not wanted or wanted & set(found.readings)), None)
-                if match is not None and quote_in_text(quote, page_text):
+                if match is not None and quote_in_text(quote, page_text, strict_gaps=True):
                     value = ProfileField(text=match.text, dates=list(match.readings), page=fact.page, quote=quote)
             elif fact.field == "term_months":
                 stated = [months for months, _, _ in months_in_text(quote)]
-                if fact.number is not None and int(fact.number) in stated and quote_in_text(quote, page_text):
+                if fact.number is not None and int(fact.number) in stated and quote_in_text(quote, page_text, strict_gaps=True):
                     value = ProfileField(number=float(int(fact.number)), unit="months", page=fact.page, quote=quote)
             elif fact.field in _NUMBER_FIELDS and fact.number is not None:
-                if quote_in_text(quote, page_text, 2) and number_appears(fact.number, quote):
+                if quote_in_text(quote, page_text, 2, strict_gaps=True) and number_appears(abs(fact.number), quote):
                     unit = "days" if fact.field == "payment_terms_days" else normalize_unit(fact.unit)
                     value = ProfileField(number=float(fact.number), unit=unit, page=fact.page, quote=quote)
         if value is None:
@@ -226,8 +227,8 @@ def ground_extraction(
         in_quote = sum(word in normalize(quote) for word in words)
         if (
             not page_text or not quote or not numbers or not words
-            or not quote_in_text(quote, page_text, 2)
-            or not all(number_appears(number, quote) for number in numbers)
+            or not quote_in_text(quote, page_text, 2, strict_gaps=True)
+            or not all(number_appears(abs(number), quote) for number in numbers)
             or in_quote * 2 < len(words)  # the description must mostly be the document's own words
         ):
             dropped += 1
@@ -237,7 +238,7 @@ def ground_extraction(
             description=description, quantity=line.quantity, unit_price=line.unit_price, amount=line.amount,
             unit=normalize_unit(line.unit), page=line.page, quote=quote,
         ))
-    return profile, dropped
+    return enrich(profile, pages), dropped
 
 
 def to_extraction(profile: DocumentProfile) -> ProfileExtraction:

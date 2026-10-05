@@ -84,7 +84,12 @@ def test_date_arithmetic_and_durations():
     "first, second, expected",
     [
         ("Brightline Engineering Services Ltd", "BRIGHTLINE ENGINEERING SERVICES LIMITED.", "same"),
-        ("Brightline Engineering Services Ltd", "Brightline Engineering", "same"),  # short form
+        ("Brightline Engineering Services Ltd", "Brightline Engineering", "short_form"),
+        # Found in review: adding a word is how a look-alike company is named. These used to count as "same".
+        ("Redbridge Lifts Ltd", "Redbridge Lifts Services Ltd", "short_form"),
+        ("Redbridge Lifts Ltd", "Redbridge Lifts Holdings (Cyprus) Ltd", "short_form"),
+        ("Kestrel Packaging Ltd", "Kestrel Packaging 2026 Ltd", "short_form"),
+        ("Harlow Print Works", "HARLOW PRINT WORKS LTD", "same"),  # only the legal form is missing
         ("Marks & Spencer plc", "Marks and Spencer", "same"),
         ("Indus Textiles (Pvt) Ltd", "Indus Textiles Private Limited", "same"),
         ("Müller Maschinenbau GmbH", "Muller Maschinenbau", "same"),
@@ -349,13 +354,16 @@ def test_a_reference_to_another_contract_is_reported():
 
 def test_lines_are_matched_by_what_they_describe():
     ordered = [line("Sterilisation pouches, cartons", 40, 205), line("Nitrile gloves, boxes", 100, 6)]
-    billed = [line("Nitrile gloves (boxes)", 100, 6.5), line("Cartons of sterilisation pouches", 44, 205), line("Courier surcharge", amount=85)]
+    billed = [
+        line("Nitrile gloves (boxes)", 100, 6.5), line("Cartons of sterilisation pouches", 44, 205),
+        line("Autoclave indicator tape", amount=85), line("Courier surcharge", amount=12),
+    ]
     pairs, unmatched = match_lines(ordered, billed)
     assert [(a.description, b.description) for a, b in pairs] == [
         ("Sterilisation pouches, cartons", "Cartons of sterilisation pouches"),
         ("Nitrile gloves, boxes", "Nitrile gloves (boxes)"),
     ]
-    assert [item.description for item in unmatched] == ["Courier surcharge"]
+    assert [item.description for item in unmatched] == ["Autoclave indicator tape", "Courier surcharge"]
 
     order = profile("purchase_order", "PO.txt", number=field("PO-1"), line_items=ordered)
     invoice = profile("invoice", "I.txt", number=field("INV-1"), purchase_order_reference=field("PO-1"), line_items=billed)
@@ -363,7 +371,8 @@ def test_lines_are_matched_by_what_they_describe():
     assert [finding.type for finding in findings] == ["quantity_mismatch", "unit_price_mismatch", "unlisted_line_item"]
     assert (findings[0].value_a, findings[0].value_b) == (40, 44)
     assert (findings[1].value_a, findings[1].value_b, findings[1].unit_a) == (6, 6.5, "GBP")
-    assert "Courier surcharge" in findings[2].description
+    # Goods that were not ordered are reported; a delivery charge rides along with every order and is not.
+    assert "Autoclave indicator tape" in findings[2].description
 
     # Nothing in common: the documents describe their items too differently to say that a line is "unlisted".
     unrelated = profile("invoice", "I.txt", line_items=[line("Annual service visit", amount=900)])

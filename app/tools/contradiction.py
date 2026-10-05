@@ -15,6 +15,14 @@ What is compared
     need to be matched to each other first; that is the job of the document
     profiles in ``app/comparison`` (Version 3).
 
+What is not a contradiction
+    * Two invoices with different totals. They are two bills, not two
+      statements of one quantity.
+    * An invoice for LESS than the contract or order it is checked against.
+      That is what a monthly invoice, an instalment and a part delivery look
+      like. More than the reference is reported; several invoices that only
+      exceed it together are added up by the document comparison.
+
 A contradiction is a reason to review, not proof that something is wrong:
 an invoice can legitimately differ from a contract when a signed variation
 exists. Whether such support exists is checked later (evidence sufficiency).
@@ -47,6 +55,11 @@ _REFERENCE_PRIORITY = {
     "receipt": 6,
     "invoice": 7,
 }
+
+# Documents that ask for money. Their totals are compared with what was agreed, never with each other.
+_BILLING_TYPES = {"invoice", "receipt"}
+# Documents that say what was agreed: an invoice below their total is not a contradiction.
+_AGREEMENT_TYPES = {"contract", "purchase_order", "quotation"}
 
 # A policy sets rules and thresholds; it has no "total amount" of its own, so
 # an amount found in a policy is never compared with a contract or invoice total.
@@ -134,6 +147,13 @@ def find_contradictions(evidence: list[EvidenceItem]) -> list[Contradiction]:
             # Put the more authoritative source on side A.
             sides = sorted([(first, by_value[first]), (second, by_value[second])], key=lambda s: _side_rank(s[1]))
             (value_a, items_a), (value_b, items_b) = sides
+            bills_a = all(item.document_type in _BILLING_TYPES for item in items_a)
+            bills_b = all(item.document_type in _BILLING_TYPES for item in items_b)
+            if bills_a and bills_b:
+                continue  # two different bills
+            agreed = any(item.document_type in _AGREEMENT_TYPES for item in items_a)
+            if key == KEY_TOTAL_AMOUNT and agreed and bills_b and value_b < value_a:
+                continue  # billing less than was agreed: an instalment or a part delivery
             unit_a, unit_b = _unit(key, items_a), _unit(key, items_b)
             source_a, source_b = _sources(items_a), _sources(items_b)
 

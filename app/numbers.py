@@ -51,6 +51,8 @@ def parse_number(token: str) -> list[float]:
         as_thousands = float(token.replace(".", "").replace(",", "."))
         if "," in token or token.count(".") > 1:
             return [as_thousands]  # "40.000,00" or "1.234.567" can only be European
+        if token.startswith("0."):
+            return [float(token)]  # "0.125" can only be a decimal: nobody writes one hundred and twenty-five as 0.125
         return [as_thousands, float(token)]  # "40.000": thousands, or forty with three decimals
 
     if _PLAIN.match(token):
@@ -88,13 +90,22 @@ def numbers_in_text(text: str) -> list[float]:
 
 def number_appears(value: float, text: str) -> bool:
     """Is ``value`` written somewhere in ``text``, in any supported format?"""
-    for token, _, _ in find_number_tokens(text):
+    tokens = [token for token, _, _ in find_number_tokens(text)]
+    # "5 250 1,250.00" may be one number with spaces as separators, or the columns of a table row
+    # (quantity 5, price 250, amount 1,250.00). For "is it written there?" both readings count.
+    tokens += [part.group(0) for token in tokens if re.search(rf"[{_SPACES}]", token) for part in re.finditer(r"\d+(?:[.,]\d+)*", token)]
+    for token in tokens:
         if any(abs(candidate - value) < 0.005 for candidate in parse_number(token)):
             return True
-        # Last resort for whole numbers: compare the bare digits ("1,50,000" -> "150000").
+        # Last resort for whole numbers in an unusual grouping ("12,50,000.00", "1.50.000"): compare the
+        # bare digits. Only for tokens that are grouped thousands - every group after the first has two
+        # or three digits and the last one three. "12,50" (twelve and a half) and "1,234.56" are not
+        # 1250 and 123456, and must not pass as them.
         if float(value).is_integer():
-            digits = re.sub(r"[.,]0+$", "", token)
-            if re.sub(r"\D", "", digits) == str(int(abs(value))) and re.fullmatch(rf"[\d,.'{_SPACES}]+", digits):
+            whole = re.sub(r"[.,]0+$", "", token)
+            groups = re.split(rf"[,.'{_SPACES}]", whole)
+            grouped = len(groups) >= 2 and all(len(group) in (2, 3) for group in groups[1:]) and len(groups[-1]) == 3
+            if grouped and "".join(groups) == str(int(abs(value))):
                 return True
     return False
 

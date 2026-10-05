@@ -56,8 +56,18 @@ def _text_variants(text: str) -> list[str]:
     return list(dict.fromkeys(normalize(variant) for variant in (text, joined_words, kept_hyphen)))
 
 
-def quote_in_text(quote: str, text: str, min_chars: int = MIN_QUOTE_CHARS) -> bool:
-    """Does the quote appear in the text, allowing for line breaks and "..." gaps?"""
+MAX_GAP_CHARS = 120
+
+
+def quote_in_text(quote: str, text: str, min_chars: int = MIN_QUOTE_CHARS, *, strict_gaps: bool = False) -> bool:
+    """Does the quote appear in the text, allowing for line breaks and "..." gaps?
+
+    ``strict_gaps``: for quotes that have to state a value. A "..." may then
+    only skip a few words inside one sentence, and never a number. Otherwise a
+    quote could be stitched together from a label and a figure that stand in
+    different sentences ("Total amount due: ... £58,000" on a page that says
+    "Total amount due: £40,000" and mentions a limit of £58,000 further down).
+    """
     fragments = [
         normalize(fragment).strip(" .,;:\"'")
         for fragment in re.split(r"\.{3,}|…|\[\.\.\.\]", quote)
@@ -67,14 +77,21 @@ def quote_in_text(quote: str, text: str, min_chars: int = MIN_QUOTE_CHARS) -> bo
         return False
 
     for variant in _text_variants(text):
-        position = 0
-        for fragment in fragments:  # fragments must appear in the same order
-            found = variant.find(fragment, position)
-            if found == -1:
+        starts = [index for index in range(len(variant)) if variant.startswith(fragments[0], index)] if strict_gaps else [variant.find(fragments[0])]
+        for start in starts:
+            if start == -1:
                 break
-            position = found + len(fragment)
-        else:
-            return True
+            position = start + len(fragments[0])
+            for fragment in fragments[1:]:  # fragments must appear in the same order
+                found = variant.find(fragment, position)
+                if found == -1:
+                    break
+                skipped = variant[position:found]
+                if strict_gaps and (len(skipped) > MAX_GAP_CHARS or re.search(r"\d|[.!?;] ", skipped)):
+                    break
+                position = found + len(fragment)
+            else:
+                return True
     return False
 
 
@@ -88,7 +105,7 @@ def is_grounded(quote: str, value_number: float | None, chunk_text: str) -> bool
     """
     if value_number is None:
         return quote_in_text(quote, chunk_text)
-    return quote_in_text(quote, chunk_text, MIN_NUMERIC_QUOTE_CHARS) and number_appears(value_number, quote)
+    return quote_in_text(quote, chunk_text, MIN_NUMERIC_QUOTE_CHARS, strict_gaps=True) and number_appears(value_number, quote)
 
 
 _FILENAME = re.compile(r"\S+\.(?:pdf|docx|txt)\b", re.IGNORECASE)

@@ -591,8 +591,11 @@ async def test_investigation_reports_document_integrity_through_the_api(client, 
     [integrity] = report["document_integrity"]
     assert (integrity["document"], integrity["document_id"], integrity["level"]) == ("Invoice_205_altered.pdf", altered["id"], "high")
     assert report["requires_human_review"] is True and report["human_review"]["status"] == "pending"
-    amount = next(item for item in report["contradictions"] if item["type"] == "amount_mismatch")
-    assert (amount["value_a"], amount["value_b"]) == (40000, 16000)  # the amount a reader sees, not the covered one
+    # The report works with the amount a reader sees (£16,000), never with the covered one (£10,000).
+    stated = " ".join(finding["statement"] for finding in report["key_findings"])
+    assert "£16,000" in stated and "£10,000" not in stated and "10,000" not in report["summary"]
+    # £16,000 against a contract of £40,000 is not a contradiction: an invoice for less is an instalment.
+    assert [item["type"] for item in report["contradictions"] if item["type"] == "amount_mismatch"] == []
 
     async with get_session_factory()() as session:
         stored = (await session.execute(

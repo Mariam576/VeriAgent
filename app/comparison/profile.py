@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 
 # Raise this number when the way profiles are built changes. Stored profiles
 # with a lower version are rebuilt the next time they are needed.
-PROFILE_VERSION = 1
+PROFILE_VERSION = 2  # 2: adjustments (taxes, discounts, charges), credit notes, negative amounts
 
 PROFILED_TYPES = ("contract", "purchase_order", "invoice")
 REFERENCE_TYPES = ("contract", "purchase_order")  # documents an invoice is checked against
@@ -90,6 +90,15 @@ class DocumentProfile(BaseModel):
     tax: ProfileField | None = None
     payment_terms_days: ProfileField | None = None
     line_items: list[LineItem] = Field(default_factory=list)
+    # Amounts on lines that speak of a tax, a discount, a delivery charge, a deposit ...: everything
+    # that stands between the listed lines and the total. Found by code in the document's text
+    # (app/comparison/adjustments.py), so that "the lines do not add up" is only said when none of
+    # these explains the difference.
+    adjustments: list[ProfileField] = Field(default_factory=list)
+    # The document mentions such an adjustment without an amount ("less 10% discount").
+    unquantified_adjustment: bool = False
+    # A credit note takes money back. It quotes the invoice it corrects, so it must not be checked as an invoice.
+    credit_note: bool = False
 
     def party(self, role: PartyRole) -> ProfileField | None:
         return next((party for party in self.parties if party.role == role), None)

@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 
+from app.comparison.adjustments import find_adjustments, is_credit_note
 from app.comparison.dates import find_dates, months_in_text
 from app.comparison.names import LEGAL_FORMS
 from app.comparison.profile import (
@@ -38,7 +39,7 @@ from app.comparison.profile import (
     ProfileField,
 )
 from app.numbers import NUMBER_CORE, parse_number
-from app.patterns import MONEY, find_amounts, find_payment_terms, money_amount, money_currency, sentence_bounds
+from app.patterns import MONEY, find_amounts, find_payment_terms, iter_segments, money_amount, money_currency, money_readings, sentence_bounds
 from app.rag.loaders import PageText
 from app.security.guardrails import trusted_part
 
@@ -49,25 +50,70 @@ _INVOICE_NUMBER = re.compile(rf"\binvoice\s*{_LABEL}\s*[:#]?\s*{_ID}", re.I)
 _CONTRACT_NUMBER = re.compile(rf"\b(?:contract|agreement)\s*{_LABEL}\s*[:#]?\s*{_ID}", re.I)
 _PO_NUMBER = re.compile(rf"\b(?:purchase\s+order|p\.?o\.?(?![a-z]))\s*{_LABEL}\s*[:#]?\s*{_ID}", re.I)
 # On an invoice the purchase order is often given without "No.": "Purchase order: PO-4421".
-_PO_REFERENCE = re.compile(rf"\b(?:purchase\s+order|p\.?o\.?(?![a-z]))(?:\s*{_LABEL})?\s*[:#]?\s*{_ID}", re.I)
+# The short form needs a label or a separator ("PO No. 4421", "PO: 4421", "P.O. #4421"): "PO16 7GZ" is a postcode.
+_PO_REFERENCE = re.compile(
+    rf"\bpurchase\s+order(?:\s*{_LABEL})?\s*[:#]?\s*{_ID}|\bp\.?o\.?(?![a-z])\s*(?:{_LABEL}\s*[:#]?|[:#])\s*{_ID.replace('P<id>', 'P<id2>')}",
+    re.I,
+)
 
+_CREDIT_NOTE_NUMBER = re.compile(rf"\bcredit\s+(?:note|memo)\s*{_LABEL}?\s*[:#]?\s*{_ID}", re.I)
+
+# A date label counts in this order: first the label that names this kind of document's own date,
+# and only if there is none a bare "Date:" at the start of a line (or "dated ..."). A bare "date"
+# anywhere would also be the end of "Required delivery date:" and "Order date:" on an invoice.
+_BARE_DATE = re.compile(r"(?:(?:^|(?<=[\n.;]))[ \t]*date\s*:\s*|\bdated\s+(?:the\s+)?)", re.I | re.M)
 _DATE_LABELS = {
-    "invoice": re.compile(r"\b(?:invoice\s+date|date\s+of\s+(?:invoice|issue)|issue\s+date|issued(?:\s+on)?|dated?)\s*:?\s*", re.I),
-    "purchase_order": re.compile(r"\b(?:order\s+date|date\s+of\s+order|dated?)\s*:?\s*", re.I),
-    "contract": re.compile(
-        r"\b(?:made|dated|entered\s+into|executed)\s+(?:on\s+|as\s+of\s+)?(?:this\s+)?"
-        r"|\b(?:effective\s+date|agreement\s+date|contract\s+date|date)\s*:\s*",
+    "invoice": [
+        re.compile(r"\b(?:invoice\s+date|date\s+of\s+(?:invoice|issue)|issue\s+date|issued(?:\s+on)?|tax\s+point(?:\s+date)?)\s*:?\s*", re.I),
+        _BARE_DATE,
+    ],
+    "purchase_order": [
+        re.compile(r"\b(?:order\s+date|date\s+of\s+order|p\.?o\.?\s+date|purchase\s+order\s+date|ordered\s+on)\s*:?\s*", re.I),
+        _BARE_DATE,
+    ],
+    "contract": [
+        re.compile(
+            r"\b(?:made|dated|entered\s+into|executed)\s+(?:on\s+|as\s+of\s+)?(?:this\s+)?"
+            r"|\b(?:agreement\s+date|contract\s+date)\s*:\s*",
+            re.I,
+        ),
+        _BARE_DATE,
+    ],
+}
+# The term of a contract. The sentence has to be about the contract itself ("This agreement
+# starts on ...", "The term ends on ..."): "prices are fixed until 31 March" and "invoicing
+# begins on 1 June" also contain a date after "until" and "begins", and say nothing about the term.
+_TERM_SUBJECT = r"(?:agreement|contract|term|engagement|appointment|services?)"
+_TERM_START = [
+    re.compile(r"\b(?:commencement\s+date|start\s+date|effective\s+date)\s*:?\s*(?:is\s+|shall\s+be\s+)?", re.I),
+    re.compile(
+        rf"\b{_TERM_SUBJECT}\b[^.\n]{{0,80}}?\b(?:starts?|commences?|begins?|commencing|starting|effective|takes\s+effect)\s+(?:on\s+|from\s+)?",
         re.I,
     ),
-}
-_TERM_START = re.compile(r"\b(?:starts?|commences?|begins?|commencing|starting|effective)\s+(?:on\s+|from\s+)?", re.I)
-_TERM_END = re.compile(r"\b(?:ends?|expires?|expiring|terminates?|ending|until)\s+(?:on\s+)?", re.I)
+]
+_TERM_END = [
+    re.compile(r"\b(?:expiry\s+date|expiration\s+date|end\s+date|termination\s+date)\s*:?\s*(?:is\s+|shall\s+be\s+)?", re.I),
+    re.compile(
+        rf"\b{_TERM_SUBJECT}\b[^.\n]{{0,80}}?\b(?:ends?|expires?|expiring|terminates?|ending|(?:continues?\s+|runs?\s+)?until)\s+(?:on\s+)?",
+        re.I,
+    ),
+]
+_NOT_THE_TERM = re.compile(r"\b(?:prices?|pricing|rates?|fees?|charges?|quot\w+|offer|valid|fixed|invoic\w+|payments?|deliver\w+|notice|warrant\w+)\b", re.I)
 
 _SUPPLIER_LABELS = ("from", "supplier", "vendor", "seller", "contractor", "service provider", "issued by", "payee")
-_CUSTOMER_LABELS = ("to", "bill to", "billed to", "invoice to", "buyer", "customer", "client", "purchaser", "sold to")
+_CUSTOMER_LABELS = ("to", "bill to", "billed to", "invoice to", "buyer", "customer", "client", "purchaser", "sold to", "ordered by", "ship to", "deliver to")
+# A purchase order is written by the buyer: there "From:" is the customer and "To:" the supplier.
+_SWAPPED_ON_AN_ORDER = {"from": "customer", "to": "supplier"}
+# "To: Accounts Payable, Northwind Facilities Ltd": the department is not the company.
+_DEPARTMENT = re.compile(
+    r"^(?:the\s+)?(?:accounts?(?:\s+(?:payable|receivable))?|finance|purchasing|procurement|billing|payables)"
+    r"(?:\s+(?:department|dept\.?|team|office|manager))?$|^(?:attn\.?|attention|f\.?a\.?o\.?|c/o)\b.*$",
+    re.I,
+)
 _ROLE_WORDS: dict[str, PartyRole] = {
     **{word: "supplier" for word in ("supplier", "vendor", "seller", "contractor", "provider", "service provider", "consultant", "licensor")},
-    **{word: "customer" for word in ("client", "customer", "buyer", "purchaser", "employer", "licensee", "company")},
+    # "the Company" is left out on purpose: half of all contracts call the supplier that, the other half the customer.
+    **{word: "customer" for word in ("client", "customer", "buyer", "purchaser", "employer", "licensee")},
 }
 # A label counts only at the start of a line or sentence: "To: Northwind", not "payable to: ...".
 _PARTY_LABEL = re.compile(
@@ -142,7 +188,7 @@ def _identifier(pattern: re.Pattern[str], pages: list[PageText]) -> ProfileField
     for page, text in _pages(pages):
         match = pattern.search(text)
         if match:
-            value = match.group("id").rstrip(".-/_")[:MAX_IDENTIFIER_CHARS]
+            value = (match.group("id") or match.groupdict().get("id2") or "").rstrip(".-/_")[:MAX_IDENTIFIER_CHARS]
             return ProfileField(text=value, page=page, quote=_clip(match.group(0).rstrip(".")))
     return None
 
@@ -156,21 +202,31 @@ def _date_after(text: str, position: int) -> tuple[list, str, int] | None:
     return None
 
 
-def _labelled_date(pattern: re.Pattern[str], pages: list[PageText]) -> tuple[ProfileField, int, int] | None:
-    """The first date that directly follows one of the labels: (field, page, end index on that page)."""
-    for page, text in _pages(pages):
-        for match in pattern.finditer(text):
-            hit = _date_after(text, match.end())
-            if hit:
-                readings, written, end = hit
-                field = ProfileField(text=written, dates=readings, page=page, quote=_sentence(text, match.start(), end))
-                return field, page, end
+def _labelled_date(
+    patterns: list[re.Pattern[str]], pages: list[PageText], veto: re.Pattern[str] | None = None
+) -> tuple[ProfileField, int, int] | None:
+    """The first date that directly follows a label: (field, page, end index on that page).
+
+    ``patterns`` are tried in order, each over the whole document, so a weaker
+    label is only used when the stronger one occurs nowhere. ``veto``: words
+    that must not stand in the matched label.
+    """
+    for pattern in patterns:
+        for page, text in _pages(pages):
+            for match in pattern.finditer(text):
+                if veto is not None and veto.search(match.group(0)):
+                    continue
+                hit = _date_after(text, match.end())
+                if hit:
+                    readings, written, end = hit
+                    field = ProfileField(text=written, dates=readings, page=page, quote=_sentence(text, match.start(), end))
+                    return field, page, end
     return None
 
 
 def _term(pages: list[PageText]) -> tuple[ProfileField | None, ProfileField | None, ProfileField | None]:
     start = end = months = None
-    found = _labelled_date(_TERM_START, pages)
+    found = _labelled_date(_TERM_START, pages, _NOT_THE_TERM)
     if found:
         start, page, position = found
         text = next(text for number, text in _pages(pages) if number == page)
@@ -181,21 +237,28 @@ def _term(pages: list[PageText]) -> tuple[ProfileField | None, ProfileField | No
                 quote=_sentence(text, position + begin, position + finish),
             )
             break
-    found = _labelled_date(_TERM_END, pages)
+    found = _labelled_date(_TERM_END, pages, _NOT_THE_TERM)
     if found:
         end = found[0]
     return start, end, months
 
 
-def _labelled_parties(pages: list[PageText]) -> list[ProfileField]:
+def _labelled_parties(pages: list[PageText], document_type: str = "invoice") -> list[ProfileField]:
     parties = []
     for page, text in _pages(pages):
         for match in _PARTY_LABEL.finditer(text):
             label = match.group("label").lower()
             name, name_end = _name_at(text, match.end(), soft_stops=False)
-            if len(name) < 2 or not re.search(r"[A-Za-z]", name):
+            # "To: Accounts Payable, Northwind Facilities Ltd": step over the department to the company.
+            for _ in range(2):
+                if not _DEPARTMENT.match(name) or not text.startswith(",", name_end):
+                    break
+                name, name_end = _name_at(text, name_end + 1 + (len(text[name_end + 1:]) - len(text[name_end + 1:].lstrip(" "))), soft_stops=False)
+            if len(name) < 2 or not re.search(r"[A-Za-z]", name) or _DEPARTMENT.match(name):
                 continue
             role: PartyRole = "supplier" if label in _SUPPLIER_LABELS else "customer"
+            if document_type == "purchase_order":
+                role = _SWAPPED_ON_AN_ORDER.get(label, role)  # type: ignore[assignment]
             parties.append(ProfileField(text=name, role=role, page=page, quote=_clip(text[match.start("label") : name_end])))
     return parties
 
@@ -254,8 +317,8 @@ def _amount_fields(pages: list[PageText]) -> tuple[ProfileField | None, ProfileF
                 subtotal = subtotal or field
             elif hit.priority:
                 # A higher-ranked label wins; between equals the larger amount (a total is never smaller than its parts).
-                if best is None or (hit.priority, hit.value) > (best[0], best[1]):
-                    best = (hit.priority, hit.value, field)
+                if best is None or (hit.priority, abs(hit.value)) > (best[0], best[1]):
+                    best = (hit.priority, abs(hit.value), field)
             elif tax is None and _TAX_LABEL.search(hit.before) and re.search(r"[:(%]|\bat\b", hit.before):
                 tax = field
     return (best[2] if best else None), subtotal, tax
@@ -277,26 +340,36 @@ def _cell_number(cell: str) -> float | None:
     return readings[0] if readings else None
 
 
+def _unit_price(price: re.Match[str], quantity: float, stated: float | None) -> float | None:
+    """The price per unit of a "40 items at $205 each" line.
+
+    "$3.459 per gallon" can be read as three dollars and a bit, or as three
+    thousand. A stated line total settles it: the reading that multiplies out
+    to that total is the price. Without one the price stays unread - an
+    unread value means "not checked", a misread one would be a false alarm.
+    """
+    readings = money_readings(price)
+    if len(readings) == 1:
+        return readings[0]
+    if stated is not None:
+        fitting = [reading for reading in readings if abs(quantity * reading - stated) <= 0.011]
+        if len(fitting) == 1:
+            return fitting[0]
+    return None
+
+
 def _line_items(pages: list[PageText]) -> list[LineItem]:
     items: list[LineItem] = []
-    seen: set[tuple[str, float | None, float | None, float | None]] = set()
 
     def add(description: str, quantity: float | None, price: float | None, amount: float | None, unit: str | None, page: int, quote: str) -> None:
         description = " ".join(description.split()).strip(" -:")[:MAX_DESCRIPTION_CHARS]
-        identity = (description.lower(), quantity, price, amount)
-        if len(description) < 3 or identity in seen or len(items) >= MAX_LINE_ITEMS:
+        if len(description) < 3 or len(items) >= MAX_LINE_ITEMS or (quantity is None and price is None and amount is None):
             return
-        seen.add(identity)
+        # Two identical lines are two lines: an invoice may bill the same call-out twice.
         items.append(LineItem(description=description, quantity=quantity, unit_price=price, amount=amount, unit=unit, page=page, quote=_clip(quote)))
 
     for page, text in _pages(pages):
-        # Sentences and lines, one at a time.
-        position = 0
-        while position < len(text):
-            left, right = sentence_bounds(text, position, position)
-            segment = text[left:right]
-            position = right + (2 if text.startswith(". ", right) else 1)
-            stripped = segment.strip(" .\n")
+        for _, _, stripped in iter_segments(text):  # sentences and lines, one at a time
             if not stripped:
                 continue
 
@@ -317,20 +390,28 @@ def _line_items(pages: list[PageText]) -> list[LineItem]:
                 if price and quantity and money_amount(price) is not None:
                     rest = stripped[match.end():]
                     stated = MONEY.search(rest) if re.match(r"\s*[:=,]", rest) else None  # "... each: $8,200"
+                    stated_amount = money_amount(stated) if stated else None
                     add(
-                        match.group("desc"), quantity[0], money_amount(price),
-                        money_amount(stated) if stated else None, money_currency(price) or None, page,
+                        match.group("desc"), quantity[0], _unit_price(price, quantity[0], stated_amount),
+                        stated_amount, money_currency(price) or None, page,
                         stripped[: stated.end() + match.end()] if stated else match.group(0),
                     )
                     continue
 
             # 3. "Description of the work: £12,000"
             amounts = list(MONEY.finditer(stripped))
-            if len(amounts) == 1 and stripped[amounts[0].end():].strip(" .") == "":
-                before = stripped[: amounts[0].start()]
+            if len(amounts) == 1 and stripped[amounts[0].end():].strip(" .)") == "":
+                before = stripped[: amounts[0].start()].rstrip("(-−– ")
                 if re.search(r":\s*$", before) and not _NOT_A_LINE.search(before) and money_amount(amounts[0]) is not None:
                     add(before, None, None, money_amount(amounts[0]), money_currency(amounts[0]) or None, page, stripped)
     return items
+
+
+def enrich(profile: DocumentProfile, pages: list[PageText]) -> DocumentProfile:
+    """Add what code finds in the text of every document, however the rest of the profile was built."""
+    profile.adjustments, profile.unquantified_adjustment = find_adjustments(pages)
+    profile.credit_note = profile.document_type == "invoice" and is_credit_note(pages)
+    return profile
 
 
 def build_profile_with_rules(
@@ -339,7 +420,11 @@ def build_profile_with_rules(
     profile = DocumentProfile(document_id=document_id, filename=filename, document_type=document_type, built_by="rules")
 
     if document_type == "invoice":
-        profile.number = _identifier(_INVOICE_NUMBER, pages)
+        if is_credit_note(pages):
+            # "Credit against Invoice No. INV-300" names the invoice being corrected, not this document.
+            profile.number = _identifier(_CREDIT_NOTE_NUMBER, pages)
+        else:
+            profile.number = _identifier(_INVOICE_NUMBER, pages)
         profile.contract_reference = _identifier(_CONTRACT_NUMBER, pages)
         profile.purchase_order_reference = _identifier(_PO_REFERENCE, pages)
     elif document_type == "purchase_order":
@@ -348,7 +433,7 @@ def build_profile_with_rules(
     else:
         profile.number = _identifier(_CONTRACT_NUMBER, pages)
 
-    parties = _labelled_parties(pages)
+    parties = _labelled_parties(pages, document_type)
     if document_type == "contract" or not parties:
         parties = _contract_parties(pages) or parties
     unique: list[ProfileField] = []
@@ -366,4 +451,4 @@ def build_profile_with_rules(
     profile.payment_terms_days = _payment_terms(pages)
     if document_type != "contract":
         profile.line_items = _line_items(pages)
-    return profile
+    return enrich(profile, pages)

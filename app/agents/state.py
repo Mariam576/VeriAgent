@@ -61,6 +61,8 @@ class InvestigationState(TypedDict, total=False):
     discarded_facts: int  # extracted statements dropped because they were not grounded
     contradictions: list[dict[str, Any]]
     compared_documents: list[str]  # documents whose profiles the last comparison looked at
+    # [invoice id, contract or order id]: pairs the profiles show to be two separate pieces of business
+    unrelated_documents: list[list[str]]
     calculations: list[dict[str, Any]]
     tool_selection_done: bool
     sufficiency: dict[str, Any]
@@ -132,6 +134,7 @@ def initial_state(
         discarded_facts=0,
         contradictions=[],
         compared_documents=[],
+        unrelated_documents=[],
         calculations=[],
         tool_selection_done=False,
         missing_evidence=[],

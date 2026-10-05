@@ -61,7 +61,7 @@ def _differs(name: str, values: list[ProfileField]) -> bool:
             if abs(first.number - other.number) > 0.005 or (first.unit and other.unit and first.unit != other.unit):
                 return True
         elif name in ("supplier", "customer"):
-            if compare_names(first.text, other.text) in ("different", "similar"):
+            if compare_names(first.text, other.text) in ("different", "similar", "short_form"):
                 return True
         elif not same_identifier(first.text, other.text) and (first.text or "").strip().lower() != (other.text or "").strip().lower():
             return True

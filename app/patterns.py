@@ -16,7 +16,7 @@ from app.numbers import NUMBER_CORE, normalize_unit, parse_number
 # A currency marker directly before or after a number token (see app.numbers for the number formats).
 NUMBER = NUMBER_CORE + r"(?![\w]|[.,]\d)"
 MONEY = re.compile(
-    rf"(?P<cur>£|\$|€|₹|\b(?:GBP|USD|EUR|PKR|INR|AED|SAR|Rs\.?))\s?(?P<num>{NUMBER})"
+    rf"(?P<cur>£|\$|€|₹|\b(?:GBP|USD|EUR|PKR|INR|AED|SAR|Rs\.?))\s?(?P<neg>[-−])?(?P<num>{NUMBER})"
     rf"|(?<!\w)(?<!\d[.,])(?P<num2>{NUMBER})\s?(?P<cur2>GBP|USD|EUR|PKR|INR|AED|SAR)\b",
     re.IGNORECASE,
 )
@@ -42,10 +42,44 @@ def money_currency(match: re.Match[str]) -> str:
     return normalize_unit(match.group("cur") or match.group("cur2")) or ""
 
 
+_SIGN_BEFORE = re.compile(r"(?:^|[\s:(=|])[-−–]$")
+
+
+def is_negative(match: re.Match[str]) -> bool:
+    """Is the amount written as negative: "-£1,200", "£-1,200" or, as accountants do, "(£1,200)"?
+
+    A dash only counts as a minus sign when it stands directly in front of the
+    amount and is not part of a word or a range ("A-£5", "£100 - £200").
+    """
+    text = match.string
+    before = text[max(match.start() - 2, 0) : match.start()]
+    if _SIGN_BEFORE.search(before) or match.groupdict().get("neg"):
+        return True
+    return before.endswith("(") and text[match.end() : match.end() + 1] == ")"
+
+
 def money_amount(match: re.Match[str]) -> float | None:
+    """The amount a money match states, negative when it is written as negative."""
     readings = parse_number(match.group("num") or match.group("num2"))
+    if not readings:
+        return None
     # For money, "40.000" means forty thousand (the first reading), not forty.
-    return readings[0] if readings else None
+    return -readings[0] if is_negative(match) else readings[0]
+
+
+def money_readings(match: re.Match[str]) -> list[float]:
+    """Every reading of an ambiguous amount ("3.459": three thousand, or three and a bit)."""
+    sign = -1.0 if is_negative(match) else 1.0
+    return [sign * reading for reading in parse_number(match.group("num") or match.group("num2"))]
+
+
+def iter_segments(text: str):
+    """The sentences and lines of ``text``, one at a time: (start, end, the piece without its edges)."""
+    position = 0
+    while position < len(text):
+        left, right = sentence_bounds(text, position, position)
+        position = right + (2 if text.startswith(". ", right) else 1)
+        yield left, right, text[left:right].strip(" .\n")
 
 
 def sentence_bounds(text: str, start: int, end: int) -> tuple[int, int]:

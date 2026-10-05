@@ -322,6 +322,54 @@ def corpora() -> dict[str, Corpus]:
                 ],
             ),
             Corpus(
+                "part_delivery",
+                [
+                    _doc(
+                        "Purchase_Order_PO-4421.txt",
+                        """PURCHASE ORDER Purchase Order No. PO-4421. Date: 2 March 2026. Buyer: Castlegate Dental
+                        Group. Supplier: Merrow Medical Supplies. 40 sterilisation pouches cartons at £205 each.
+                        Order total: £8,200. Payment terms: 30 days from the date of invoice.""",
+                    ),
+                    _doc(
+                        "Invoice_140.txt",
+                        """INVOICE Invoice No. INV-140. Invoice date: 18 March 2026. From: Merrow Medical Supplies.
+                        To: Castlegate Dental Group. Purchase order: PO-4421. First part delivery. 15
+                        sterilisation pouches cartons at £205 each: £3,075. Total amount due: £3,075. Payment
+                        terms: 30 days from the date of invoice.""",
+                    ),
+                ],
+            ),
+            Corpus(
+                "another_suppliers_invoice",
+                [
+                    _MAINTENANCE_CONTRACT,
+                    _doc(
+                        "Invoice_311.txt",
+                        """INVOICE Invoice No. INV-311. Invoice date: 20 February 2026. From: Redbridge Lifts Ltd.
+                        To: Harlow Print Works Ltd. Contract reference: MC-2026-011. Lift maintenance, annual:
+                        £40,000. Total amount due: £40,000. Payment terms: 30 days from the date of invoice.""",
+                    ),
+                    _doc(
+                        "Invoice_88.txt",
+                        """INVOICE Invoice No. INV-88. Invoice date: 1 March 2026. From: Tolland Electrical Ltd.
+                        To: Harlow Print Works Ltd. Emergency lighting test and repairs at the print works.
+                        Total amount due: £52,000. Payment terms: 30 days from the date of invoice.""",
+                    ),
+                ],
+            ),
+            Corpus(
+                "discount_and_tax",
+                [
+                    _doc(
+                        "Invoice_903.txt",
+                        """INVOICE Invoice No. INV-903. Invoice date: 6 May 2026. From: Kestrel Packaging Ltd.
+                        To: Orchard Foods Ltd. Printed cartons: £600.00. Barcode labels: £400.00. Discount
+                        10%: -£100.00. Subtotal: £900.00. VAT 20%: £180.00. Total amount due: £1,080.00.
+                        Payment terms: 30 days from the date of invoice.""",
+                    )
+                ],
+            ),
+            Corpus(
                 "unit_price",
                 [
                     _doc(
@@ -484,6 +532,28 @@ CASES: list[EvalCase] = [
             ExpectedCall(_PCT, {"old": 120, "new": 135}, 12.5),
         ),
         answer_contains=("£120", "£135"),
+    ),
+    # Ordinary business that must NOT be reported (added after the review of Version 3).
+    EvalCase(
+        "comparison_part_delivery_is_not_a_mismatch", "comparison", "part_delivery",
+        "Does invoice INV-140 match purchase order PO-4421?",
+        statuses=("no_issues_found",), risk_levels=("low",), contradictions=(),
+        note="15 of the 40 cartons ordered are delivered and invoiced, at the ordered price. Billing less is not a finding.",
+    ),
+    EvalCase(
+        "comparison_another_suppliers_invoice_is_left_alone", "comparison", "another_suppliers_invoice",
+        "Does invoice INV-311 match the maintenance contract MC-2026-011?",
+        statuses=("no_issues_found",), risk_levels=("low",), contradictions=(),
+        note=(
+            "Invoice INV-88 is from another supplier, cites no contract and happens to lie in the same library. "
+            "It must not be held against this contract, although its total is above the contract value."
+        ),
+    ),
+    EvalCase(
+        "comparison_discount_and_tax_explain_the_total", "comparison", "discount_and_tax",
+        "Check invoice INV-903 for errors.",
+        statuses=("no_issues_found",), risk_levels=("low",), contradictions=(),
+        note="Lines of £1,000, a discount of £100 and VAT of £180 give the stated £1,080: the page explains itself.",
     ),
     # ------------------------------------------------------------- forensics
     EvalCase(
