@@ -17,13 +17,13 @@ from fastapi.responses import JSONResponse
 from app.agents.checkpoint import close_checkpointer, get_checkpointer
 from app.agents.service import reset_graph
 from app.api import chat, documents, health, investigations, memory
+from app.api.sse import error_payload
 from app.config import get_settings
 from app.database.session import dispose_engine, init_db
 from app.embeddings.base import EmbeddingError
 from app.errors import AppError
-from app.llm.base import LLMConfigurationError, LLMError
+from app.llm.base import LLMError
 from app.logging_config import configure_logging
-from app.security.guardrails import redact_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -62,33 +62,18 @@ def create_app() -> FastAPI:
     )
 
     @app.exception_handler(AppError)
-    async def handle_app_error(_: Request, exc: AppError) -> JSONResponse:
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"error": {"code": exc.code, "message": exc.message}},
-        )
-
     @app.exception_handler(LLMError)
-    async def handle_llm_error(_: Request, exc: LLMError) -> JSONResponse:
-        code = "llm_not_configured" if isinstance(exc, LLMConfigurationError) else "llm_unavailable"
-        message = redact_secrets(str(exc), get_settings())  # provider errors must never leak a key
-        return JSONResponse(status_code=503, content={"error": {"code": code, "message": message}})
-
     @app.exception_handler(EmbeddingError)
-    async def handle_embedding_error(_: Request, exc: EmbeddingError) -> JSONResponse:
-        return JSONResponse(
-            status_code=503,
-            content={"error": {"code": "embeddings_unavailable", "message": redact_secrets(str(exc), get_settings())}},
-        )
+    async def handle_known_error(_: Request, exc: Exception) -> JSONResponse:
+        status_code, payload = error_payload(exc)
+        return JSONResponse(status_code=status_code, content={"error": payload})
 
     @app.exception_handler(Exception)
     async def handle_unexpected_error(_: Request, exc: Exception) -> JSONResponse:
         # Log everything, tell the client nothing internal.
         logger.exception("Unhandled error: %s", exc)
-        return JSONResponse(
-            status_code=500,
-            content={"error": {"code": "internal_error", "message": "Something went wrong on the server."}},
-        )
+        status_code, payload = error_payload(exc)
+        return JSONResponse(status_code=status_code, content={"error": payload})
 
     app.include_router(health.router)
     app.include_router(documents.router)

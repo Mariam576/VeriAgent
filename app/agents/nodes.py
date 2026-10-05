@@ -43,6 +43,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.config import get_stream_writer
 from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
 
@@ -127,6 +128,7 @@ def traced(name: str) -> Callable[[NodeFunction], NodeFunction]:
         async def wrapper(self: Any, state: InvestigationState) -> dict[str, Any]:
             investigation = state.get("investigation_id", "-")
             logger.info("node_entered node=%s investigation=%s iteration=%s", name, investigation, state.get("iteration", 0))
+            _announce(name)
             started = time.perf_counter()
             try:
                 update = await function(self, state)
@@ -150,6 +152,42 @@ def traced(name: str) -> Callable[[NodeFunction], NodeFunction]:
         return wrapper
 
     return decorator
+
+
+# What the user sees while a node is working. None = nothing worth announcing.
+STAGE_LABELS: dict[str, str | None] = {
+    "load_memory": "Checking memory...",
+    "analyze_request": "Analyzing request...",
+    "retrieve": "Searching documents...",
+    "extract_evidence": "Reading the evidence...",
+    "detect_contradictions": "Checking contradictions...",
+    "calculate": "Calculating differences...",
+    "check_sufficiency": "Checking whether the evidence is sufficient...",
+    "assess_risk": "Assessing risk...",
+    "review_findings": "Reviewing findings...",
+    "correct_findings": "Correcting findings...",
+    "human_approval": None,
+    "final_report": "Generating report...",
+    "save_memory": None,
+}
+
+
+def _announce(node: str) -> None:
+    """Tell a streaming client that a node has started.
+
+    Concept - streaming from inside a node:
+        ``get_stream_writer()`` returns a function that pushes a value into
+        the graph's "custom" stream. Whoever iterates ``graph.astream(...,
+        stream_mode=["updates", "custom"])`` receives it immediately, while
+        the node is still working. Only the node's name is sent - never
+        prompts, model output or document text.
+    """
+    if STAGE_LABELS.get(node) is None:
+        return
+    try:
+        get_stream_writer()({"type": "node_started", "node": node})
+    except Exception:  # noqa: BLE001 - not inside a streamed graph run (e.g. a unit test calling the node directly)
+        pass
 
 
 def event(node: str, message: str) -> dict[str, Any]:

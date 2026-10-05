@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncIterator
+from typing import Any
 
 from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
 
-from app.agents.service import decide_investigation, resume_investigation, run_investigation
+from app.agents.service import decide_investigation, resume_investigation, run_investigation, stream_investigation
+from app.api.sse import sse_response
 from app.database import repositories
+from app.database.session import get_session_factory
 from app.errors import NotFound
 from app.schemas.response import (
     ApprovalRequest,
@@ -43,6 +48,57 @@ async def create_investigation(request: InvestigationRequest, user: CurrentUser,
         year=request.year,
     )
     return report
+
+
+def investigation_event(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """A service event as an SSE (event name, JSON data) pair."""
+    kind = item["type"]
+    if kind == "started":
+        return "started", {"investigation_id": str(item["investigation"].id)}
+    if kind == "report":
+        return "report", item["report"].model_dump(mode="json")
+    return kind, {key: value for key, value in item.items() if key != "type"}
+
+
+@router.post("/stream", response_class=StreamingResponse)
+async def stream_new_investigation(request: InvestigationRequest, user: CurrentUser) -> StreamingResponse:
+    """Run an investigation and stream its progress as Server-Sent Events.
+
+    Events, in order: ``started`` (the investigation id), any number of
+    ``progress`` and ``tool`` events, then ``report`` with the full report -
+    or ``error`` if something failed on the way. The report is the same as
+    from ``POST /investigations`` and is stored the same way.
+    """
+    # A streamed response outlives the request handler, so it gets its own
+    # database session, closed when the stream ends or the client disconnects.
+    session = get_session_factory()()
+    events = stream_investigation(
+        session,
+        user=user,
+        question=request.question,
+        document_ids=request.document_ids,
+        document_type=request.document_type,
+        year=request.year,
+    )
+    try:
+        # Input validation happens before the first event. Pulling it here means
+        # an invalid request still gets a normal 400/404 response, not a stream.
+        first = await events.__anext__()
+    except BaseException:
+        await events.aclose()
+        await session.close()
+        raise
+
+    async def body() -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        try:
+            yield investigation_event(first)
+            async for item in events:
+                yield investigation_event(item)
+        finally:
+            await events.aclose()
+            await session.close()
+
+    return sse_response(body())
 
 
 @router.post("/{investigation_id}/approve", response_model=InvestigationReport)

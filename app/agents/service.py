@@ -37,7 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.checkpoint import get_checkpointer
 from app.agents.graph import build_investigation_graph, recursion_limit
-from app.agents.nodes import AgentDeps
+from app.agents.nodes import STAGE_LABELS, AgentDeps
 from app.agents.report import findings_for_storage, render_report
 from app.agents.state import initial_state
 from app.config import get_settings
@@ -129,8 +129,11 @@ async def _run(
     ``Command(resume=...)`` to deliver a human decision, or ``None`` to
     continue from the last checkpoint.
 
-    Yields ``{"type": "progress", ...}`` events and finally
-    ``{"type": "report", "report": InvestigationReport}``.
+    Yields ``{"type": "progress", "node", "message"}`` and
+    ``{"type": "tool", "tool_name", "status"}`` events while the graph works,
+    and finally ``{"type": "report", "report": InvestigationReport}``.
+    Progress messages are fixed, safe sentences; the model's reasoning is
+    never streamed.
     """
     key = str(investigation.id)
     if key in _active:
@@ -163,12 +166,28 @@ async def _run_exclusive(
             # Nothing left to run: the graph finished, only storing the result was cut off.
             skip = not before.next
         if not skip:
-            async for chunk in graph.astream(graph_input, config=config, stream_mode="updates"):
+            # Two streams at once: "custom" carries "node X started" (sent by the node
+            # itself while it works), "updates" carries what each node returned.
+            announced: dict[str, str] = {}
+            async for mode, chunk in graph.astream(graph_input, config=config, stream_mode=["updates", "custom"]):
+                if mode == "custom":
+                    if isinstance(chunk, dict) and chunk.get("type") == "node_started":
+                        node = str(chunk.get("node", ""))
+                        label = STAGE_LABELS.get(node)
+                        if label:
+                            announced[node] = label
+                            yield {"type": "progress", "node": node, "message": label}
+                    continue
                 for node, update in chunk.items():
                     if not isinstance(update, dict):
                         continue  # e.g. the "__interrupt__" marker
                     for item in update.get("events", []):
-                        yield {"type": "progress", "node": item.get("node", node), "message": item.get("message", "")}
+                        message = item.get("message", "")
+                        if message and message != announced.get(node):  # do not repeat the "started" line
+                            yield {"type": "progress", "node": item.get("node", node), "message": message}
+                    for call in update.get("tool_calls", []):
+                        yield {"type": "tool", "tool_name": str(call.get("tool_name", ""))[:100], "status": call.get("status", "")}
+                    announced.pop(node, None)
         snapshot = await graph.aget_state(config)
         waiting = _waiting_requests(snapshot)
         state = snapshot.values

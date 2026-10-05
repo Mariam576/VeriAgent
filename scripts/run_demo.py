@@ -16,11 +16,15 @@ Human approval
     python -m scripts.run_demo --decision approve --note "Checked with procurement"
     python -m scripts.run_demo --decision modify --action "Pay 40,000 and dispute the rest"
     python -m scripts.run_demo --decision skip      (leave it waiting)
+
+Progress is shown live through the streaming endpoint; --no-stream waits for
+the finished report instead.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -34,6 +38,32 @@ SAMPLE_FILES = ["Contract.pdf", "Invoice_102.pdf", "Procurement_Policy.pdf"]
 def fail(message: str) -> int:
     print(f"\nERROR: {message}")
     return 1
+
+
+def stream_investigation(client: httpx.Client, question: str) -> tuple[dict | None, str]:
+    """Run the investigation through the streaming endpoint and print progress as it arrives.
+
+    Returns (report, "") or (None, what went wrong).
+    """
+    with client.stream("POST", "/investigations/stream", json={"question": question}) as response:
+        if response.status_code != 200:
+            response.read()
+            return None, f"{response.status_code} {response.text}"
+        event_name, report = "", None
+        for line in response.iter_lines():
+            if line.startswith("event: "):
+                event_name = line[len("event: "):]
+            elif line.startswith("data: "):
+                data = json.loads(line[len("data: "):])
+                if event_name == "progress":
+                    print(f"  - {data['message']}")
+                elif event_name == "tool":
+                    print(f"      tool {data['tool_name']}: {data['status']}")
+                elif event_name == "report":
+                    report = data
+                elif event_name == "error":
+                    return None, data.get("message", "unknown error")
+    return (report, "") if report else (None, "the stream ended without a report")
 
 
 def print_report(report: dict) -> None:
@@ -70,6 +100,7 @@ def main() -> int:
     parser.add_argument("--user", default="demo-user", help="Value for the X-User-Id header.")
     parser.add_argument("--question", default=DEFAULT_QUESTION)
     parser.add_argument("--with-injection", action="store_true", help="Also upload a note containing a prompt-injection attempt.")
+    parser.add_argument("--no-stream", action="store_true", help="Wait for the result instead of showing live progress.")
     parser.add_argument("--decision", choices=["approve", "reject", "modify", "skip"], help="Answer the approval request without asking.")
     parser.add_argument("--note", default=None, help="Reason for the decision (shown in the final report).")
     parser.add_argument("--action", default=None, help="For --decision modify: the recommendation to use instead.")
@@ -106,10 +137,16 @@ def main() -> int:
             print(f"  {document['filename']:<26} type={document['document_type']:<10} {note}")
 
         print(f"\nQuestion: {args.question}\nInvestigating...\n")
-        response = client.post("/investigations", json={"question": args.question})
-        if response.status_code != 201:
-            return fail(f"Investigation failed: {response.status_code} {response.text}")
-        report = response.json()
+        if args.no_stream:
+            response = client.post("/investigations", json={"question": args.question})
+            if response.status_code != 201:
+                return fail(f"Investigation failed: {response.status_code} {response.text}")
+            report = response.json()
+        else:
+            report, problem = stream_investigation(client, args.question)
+            if report is None:
+                return fail(f"Investigation failed: {problem}")
+            print()
 
         if report["human_review"]["status"] == "pending":
             print_report(report)
