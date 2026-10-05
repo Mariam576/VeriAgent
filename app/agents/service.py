@@ -40,7 +40,12 @@ def get_graph() -> CompiledStateGraph:
     """Build the graph once and reuse it. It holds no per-request data; that lives in the state."""
     deps = AgentDeps(
         llm=get_llm(),
-        retriever=PgVectorRetriever(get_session_factory(), get_embedding_provider()),
+        retriever=PgVectorRetriever(
+            get_session_factory(),
+            get_embedding_provider(),
+            hybrid=get_settings().HYBRID_SEARCH,
+            keyword_top_k=get_settings().KEYWORD_TOP_K,
+        ),
         settings=get_settings(),
     )
     return build_investigation_graph(deps)

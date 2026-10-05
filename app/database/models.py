@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, Uuid
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, Uuid, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -98,6 +98,12 @@ class DocumentChunk(Base):
             postgresql_using="hnsw",
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
+        # GIN index over the words of each chunk, for keyword search.
+        Index(
+            "ix_document_chunks_content_fts",
+            text("to_tsvector('english', content)"),
+            postgresql_using="gin",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -131,6 +137,10 @@ class Investigation(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # The full structured report, so GET /investigations/{id} can return it later.
     report: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # Human-in-the-loop: not_required | pending | approved | rejected | modified
+    approval_status: Mapped[str] = mapped_column(String(20), default="not_required", server_default="not_required")
+    approval_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     findings: Mapped[list["Finding"]] = relationship(
         back_populates="investigation", cascade="all, delete-orphan", order_by="Finding.position"

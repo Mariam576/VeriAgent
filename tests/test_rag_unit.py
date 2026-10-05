@@ -150,3 +150,36 @@ def test_number_helpers_are_shared_with_the_rest_of_the_app():
     assert parse_number("1,50,000") == [150000.0]
     assert number_appears(150000, "Rs. 1,50,000")
     assert normalize_unit("pounds sterling") == "GBP"
+
+
+# ------------------------------------------------------------ hybrid search
+def test_keyword_terms_separate_words_from_exact_codes():
+    from app.rag.hybrid import keyword_terms, to_websearch_query
+
+    words, identifiers = keyword_terms("What does Clause 7.3 say about invoice INV-102 and PO-4421 in 2026?")
+    assert identifiers == ["7.3", "inv-102", "po-4421"]
+    assert words == ["clause", "say", "invoice", "2026"]
+    assert to_websearch_query(identifiers) == '"7.3" or "inv-102" or "po-4421"'
+    assert keyword_terms("the of and is") == ([], [])
+
+
+def test_keyword_terms_cannot_carry_query_syntax():
+    from app.rag.hybrid import keyword_terms, to_websearch_query
+
+    words, identifiers = keyword_terms("payment'); DROP TABLE users; -- \"terms\" | & ! <-> :*")
+    assert words == ["payment", "drop", "table", "users", "terms"] and identifiers == []
+    assert to_websearch_query(words) == '"payment" or "drop" or "table" or "users" or "terms"'
+
+
+def test_rank_fusion_rewards_chunks_found_by_both_searches():
+    from app.rag.hybrid import reciprocal_rank_fusion
+
+    a, b, c, d = (chunk(name, "doc", "t", 0.5) for name in "abcd")
+    fused = reciprocal_rank_fusion(vector_hits=[a, b, c], keyword_hits=[c, d], limit=10)
+    assert [item.chunk_id for item in fused][0] == "c"  # rank 3 + rank 1 beats rank 1 alone
+    by_id = {item.chunk_id: item for item in fused}
+    assert by_id["c"].matched_by == ["vector", "keyword"]
+    assert by_id["a"].matched_by == ["vector"] and by_id["d"].matched_by == ["keyword"]
+    assert by_id["c"].fused_score > by_id["a"].fused_score > by_id["b"].fused_score
+    assert len(reciprocal_rank_fusion([a, b, c], [c, d], limit=2)) == 2
+    assert reciprocal_rank_fusion([], [], limit=5) == []

@@ -52,6 +52,9 @@ class RetrievedChunk(BaseModel):
     chunk_index: int = 0
     text: str
     score: float = 0.0  # vector similarity, 1.0 = identical direction
+    keyword_score: float = 0.0  # full-text rank; 0 when the keyword search did not return this chunk
+    fused_score: float = 0.0  # reciprocal rank fusion of the vector and keyword rankings
+    matched_by: list[str] = Field(default_factory=list)  # "vector", "keyword" or both
     rerank_score: float = 0.0
     ref: str = ""  # short alias used in prompts, e.g. "C3"
     injection_suspected: bool = False

@@ -52,12 +52,13 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 
 async def init_db() -> None:
-    """Enable pgvector and create tables that do not exist yet.
+    """Enable pgvector, create missing tables, then upgrade tables that already exist.
 
-    Version 1 keeps this simple with ``create_all``. When the schema starts to
-    change between releases, switch to Alembic migrations.
+    ``create_all`` only creates tables that are missing. Changes to existing
+    tables are applied by the small migration list in ``migrations.py``.
     """
     from app.database import models  # noqa: F401  (registers the tables on Base)
+    from app.database.migrations import run_migrations
     from app.database.models import Base
 
     settings = get_settings()
@@ -81,6 +82,7 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
+        await run_migrations(conn)
 
         # The vector column has a fixed size. If someone changes EMBEDDING_DIM
         # after the table exists, inserts would fail with a confusing error,

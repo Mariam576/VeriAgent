@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     RAG_TOP_K: int = Field(default=8, ge=1, le=50)
     RERANK_TOP_K: int = Field(default=4, ge=1, le=50)
     MAX_RETRIEVED_CHUNKS: int = Field(default=12, ge=1, le=60)
+    # Hybrid search: combine vector similarity with keyword matching.
+    HYBRID_SEARCH: bool = True
+    KEYWORD_TOP_K: int = Field(default=8, ge=1, le=50)
 
     # ---------------------------------------------------------------- Agent
     MAX_AGENT_ITERATIONS: int = Field(default=6, ge=1, le=20)
