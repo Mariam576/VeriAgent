@@ -1,4 +1,8 @@
-"""Test doubles for the agent: an in-memory retriever and scripted LLMs."""
+"""Test doubles for the agent: an in-memory memory store and scripted LLMs.
+
+The in-memory retriever lives in ``app/evaluation/corpus.py`` because the
+evaluation suite uses it too; it is re-exported here for the tests.
+"""
 
 from __future__ import annotations
 
@@ -13,54 +17,8 @@ from app.agents.nodes import AgentDeps
 from app.agents.state import initial_state
 from app.config import Settings, get_settings
 from app.embeddings.hash_embeddings import HashEmbeddingProvider
+from app.evaluation.corpus import InMemoryRetriever
 from app.llm.base import BaseLLM, LLMUnavailableError, ToolCallRequest
-from app.rag.chunking import chunk_pages
-from app.rag.loaders import guess_document_type, load_pages
-from app.rag.reranker import rerank
-from app.rag.retriever import SearchFilters
-from app.schemas.investigation import RetrievedChunk
-
-
-class InMemoryRetriever:
-    """Same interface as PgVectorRetriever, but everything lives in a Python list."""
-
-    def __init__(self) -> None:
-        self._embedder = HashEmbeddingProvider(256)
-        self._chunks: list[tuple[RetrievedChunk, list[float]]] = []
-        self.queries: list[str] = []
-        self.fail = False
-
-    def add_text(self, filename: str, pages: list[str], document_type: str | None = None) -> None:
-        from app.rag.loaders import PageText
-
-        page_objects = [PageText(page_number=i, text=text) for i, text in enumerate(pages, start=1)]
-        doc_type = document_type or guess_document_type(filename, pages[0] if pages else "")
-        for chunk in chunk_pages(page_objects, 800, 120):
-            record = RetrievedChunk(
-                chunk_id=f"{filename}#{chunk.chunk_index}", document_id=f"doc:{filename}", filename=filename,
-                document_type=doc_type, page=chunk.page_number, chunk_index=chunk.chunk_index, text=chunk.text,
-            )
-            self._chunks.append((record, self._embedder.embed_text(chunk.text)))
-
-    def add_file(self, path: Path, document_type: str | None = None) -> None:
-        pages = load_pages(path.read_bytes(), path.suffix.lower())
-        self.add_text(path.name, [page.text for page in pages], document_type)
-
-    async def search(
-        self, user_id: str, query: str, *, top_k: int, rerank_top_k: int, filters: SearchFilters | None = None
-    ) -> list[RetrievedChunk]:
-        self.queries.append(query)
-        if self.fail:
-            raise ConnectionError("vector store is down")
-        query_vector = self._embedder.embed_text(query)
-        scored = []
-        for chunk, vector in self._chunks:
-            if filters and filters.document_ids and chunk.document_id not in filters.document_ids:
-                continue
-            score = sum(a * b for a, b in zip(query_vector, vector))
-            scored.append(chunk.model_copy(update={"score": round(score, 6)}))
-        scored.sort(key=lambda c: c.score, reverse=True)
-        return rerank(query, scored[:top_k], rerank_top_k)
 
 
 class InMemoryMemoryStore:
