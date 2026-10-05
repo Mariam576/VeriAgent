@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.agents.checkpoint import close_checkpointer, get_checkpointer, purge_stale_checkpoints
+from app.agents.checkpoint import close_checkpointer, get_checkpointer
 from app.agents.service import reset_graph
 from app.api import actions, auth, chat, comparisons, documents, health, investigations, memory
 from app.api.sse import error_payload
@@ -24,7 +24,9 @@ from app.database.session import dispose_engine, init_db
 from app.embeddings.base import EmbeddingError
 from app.errors import AppError
 from app.llm.base import LLMError
+from app.jobs import get_jobs
 from app.logging_config import configure_logging
+from app.maintenance import run_maintenance
 from app.security.guardrails import redact_secrets
 
 logger = logging.getLogger(__name__)
@@ -44,8 +46,12 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         settings.EMBEDDING_PROVIDER,
     )
     await get_checkpointer()  # opens its connection pool and creates the checkpoint tables
-    await purge_stale_checkpoints()
+    await run_maintenance()
+    jobs = get_jobs()
+    if settings.MAINTENANCE_INTERVAL_MINUTES > 0:
+        jobs.every("maintenance", settings.MAINTENANCE_INTERVAL_MINUTES * 60, run_maintenance)
     yield
+    await jobs.shutdown()  # let a document that is being processed finish, within reason
     reset_graph()
     await close_checkpointer()
     await dispose_engine()

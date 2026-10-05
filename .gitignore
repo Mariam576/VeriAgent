@@ -28,3 +28,6 @@ Thumbs.db
 
 # Git history hand-over file (see the chat instructions); not part of the project
 *.bundle
+
+# Tickets created by the built-in action server
+data/

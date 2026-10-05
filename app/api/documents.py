@@ -7,13 +7,14 @@ import uuid
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, File, Form, Response, UploadFile
+from fastapi import APIRouter, File, Form, Query, Response, UploadFile
 
 from app.config import get_settings
 from app.database import repositories
 from app.embeddings.factory import get_embedding_provider
 from app.errors import FileTooLarge, NotFound
-from app.rag.ingestion import ingest_document
+from app.jobs import get_jobs
+from app.rag.ingestion import ingest_document, process_in_background, register_document
 from app.comparison.profile import PROFILED_TYPES
 from app.comparison.service import NOT_PROFILED
 from app.comparison.store import get_profile_store
@@ -26,15 +27,26 @@ from app.security.validation import validate_document_type
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 
-@router.post("/upload", response_model=DocumentOut, status_code=201)
+@router.post("/upload", response_model=DocumentOut, status_code=201, responses={202: {"model": DocumentOut}})
 async def upload_document(
+    response: Response,
     user: CurrentUser,
     session: DbSession,
     file: Annotated[UploadFile, File(description="PDF, DOCX or TXT")],
     document_type: Annotated[
         str | None, Form(description="Optional: contract, invoice, policy, ... Guessed when omitted.")
     ] = None,
+    background: Annotated[
+        bool, Query(description="true = answer at once with status 'processing' (202) and finish in the background.")
+    ] = False,
 ) -> DocumentOut:
+    """Upload a document.
+
+    By default the answer comes when the document is ready to be searched
+    (201). With ``?background=true`` the file is checked, the answer comes at
+    once (202, status "processing") and the reading and embedding happen
+    afterwards: ask ``GET /documents/{id}`` until the status is "ready" or "failed".
+    """
     settings = get_settings()
     # Read at most one byte more than the limit, so a huge upload is rejected
     # without loading all of it into memory.
@@ -42,12 +54,32 @@ async def upload_document(
     if len(data) > settings.max_upload_bytes:
         raise FileTooLarge(f"The file is larger than the {settings.MAX_UPLOAD_MB} MB limit.")
 
+    document_type = validate_document_type(document_type)
+    if background:
+        registered = await register_document(
+            session, user=user, filename=file.filename, data=data, document_type=document_type,
+            settings=settings, embedder=get_embedding_provider(),
+        )
+        out = DocumentOut.model_validate(registered.document)
+        out.chunk_count, out.duplicate = registered.chunk_count, registered.duplicate
+        if not registered.duplicate:
+            document_id, extension, path = registered.document.id, registered.extension, registered.path
+            get_jobs().submit(
+                f"document:{document_id}",
+                lambda: process_in_background(
+                    document_id=document_id, data=data, extension=extension, path=path, document_type=document_type,
+                ),
+            )
+        if out.status == "processing":
+            response.status_code = 202
+        return out
+
     result = await ingest_document(
         session,
         user=user,
         filename=file.filename,
         data=data,
-        document_type=validate_document_type(document_type),
+        document_type=document_type,
         settings=settings,
         embedder=get_embedding_provider(),
     )
@@ -72,6 +104,20 @@ async def list_documents(user: CurrentUser, session: DbSession) -> DocumentList:
             out.integrity_level, out.integrity_score = levels[document.id]
         documents.append(out)
     return DocumentList(documents=documents)
+
+
+@router.get("/{document_id}", response_model=DocumentOut)
+async def get_document(document_id: uuid.UUID, user: CurrentUser, session: DbSession) -> DocumentOut:
+    """One of your documents. Use it to wait for a background upload: status processing -> ready or failed."""
+    document = await repositories.get_document(session, user.id, document_id)
+    if document is None:
+        raise NotFound("Document not found.")
+    out = DocumentOut.model_validate(document)
+    out.chunk_count = await repositories.count_chunks(session, document.id)
+    levels = await repositories.integrity_levels(session, [document.id])
+    if document.id in levels:
+        out.integrity_level, out.integrity_score = levels[document.id]
+    return out
 
 
 @router.get("/{document_id}/profile", response_model=ProfileOut)

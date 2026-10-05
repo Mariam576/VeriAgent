@@ -2,6 +2,11 @@
 
     validate -> save metadata -> extract text (keep page numbers) -> clean
     -> inspect the file for signs of editing -> chunk -> embed -> store chunks in pgvector
+
+It has a quick part (``register_document``: validate, write the row) and a
+slow part (``process_document``: everything after that). An upload can run
+both inside the request, or answer after the quick part and leave the slow
+part to a background job (see app/jobs.py).
 """
 
 from __future__ import annotations
@@ -11,6 +16,7 @@ import hashlib
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -54,7 +60,18 @@ def _extract_and_chunk(
     return pages, chunk_pages(pages, chunk_size, chunk_overlap), guess_year(full_text), document_type, forensics
 
 
-async def ingest_document(
+@dataclass
+class Registered:
+    """A file that passed validation and has its row in the database."""
+
+    document: Document
+    extension: str
+    path: Path
+    duplicate: bool = False
+    chunk_count: int = 0
+
+
+async def register_document(
     session: AsyncSession,
     *,
     user: User,
@@ -63,7 +80,8 @@ async def ingest_document(
     document_type: str | None,
     settings: Settings,
     embedder: EmbeddingProvider,
-) -> IngestionResult:
+) -> Registered:
+    """The quick part of an upload: validate the file and write its row (status "processing")."""
     # 1. Validate (extension allowlist, size limit, real file format).
     safe_name, extension = validate_upload(filename, data, settings)
 
@@ -71,9 +89,13 @@ async def ingest_document(
     file_hash = hashlib.sha256(data).hexdigest()
     existing = await repositories.get_document_by_hash(session, user.id, file_hash)
     if existing is not None:
+        path = Path(settings.UPLOAD_DIR) / str(user.id) / f"{existing.id}{extension}"
         if existing.status == "ready" and existing.embedding_model == embedder.model_id:
             chunk_counts = dict((doc.id, count) for doc, count in await repositories.list_documents(session, user.id))
-            return IngestionResult(existing, chunk_counts.get(existing.id, 0), duplicate=True)
+            return Registered(existing, extension, path, duplicate=True, chunk_count=chunk_counts.get(existing.id, 0))
+        age = datetime.now(timezone.utc) - existing.uploaded_at
+        if existing.status == "processing" and age < timedelta(minutes=settings.DOCUMENT_PROCESSING_TIMEOUT_MINUTES):
+            return Registered(existing, extension, path, duplicate=True)  # the same upload is still being worked on
         # A failed attempt, or vectors from a different embedding model: start again.
         await repositories.delete_document(session, existing)
 
@@ -89,27 +111,56 @@ async def ingest_document(
     )
     session.add(document)
     await session.commit()
-    document_id = document.id
     # The stored path uses the generated id, never the user's file name.
-    path = Path(settings.UPLOAD_DIR) / str(user.id) / f"{document_id}{extension}"
+    return Registered(document, extension, Path(settings.UPLOAD_DIR) / str(user.id) / f"{document.id}{extension}")
 
+
+async def process_document(
+    session: AsyncSession,
+    *,
+    document_id: uuid.UUID,
+    data: bytes,
+    extension: str,
+    path: Path,
+    document_type: str | None,
+    settings: Settings,
+    embedder: EmbeddingProvider,
+) -> IngestionResult:
+    """The slow part of an upload: read, inspect, chunk, embed and store.
+
+    Runs inside the request (the default) or as a background job. Either way
+    the outcome is written to the document's row: "ready", or "failed" with
+    the reason.
+    """
+    document = await session.get(Document, document_id)
+    if document is None:
+        raise DocumentProcessingError("The document was deleted before it could be processed.")
+    safe_name = document.filename
     try:
         await asyncio.to_thread(_write_file, path, data)
 
         # 4. Extract and clean text page by page, then 5. chunk it. Parsing is
         #    CPU work, so it runs in a worker thread instead of blocking the event loop.
-        pages, chunks, year, document.document_type, forensics = await asyncio.to_thread(
+        pages, chunks, year, kind, forensics = await asyncio.to_thread(
             _extract_and_chunk, data, extension, safe_name, document_type, settings.CHUNK_SIZE,
             settings.CHUNK_OVERLAP, settings.ENABLE_FORENSICS,
         )
         if not chunks:
             raise DocumentProcessingError("The document contains no text to index.")
 
-        # 6. Embed, in batches.
+        # 6. Embed, in batches. (No database connection is held while waiting for the embedding provider.)
+        await session.rollback()
         vectors: list[list[float]] = []
         for start in range(0, len(chunks), EMBED_BATCH_SIZE):
             batch = [chunk.text for chunk in chunks[start : start + EMBED_BATCH_SIZE]]
             vectors.extend(await embedder.aembed_documents(batch))
+
+        # The document may have been deleted while it was being read (a background job takes a while).
+        document = await session.get(Document, document_id)
+        if document is None:
+            await asyncio.to_thread(path.unlink, True)
+            raise DocumentProcessingError("The document was deleted before it could be processed.")
+        document.document_type = kind
 
         # 7. Store chunks + vectors + metadata. Source information is never lost.
         for chunk, vector in zip(chunks, vectors, strict=True):
@@ -143,6 +194,9 @@ async def ingest_document(
         document.page_count = len(pages)
         document.status = "ready"
         await session.commit()
+        if not settings.KEEP_UPLOADED_FILES:
+            # Everything the application needs is in the database now (text, vectors, inspection result).
+            await asyncio.to_thread(path.unlink, True)
         logger.info(
             "document_ingested id=%s type=%s pages=%d chunks=%d",
             document.id, document.document_type, len(pages), len(chunks),
@@ -170,3 +224,43 @@ async def ingest_document(
             await session.commit()
         await asyncio.to_thread(path.unlink, True)
         raise error from exc
+
+
+async def ingest_document(
+    session: AsyncSession,
+    *,
+    user: User,
+    filename: str | None,
+    data: bytes,
+    document_type: str | None,
+    settings: Settings,
+    embedder: EmbeddingProvider,
+) -> IngestionResult:
+    """Upload and process a document in one go (both parts inside the caller's request)."""
+    registered = await register_document(
+        session, user=user, filename=filename, data=data, document_type=document_type, settings=settings, embedder=embedder,
+    )
+    if registered.duplicate:
+        return IngestionResult(registered.document, registered.chunk_count, duplicate=True)
+    return await process_document(
+        session, document_id=registered.document.id, data=data, extension=registered.extension, path=registered.path,
+        document_type=document_type, settings=settings, embedder=embedder,
+    )
+
+
+async def process_in_background(
+    *, document_id: uuid.UUID, data: bytes, extension: str, path: Path, document_type: str | None,
+) -> None:
+    """The job behind ``POST /documents/upload?background=true``. Its result is the document's status."""
+    from app.config import get_settings
+    from app.database.session import get_session_factory
+    from app.embeddings.factory import get_embedding_provider
+
+    async with get_session_factory()() as session:
+        try:
+            await process_document(
+                session, document_id=document_id, data=data, extension=extension, path=path,
+                document_type=document_type, settings=get_settings(), embedder=get_embedding_provider(),
+            )
+        except AppError as exc:
+            logger.info("background_ingestion_failed id=%s reason=%s", document_id, exc.message)  # already stored on the row

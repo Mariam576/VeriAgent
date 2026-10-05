@@ -156,6 +156,11 @@ async def delete_user(session: AsyncSession, user_id: uuid.UUID) -> None:
 
 
 # ----------------------------------------------------------------- documents
+async def count_chunks(session: AsyncSession, document_id: uuid.UUID) -> int:
+    count = await session.scalar(select(func.count(DocumentChunk.id)).where(DocumentChunk.document_id == document_id))
+    return int(count or 0)
+
+
 async def integrity_levels(session: AsyncSession, document_ids: list[uuid.UUID]) -> dict[uuid.UUID, tuple[str, float]]:
     """{document id: (level, score)} of the forensic reports that exist for these documents."""
     if not document_ids:

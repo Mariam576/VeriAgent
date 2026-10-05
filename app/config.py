@@ -129,7 +129,18 @@ class Settings(BaseSettings):
     # Notes less similar to the question than this are not recalled (cosine similarity, 0..1).
     MEMORY_MIN_SIMILARITY: float = Field(default=0.3, ge=0.0, le=1.0)
 
+    # ----------------------------------------------------- Background work
+    # How many background jobs (document processing) may run at the same time.
+    MAX_BACKGROUND_JOBS: int = Field(default=2, ge=1, le=16)
+    # A document still "processing" after this long is marked failed (its job was lost in a restart).
+    DOCUMENT_PROCESSING_TIMEOUT_MINUTES: int = Field(default=15, ge=1)
+    # How often the upkeep runs (expired sign-ins, stale saved state, stuck documents). 0 = only at startup.
+    MAINTENANCE_INTERVAL_MINUTES: int = Field(default=60, ge=0)
+
     # -------------------------------------------------------------- Uploads
+    # false = delete the uploaded file once its text, vectors and inspection result are stored.
+    # Use false where the disk is not permanent (most free hosting): nothing then depends on the file.
+    KEEP_UPLOADED_FILES: bool = True
     MAX_UPLOAD_MB: int = Field(default=20, ge=1, le=200)
     ALLOWED_EXTENSIONS: str = ".pdf,.docx,.txt"
     UPLOAD_DIR: str = "uploads"
