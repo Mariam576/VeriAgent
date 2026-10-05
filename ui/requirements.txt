@@ -1,3 +1,0 @@
-# The interface only needs Streamlit and an HTTP client; it never imports the agent.
-streamlit==1.65.0
-httpx==0.28.1

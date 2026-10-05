@@ -137,6 +137,10 @@ class Settings(BaseSettings):
     # How often the upkeep runs (expired sign-ins, stale saved state, stuck documents). 0 = only at startup.
     MAINTENANCE_INTERVAL_MINUTES: int = Field(default=60, ge=0)
 
+    # ------------------------------------------------------------ Interface
+    # The built React interface (frontend/dist). The API serves it itself at "/".
+    FRONTEND_DIR: str = "frontend/dist"
+
     # -------------------------------------------------------------- Uploads
     # false = delete the uploaded file once its text, vectors and inspection result are stored.
     # Use false where the disk is not permanent (most free hosting): nothing then depends on the file.

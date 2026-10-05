@@ -1,4 +1,4 @@
-# Start everything:   docker compose up --build      then open http://localhost:8501
+# Start everything:   docker compose up --build      then open http://localhost:8000
 # Stop:               docker compose down
 # Stop + wipe data:   docker compose down -v
 services:
@@ -24,6 +24,7 @@ services:
       retries: 20
 
   api:
+    # The API and the web interface. The image builds the interface itself (see Dockerfile).
     build: .
     env_file:
       - path: .env
@@ -32,35 +33,23 @@ services:
       # Inside Docker the database host is the service name "db".
       DATABASE_URL: postgresql://postgres:postgres@db:5432/veriagent
       UPLOAD_DIR: /app/uploads
+      TICKETS_FILE: /app/data/tickets.jsonl
     depends_on:
       db:
         condition: service_healthy
     restart: unless-stopped
     ports:
-      # Bound to 127.0.0.1: reachable from this computer only. The API has
-      # placeholder authentication, so it must not be exposed to a network.
+      # Bound to 127.0.0.1: reachable from this computer only. To let other
+      # people use it, deploy it properly (docs/DEPLOYMENT.md) instead of opening this port.
       - "127.0.0.1:${API_PORT:-8000}:8000"
     volumes:
       - uploads:/app/uploads
+      - data:/app/data
       # Keeps the downloaded embedding model between restarts.
       - hf_cache:/home/app/.cache/huggingface
-
-  ui:
-    # The Streamlit interface. It only talks to the API over HTTP.
-    build:
-      context: .
-      dockerfile: ui/Dockerfile
-    environment:
-      # Inside Docker the API host is the service name "api".
-      VERIAGENT_API_URL: http://api:8000
-    depends_on:
-      - api
-    restart: unless-stopped
-    ports:
-      # Open http://localhost:8501 in your browser. Reachable from this computer only.
-      - "127.0.0.1:${UI_PORT:-8501}:8501"
 
 volumes:
   pgdata:
   uploads:
+  data:
   hf_cache:

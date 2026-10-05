@@ -1,48 +1,12 @@
-# Versions are pinned to the ones the test suite was run with (Python 3.12),
-# so a Docker build next month installs the same code that was tested.
-# To upgrade: change a version, rebuild, and run the tests.
-
-# --- Web API
-fastapi==0.142.2
-uvicorn[standard]==0.54.0
-python-multipart==0.0.32
-pydantic==2.13.5
-pydantic-settings==2.15.0
-
-# --- Sign-in: signed tokens, password hashing, email address checking
-pyjwt[crypto]==2.15.1
-argon2-cffi==25.1.0
-email-validator==2.3.0
-
-# --- Database
-sqlalchemy[asyncio]==2.1.3
-asyncpg==0.31.0
-pgvector==0.5.0
-
-# --- Agent / LLM
-langchain-core==1.6.6
-langchain-text-splitters==1.1.3
-langgraph==1.2.12
-# Checkpoints in PostgreSQL (pause / resume). It uses psycopg, not asyncpg.
-langgraph-checkpoint-postgres==3.1.2
-psycopg[binary]==3.3.6
-psycopg-pool==3.3.3
-langchain-google-genai==4.4.0
-langchain-openai==1.6.7
-
-# --- Actions outside VeriAgent: MCP client, and the built-in ticket server
-mcp==2.3.0
-
-# --- Documents
-pymupdf==1.28.2
-python-docx==1.2.0
+# Everything: the application, local embeddings, and the tests.
+#   pip install -r requirements.txt
+# The pinned versions of the application itself are in requirements-base.txt.
+-r requirements-base.txt
 
 # --- Local embeddings (free, runs on your machine)
 # Not pinned exactly: it pulls in PyTorch, whose builds differ per platform.
 sentence-transformers>=6.1,<7
-numpy==2.5.3
 
-# --- Tests and demo client
-httpx==0.28.1
+# --- Tests
 pytest==9.1.1
 pytest-asyncio==1.4.0

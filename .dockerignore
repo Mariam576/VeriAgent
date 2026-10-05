@@ -13,3 +13,7 @@ uploads/*
 docs
 
 data/
+
+frontend/node_modules
+frontend/dist
+frontend/e2e/screenshots

@@ -28,6 +28,7 @@ from app.jobs import get_jobs
 from app.logging_config import configure_logging
 from app.maintenance import run_maintenance
 from app.security.guardrails import redact_secrets
+from app.web import mount_interface
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,7 @@ def create_app() -> FastAPI:
     app.include_router(actions.router)
     app.include_router(chat.router)
     app.include_router(memory.router)
+    mount_interface(app, settings.FRONTEND_DIR)  # last: files are served only where no API route matched
     return app
 
 
