@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float | None = None
     LLM_REQUESTS_PER_MINUTE: int = Field(default=0, ge=0)
 
+    # A second model that checks the first one's reading of the documents (see app/agents/reviewer.py).
+    ENABLE_CLAIM_REVIEW: bool = True
+    # "" = the same provider as LLM_PROVIDER. Another provider gives a truly independent second opinion.
+    REVIEWER_LLM_PROVIDER: Literal["gemini", "grok", "mock", ""] = ""
+    # "" = that provider's normal model (GEMINI_MODEL / GROK_MODEL).
+    REVIEWER_MODEL: str = ""
+
     # ------------------------------------------------------------- Database
     DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/veriagent"
 

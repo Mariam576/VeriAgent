@@ -78,8 +78,10 @@ class EvaluationRun:
         self, llm: BaseLLM, settings: Settings, retrievers: dict[str, tuple[Retriever, str]],
         profiles: ProfileSource | None = None,
         forensics: ForensicsSource | None = None,
+        reviewer: BaseLLM | None = None,
     ) -> None:
         self._llm = llm
+        self._reviewer = reviewer or llm  # the suite always runs with the second opinion switched on
         # With the in-memory search each corpus gets its own profile source (built in run_case);
         # with PostgreSQL one store serves all of them.
         self._profiles = profiles
@@ -104,7 +106,7 @@ class EvaluationRun:
             forensics = self._memory_forensics[case.corpus]
         graph = build_investigation_graph(AgentDeps(
             llm=self._llm, retriever=retriever, settings=self._settings, pause_for_approval=False,
-            profiles=profiles, forensics=forensics,
+            profiles=profiles, forensics=forensics, reviewer=self._reviewer,
         ))
         state = initial_state(user_id=user_id, investigation_id=f"eval-{case.id}", question=case.question)
         started = time.perf_counter()
@@ -296,7 +298,9 @@ async def run_evaluation(
     if not quiet:
         print(f"Running {len(cases)} evaluation case(s) with {header['llm']}...\n", flush=True)
     try:
-        run = EvaluationRun(llm, settings, retrievers, profiles, forensics)
+        from app.llm.factory import get_reviewer_llm
+
+        run = EvaluationRun(llm, settings, retrievers, profiles, forensics, get_reviewer_llm())
         results = await run.run(cases, None if quiet else lambda case, result: print_case(case, result, verbose))
     finally:
         if user_ids:

@@ -145,11 +145,12 @@ async def run_graph(
     user_id: str = "user-1",
     profiles: Any = None,
     forensics: Any = None,
+    reviewer: BaseLLM | None = None,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
     graph = build_investigation_graph(AgentDeps(
         llm=llm or create_mock_llm(), retriever=retriever, settings=settings, memory=memory,
-        profiles=profiles, forensics=forensics,
+        profiles=profiles, forensics=forensics, reviewer=reviewer,
     ))
     state = initial_state(
         user_id=user_id, investigation_id="inv-1", question=question, history=history, document_ids=document_ids

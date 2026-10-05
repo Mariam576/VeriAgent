@@ -433,6 +433,7 @@ def _mock_profile(system: str, user: str) -> BaseModel:
 
 
 def create_mock_llm() -> MockLLM:
+    from app.agents.reviewer import ClaimReview, mock_review
     from app.comparison.llm import ProfileExtraction  # imported here: app.comparison uses this module's prompts
 
     return MockLLM(
@@ -443,6 +444,7 @@ def create_mock_llm() -> MockLLM:
             RiskAssessment: _mock_risk,
             MemoryCandidate: mock_memory,
             ProfileExtraction: _mock_profile,
+            ClaimReview: mock_review,
         },
         tool_chooser=_mock_tool_choice,
     )

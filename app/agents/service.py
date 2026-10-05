@@ -49,7 +49,7 @@ from app.database.session import get_session_factory
 from app.embeddings.factory import get_embedding_provider
 from app.forensics.store import get_forensics_store, reset_forensics_store
 from app.errors import Conflict, NotFound, ServiceUnavailable, TooManyRequests, ValidationFailed, safe_error
-from app.llm.factory import get_llm
+from app.llm.factory import get_llm, get_reviewer_llm
 from app.memory.semantic import remember_investigation
 from app.memory.store import get_memory_store
 from app.observability.tracing import json_safe, start_trace
@@ -88,6 +88,7 @@ async def get_graph() -> CompiledStateGraph:
                 memory=get_memory_store(),  # still subject to ENABLE_MEMORY
                 profiles=get_profile_store(),  # still subject to ENABLE_DOCUMENT_COMPARISON
                 forensics=get_forensics_store(),  # still subject to ENABLE_FORENSICS
+                reviewer=get_reviewer_llm(),  # still subject to ENABLE_CLAIM_REVIEW
             )
             _graph = build_investigation_graph(deps, checkpointer=await get_checkpointer())
     return _graph

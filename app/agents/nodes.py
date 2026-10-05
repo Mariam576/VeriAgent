@@ -60,6 +60,7 @@ from app.agents.assessment import (
     suspicious_content,
 )
 from app.agents.report import build_report
+from app.agents.reviewer import review_claims, reviewable
 from app.agents.state import InvestigationState
 from app.comparison.engine import Cited, ProfileFinding, compare_profiles
 from app.comparison.profile import PROFILED_TYPES
@@ -138,6 +139,8 @@ class AgentDeps:
     profiles: ProfileSource | None = None
     # Forensic reports of the uploaded files. None = signs of editing are not considered.
     forensics: ForensicsSource | None = None
+    # The model that double-checks extracted statements. None = they are not double-checked.
+    reviewer: BaseLLM | None = None
 
 
 def traced(name: str) -> Callable[[NodeFunction], NodeFunction]:
@@ -239,6 +242,7 @@ class InvestigationNodes:
         self.memory = deps.memory if deps.settings.ENABLE_MEMORY else None
         self.profiles = deps.profiles if deps.settings.ENABLE_DOCUMENT_COMPARISON else None
         self.forensics = deps.forensics if deps.settings.ENABLE_FORENSICS else None
+        self.reviewer = deps.reviewer if deps.settings.ENABLE_CLAIM_REVIEW else None
 
     # ================================================================ Node 0
     @traced("load_memory")
@@ -467,16 +471,53 @@ class InvestigationNodes:
 
         evidence = [EvidenceItem(**item) for item in state.get("evidence", [])]
         accepted, discarded = self._ground_facts(extraction.facts, new_chunks, evidence, source)
+        if discarded:
+            update.setdefault("limitations", []).append(
+                f"{discarded} extracted statement(s) were discarded because the cited text did not support them."
+            )
+        if source == "llm" and self.reviewer is not None:
+            accepted, rejected = await self._second_opinion(accepted, len(evidence), update)
+            discarded += rejected
         evidence += accepted
 
         update["evidence"] = [item.model_dump() for item in evidence]
         update["discarded_facts"] = state.get("discarded_facts", 0) + discarded
         update["events"] = [event("extract_evidence", f"{len(accepted)} supported fact(s) extracted...")]
-        if discarded:
-            update.setdefault("limitations", []).append(
-                f"{discarded} extracted statement(s) were discarded because the cited text did not support them."
-            )
         return update
+
+    async def _second_opinion(
+        self, accepted: list[EvidenceItem], already: int, update: dict[str, Any]
+    ) -> tuple[list[EvidenceItem], int]:
+        """Let the independent reviewer check the new free-text statements (see app/agents/reviewer.py).
+
+        Returns the statements that remain, numbered without gaps, and how many were removed.
+        """
+        assert self.reviewer is not None
+        if not reviewable(accepted):
+            return accepted, 0  # nothing the reviewer looks at: no call, no cost
+        try:
+            rejected = await review_claims(self.reviewer, accepted)
+            update["llm_calls"] = update.get("llm_calls", 0) + 1
+        except LLMConfigurationError:
+            raise
+        except LLMError as exc:
+            logger.warning("review_claims unavailable: %s", exc)
+            update.setdefault("limitations", []).append(
+                "The independent check of the extracted statements was unavailable; they were verified by rules only."
+            )
+            return accepted, 0
+        if not rejected:
+            return accepted, 0
+        for identifier, reason in rejected.items():
+            logger.info("fact_discarded id=%s reason=reviewer: %s", identifier, reason)
+        tracing.record("review", "claims", checked=len(accepted), rejected=[{"id": k, "reason": v} for k, v in rejected.items()])
+        kept = [item for item in accepted if item.id not in rejected]
+        kept = [item.model_copy(update={"id": f"E{already + index}"}) for index, item in enumerate(kept, start=1)]
+        update.setdefault("limitations", []).append(
+            f"{len(rejected)} extracted statement(s) were discarded by the independent reviewer because the quoted "
+            "text did not support them."
+        )
+        return kept, len(rejected)
 
     def _ground_facts(
         self, facts: list[ExtractedFact], chunks: list[RetrievedChunk], existing: list[EvidenceItem], source: str

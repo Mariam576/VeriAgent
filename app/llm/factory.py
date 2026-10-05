@@ -50,3 +50,20 @@ def get_llm() -> BaseLLM:
             return primary
         return FallbackLLM(primary, fallback)
     return primary
+
+
+@lru_cache
+def get_reviewer_llm() -> BaseLLM:
+    """The model that reviews extracted statements.
+
+    By default the same model as everywhere else. ``REVIEWER_LLM_PROVIDER`` and
+    ``REVIEWER_MODEL`` let a different one do the checking: a second model does
+    not share the first one's blind spots.
+    """
+    settings = get_settings()
+    provider = settings.REVIEWER_LLM_PROVIDER or settings.LLM_PROVIDER
+    if provider == settings.LLM_PROVIDER and not settings.REVIEWER_MODEL:
+        return get_llm()
+    if settings.REVIEWER_MODEL:
+        settings = settings.model_copy(update={"GEMINI_MODEL" if provider == "gemini" else "GROK_MODEL": settings.REVIEWER_MODEL})
+    return _create(provider, settings)
