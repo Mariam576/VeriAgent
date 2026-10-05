@@ -74,14 +74,19 @@ def _load_docx(data: bytes) -> list[PageText]:
 
 
 def _load_txt(data: bytes) -> list[PageText]:
-    for encoding in ("utf-8-sig", "cp1252"):
+    # Windows tools write several encodings; try them from most to least specific.
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encodings = ("utf-16",)
+    else:
+        encodings = ("utf-8-sig", "cp1252", "latin-1")
+    for encoding in encodings:
         try:
             text = data.decode(encoding)
             break
         except UnicodeDecodeError:
             continue
     else:
-        raise DocumentProcessingError("The text file is not valid UTF-8 text.")
+        raise DocumentProcessingError("The text file could not be decoded. Save it as UTF-8 and upload it again.")
     # A form-feed character is the plain-text convention for "new page".
     return [
         PageText(page_number=index, text=clean_text(part))
@@ -106,8 +111,8 @@ def load_pages(data: bytes, extension: str) -> list[PageText]:
 
 
 _TYPE_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
-    ("purchase_order", ("purchase order", "purchase_order", "po-", "po_")),
-    ("invoice", ("invoice", "inv-", "inv_")),
+    ("purchase_order", ("purchase order", "po")),
+    ("invoice", ("invoice", "inv")),
     ("contract", ("contract", "agreement")),
     ("policy", ("policy", "procedure", "guideline")),
     ("quotation", ("quotation", "quote", "estimate")),
@@ -117,17 +122,22 @@ _TYPE_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
 ]
 
 
+def _has_word(text: str, keyword: str) -> bool:
+    """True when ``keyword`` occurs as a whole word ("po" in "po 4421", not in "expo")."""
+    return re.search(rf"(?<![a-z]){re.escape(keyword)}s?(?![a-z])", text) is not None
+
+
 def guess_document_type(filename: str, first_page_text: str) -> str:
     """Best-effort label used for metadata filtering. The user can override it on upload."""
-    name = filename.lower().replace("_", " ")
+    name = re.sub(r"[_\-.]+", " ", filename.lower())
     for doc_type, keywords in _TYPE_KEYWORDS:
-        if any(keyword.replace("_", " ") in name for keyword in keywords):
+        if any(_has_word(name, keyword) for keyword in keywords):
             return doc_type
     # Otherwise look at the title only (the first line). Looking deeper would
     # label a cover note that merely mentions an invoice as an invoice.
     title = next((line for line in first_page_text.splitlines() if line.strip()), "")[:120].lower()
     for doc_type, keywords in _TYPE_KEYWORDS:
-        if any(keyword in title for keyword in keywords if len(keyword) > 4):
+        if any(_has_word(title, keyword) for keyword in keywords if len(keyword) > 4):
             return doc_type
     return "other"
 

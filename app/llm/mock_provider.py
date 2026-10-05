@@ -8,6 +8,7 @@ you have a Gemini key. Real reasoning needs ``LLM_PROVIDER=gemini``.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from typing import Any
 
@@ -34,7 +35,7 @@ class MockLLM(BaseLLM):
         }
         self._handlers.update(handlers or {})
         self._tool_chooser = tool_chooser
-        self.calls: list[str] = []  # schema / operation names, handy in tests
+        self.calls: deque[str] = deque(maxlen=500)  # recent schema / operation names, handy in tests
 
     async def _structured(self, schema: type[T], system: str, user: str) -> T:
         self.calls.append(schema.__name__)

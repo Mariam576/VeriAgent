@@ -18,6 +18,10 @@ pytestmark = pytest.mark.integration
 DEMO_QUESTION = "Review this invoice against the contract and tell me whether it should be approved."
 
 
+def pages(citations: list[dict]) -> set[tuple[str, int]]:
+    """Citations as (document, page) pairs."""
+    return {(c["document"], c["page"]) for c in citations}
+
 async def upload(client, headers, path):
     with path.open("rb") as handle:
         response = await client.post("/documents/upload", headers=headers, files={"file": (path.name, handle)})
@@ -45,8 +49,8 @@ async def test_demo_investigation_end_to_end(client, user_headers, library):
     assert (amount["value_a"], amount["value_b"], amount["difference"]) == (40000, 58000, 18000)
     assert any(c["type"] == "payment_terms_mismatch" for c in report["contradictions"])
     assert report["missing_evidence"]
-    assert {"document": "Contract.pdf", "page": 4} in report["sources"]
-    assert {"document": "Invoice_102.pdf", "page": 1} in report["sources"]
+    assert ("Contract.pdf", 4) in pages(report["sources"])
+    assert ("Invoice_102.pdf", 1) in pages(report["sources"])
     assert "£18,000" in report["answer_text"]
     assert report["stats"]["duration_ms"] > 0
     assert report["stats"]["llm_provider"] == "mock"
@@ -131,8 +135,8 @@ async def test_chat_matches_the_spec_example_and_remembers_the_conversation(clie
     assert body["risk_level"] == "high"
     assert 0 < body["confidence"] <= 1
     assert "£40,000" in body["answer"] and "£58,000" in body["answer"]
-    assert {"document": "Contract.pdf", "page": 4} in body["citations"]
-    assert {"document": "Invoice_102.pdf", "page": 1} in body["citations"]
+    assert ("Contract.pdf", 4) in pages(body["citations"])
+    assert ("Invoice_102.pdf", 1) in pages(body["citations"])
     conversation_id = body["conversation_id"]
 
     # A follow-up that only makes sense with the earlier turn.
@@ -176,7 +180,7 @@ async def test_prompt_injection_document_through_the_api(client, user_headers, l
     assert report["risk_level"] in ("high", "critical")
     assert report["status"] == "review_required"
     assert any("instructions to an AI" in limitation for limitation in report["limitations"])
-    assert {"document": "Vendor_Note.txt", "page": 1} in report["sources"]
+    assert ("Vendor_Note.txt", 1) in pages(report["sources"])
     assert "do not approve automatically" in report["recommended_action"].lower()
 
 
@@ -195,3 +199,73 @@ async def test_missing_llm_configuration_gives_a_clear_503(client, user_headers,
 
     listing = (await client.get("/investigations", headers=user_headers)).json()["investigations"]
     assert listing[0]["status"] == "failed"  # the failed attempt is recorded, not lost
+
+
+async def test_metadata_filters_limit_the_search(client, user_headers, library):
+    response = await client.post(
+        "/investigations", headers=user_headers,
+        json={"question": "What is the total amount?", "document_type": "invoice"},
+    )
+    assert response.status_code == 201, response.text
+    assert {document for document, _ in pages(response.json()["sources"])} == {"Invoice_102.pdf"}
+
+    wrong_year = await client.post(
+        "/investigations", headers=user_headers, json={"question": "What is the total amount?", "year": 1999}
+    )
+    assert wrong_year.json()["status"] == "insufficient_evidence"
+
+    bad_type = await client.post(
+        "/investigations", headers=user_headers, json={"question": "q", "document_type": "love_letter"}
+    )
+    assert bad_type.status_code == 400
+
+
+async def test_two_files_with_the_same_name_stay_distinguishable(client, user_headers, tmp_path):
+    for folder, text in (("a", "Supplier quote. Total amount due: £100."), ("b", "Supplier quote, revised. Total amount due: £250.")):
+        (tmp_path / folder).mkdir()
+        path = tmp_path / folder / "Quote.txt"
+        path.write_text(text, encoding="utf-8")
+        await upload(client, user_headers, path)
+
+    report = (await client.post("/investigations", headers=user_headers, json={"question": "Compare the total amounts in the quotes."})).json()
+    sources = [source for source in report["sources"] if source["document"] == "Quote.txt"]
+    assert len(sources) == 2 and len({source["document_id"] for source in sources}) == 2
+    assert [c["type"] for c in report["contradictions"]] == ["amount_mismatch"]
+
+    findings = (await client.get(f"/investigations/{report['investigation_id']}/findings", headers=user_headers)).json()["findings"]
+    fact_documents = {f["source_document_id"] for f in findings if f["finding_type"] == "fact"}
+    assert fact_documents == {source["document_id"] for source in sources}
+
+
+async def test_report_is_explicit_when_no_model_answered(client, user_headers, library, monkeypatch):
+    from app.agents import service
+    from app.agents.graph import build_investigation_graph
+    from app.agents.nodes import AgentDeps
+    from app.config import get_settings
+    from app.database.session import get_session_factory as session_factory
+    from app.embeddings.factory import get_embedding_provider
+    from app.rag.retriever import PgVectorRetriever
+    from tests.helpers import DownLLM
+
+    graph = build_investigation_graph(AgentDeps(
+        llm=DownLLM(), retriever=PgVectorRetriever(session_factory(), get_embedding_provider()), settings=get_settings(),
+    ))
+    monkeypatch.setattr(service, "get_graph", lambda: graph)
+
+    report = (await client.post("/investigations", headers=user_headers, json={"question": DEMO_QUESTION})).json()
+    assert report["stats"]["llm_calls"] == 0
+    assert report["stats"]["llm_provider"] == "down (unavailable - rules used)"
+    assert any("language model was unavailable" in text for text in report["limitations"])
+    assert report["risk_level"] == "high"  # the rule-based safety net still catches the mismatch
+
+
+async def test_health_reports_503_when_the_database_is_unreachable(client, monkeypatch):
+    from app.api import health
+
+    async def database_down() -> bool:
+        return False
+
+    monkeypatch.setattr(health, "check_db", database_down)
+    response = await client.get("/health")
+    assert response.status_code == 503
+    assert response.json()["status"] == "degraded" and response.json()["database"] == "unreachable"

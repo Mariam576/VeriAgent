@@ -20,12 +20,13 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         self.model_id = f"local:{model_name}"
         self.dimension = dimension
         self._model = None
+        self._load_lock = threading.Lock()
         self._lock = threading.Lock()
 
     def _load(self):
         # Loading is slow, so do it once, and only when first needed.
         if self._model is None:
-            with self._lock:
+            with self._load_lock:
                 if self._model is None:
                     try:
                         from sentence_transformers import SentenceTransformer
@@ -46,12 +47,15 @@ class LocalEmbeddingProvider(EmbeddingProvider):
             return []
         model = self._load()
         try:
-            vectors = model.encode(
-                texts,
-                batch_size=32,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            ).tolist()
+            # Several searches may run at once in worker threads; the model's
+            # tokenizer is not safe to share between threads, so encode one at a time.
+            with self._lock:
+                vectors = model.encode(
+                    texts,
+                    batch_size=32,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                ).tolist()
         except Exception as exc:  # noqa: BLE001
             raise EmbeddingError(f"Local embedding failed: {exc}") from exc
         self._check_dimension(vectors)

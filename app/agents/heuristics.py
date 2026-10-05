@@ -20,6 +20,7 @@ from typing import Any
 from app.agents import prompts
 from app.formatting import format_value
 from app.llm.base import ToolCallRequest
+from app.numbers import NUMBER_CORE, normalize_unit, parse_number
 from app.llm.mock_provider import MockLLM
 from app.rag.citations import normalize
 from app.schemas.investigation import (
@@ -37,12 +38,13 @@ from app.schemas.investigation import (
 from app.security.guardrails import UNTRUSTED_CLOSE, dedupe_keep_order
 
 # =========================================================== fact extraction
-_NUM = r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?"
+# A currency marker directly before or after a number token (see app.numbers for the number formats).
+_NUMBER = NUMBER_CORE + r"(?![\w]|[.,]\d)"
 _MONEY = re.compile(
-    rf"(?P<cur>£|\$|€|\b(?:GBP|USD|EUR|PKR|Rs\.?))\s?(?P<num>{_NUM})|(?P<num2>{_NUM})\s?(?P<cur2>GBP|USD|EUR|PKR)\b",
+    rf"(?P<cur>£|\$|€|₹|\b(?:GBP|USD|EUR|PKR|INR|AED|SAR|Rs\.?))\s?(?P<num>{_NUMBER})"
+    rf"|(?<!\w)(?<!\d[.,])(?P<num2>{_NUMBER})\s?(?P<cur2>GBP|USD|EUR|PKR|INR|AED|SAR)\b",
     re.IGNORECASE,
 )
-_CURRENCY_CODES = {"£": "GBP", "$": "USD", "€": "EUR", "rs": "PKR", "rs.": "PKR"}
 
 # (pattern, priority). A higher priority wins when a document has several candidates.
 _TOTAL_LABELS: list[tuple[re.Pattern[str], int]] = [
@@ -72,8 +74,13 @@ _APPROVAL_REQUIREMENT = re.compile(
 
 
 def _currency(match: re.Match[str]) -> str:
-    raw = (match.group("cur") or match.group("cur2") or "").strip().lower()
-    return _CURRENCY_CODES.get(raw, raw.upper())
+    return normalize_unit(match.group("cur") or match.group("cur2")) or ""
+
+
+def _amount(match: re.Match[str]) -> float | None:
+    readings = parse_number(match.group("num") or match.group("num2"))
+    # For money, "40.000" means forty thousand (the first reading), not forty.
+    return readings[0] if readings else None
 
 
 def _sentence_bounds(text: str, start: int, end: int) -> tuple[int, int]:
@@ -102,7 +109,9 @@ def extract_facts_with_rules(chunk: RetrievedChunk) -> list[tuple[ExtractedFact,
     labelled: list[tuple[ExtractedFact, int]] = []
     unlabelled: list[tuple[ExtractedFact, int]] = []
     for match in _MONEY.finditer(text):
-        value = float((match.group("num") or match.group("num2")).replace(",", ""))
+        value = _amount(match)
+        if value is None:
+            continue
         unit = _currency(match)
         sentence = _sentence_around(text, match.start(), match.end())
         # Look only at the words directly before the amount, within the same sentence.
@@ -169,7 +178,7 @@ def extract_facts_with_rules(chunk: RetrievedChunk) -> list[tuple[ExtractedFact,
             ExtractedFact(
                 chunk_ref=chunk.ref,
                 claim=f"{chunk.filename} sets an approval requirement: {sentence[:240]}",
-                key=KEY_OTHER, quote=sentence,
+                key=KEY_OTHER, value_number=None, unit=None, quote=sentence,
             ),
             0,
         ))
@@ -182,7 +191,7 @@ def extract_facts_with_rules(chunk: RetrievedChunk) -> list[tuple[ExtractedFact,
             ExtractedFact(
                 chunk_ref=chunk.ref,
                 claim=f"{chunk.filename} contains an approval statement: {sentence[:200]}",
-                key=KEY_OTHER, quote=sentence,
+                key=KEY_OTHER, value_number=None, unit=None, quote=sentence,
             ),
             0,
         ))
@@ -223,8 +232,8 @@ def fallback_analysis(question: str, history: list[dict[str, str]] | None = None
     history = history or []
     if _GENERAL.match(question):
         return RequestAnalysis(
-            task_type="general", needs_rag=False, needs_calculation=False,
-            standalone_question=question, search_queries=[],
+            task_type="general", needs_rag=False, needs_calculation=False, needs_external_verification=False,
+            decision_requested=False, standalone_question=question, search_queries=[],
         )
 
     standalone = question
@@ -255,6 +264,7 @@ def fallback_analysis(question: str, history: list[dict[str, str]] | None = None
         task_type=task_type,
         needs_rag=True,
         needs_calculation=investigating or calculating or bool(_AMOUNT_TOPIC.search(standalone)),
+        needs_external_verification=False,
         decision_requested=decision,
         standalone_question=standalone,
         search_queries=dedupe_keep_order(queries)[:4],

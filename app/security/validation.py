@@ -6,8 +6,10 @@ plain code is checked with plain code. The LLM is never the only safety net.
 
 from __future__ import annotations
 
+import io
 import re
 import unicodedata
+import zipfile
 from pathlib import PurePosixPath, PureWindowsPath
 
 from app.config import Settings
@@ -26,7 +28,12 @@ DOCUMENT_TYPES = (
 )
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._ ()\-]")
+# Letters and digits of any language are kept (so Urdu, Arabic or Chinese file
+# names survive); quotes, slashes, control characters and symbols are replaced.
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^\w._ ()\-]", re.UNICODE)
+UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
+# A .docx is a zip archive. Refuse one that would unpack to far more than it weighs.
+MAX_DOCX_UNPACKED_BYTES = 200 * 1024 * 1024
 
 
 def sanitize_filename(filename: str | None) -> str:
@@ -63,9 +70,18 @@ def validate_upload(filename: str | None, data: bytes, settings: Settings) -> tu
     # The extension is only a claim. Check that the content really is that format.
     if extension == ".pdf" and not data.lstrip()[:5].startswith(b"%PDF-"):
         raise UnsupportedFileType("The file has a .pdf extension but is not a PDF.")
-    if extension == ".docx" and not data.startswith(b"PK"):
-        raise UnsupportedFileType("The file has a .docx extension but is not a Word document.")
-    if extension == ".txt" and b"\x00" in data[:4096]:
+    if extension == ".docx":
+        if not data.startswith(b"PK"):
+            raise UnsupportedFileType("The file has a .docx extension but is not a Word document.")
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                unpacked = sum(member.file_size for member in archive.infolist())
+        except zipfile.BadZipFile as exc:
+            raise UnsupportedFileType("The file has a .docx extension but is not a Word document.") from exc
+        if unpacked > MAX_DOCX_UNPACKED_BYTES:
+            raise FileTooLarge("The Word document is too large when unpacked.")
+    # UTF-16 text (what Windows PowerShell writes by default) legitimately contains zero bytes.
+    if extension == ".txt" and not data.startswith(UTF16_BOMS) and b"\x00" in data[:4096]:
         raise UnsupportedFileType("The file has a .txt extension but contains binary data.")
 
     return safe_name, extension

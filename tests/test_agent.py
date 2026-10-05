@@ -29,6 +29,10 @@ from tests.helpers import DownLLM, InMemoryRetriever, ScriptedLLM, run_graph, sa
 DEMO_QUESTION = "Review this invoice against the contract and tell me whether it should be approved."
 
 
+def pages(citations: list[dict]) -> set[tuple[str, int]]:
+    """Citations as (document, page) pairs."""
+    return {(c["document"], c["page"]) for c in citations}
+
 def settings_with(**changes):
     return get_settings().model_copy(update=changes)
 
@@ -176,7 +180,7 @@ async def test_injected_instructions_are_reported_and_not_followed(samples_dir):
     # The attempt itself is surfaced as a finding with its source.
     assert state["risk_findings"] and state["risk_findings"][0]["document"] == "Vendor_Note.txt"
     assert any("instructions to an AI" in limitation for limitation in report["limitations"])
-    assert {"document": "Vendor_Note.txt", "page": 1} in report["sources"]
+    assert ("Vendor_Note.txt", 1) in pages(report["sources"])
 
     # The model saw the note only inside an UNTRUSTED block, under a system prompt that outranks it.
     system, user = next(p for p in llm.prompts["EvidenceExtraction"] if "Vendor_Note.txt" in p[1])
@@ -224,22 +228,29 @@ async def test_invented_sources_and_figures_are_discarded(samples_dir):
         ExtractedFact(chunk_ref="C1", claim="The total contract value is £40,000.", key="total_amount",
                       value_number=40000, unit="GBP", quote="The total contract value is £40,000"),
         # invented chunk reference
-        ExtractedFact(chunk_ref="C99", claim="The invoice was approved by the Finance Director.", quote="approved by the Finance Director"),
+        ExtractedFact(chunk_ref="C99", claim="The invoice was approved by the Finance Director.", key="other",
+                      value_number=None, unit=None, quote="approved by the Finance Director"),
         # real chunk, but the number is nowhere in it
         ExtractedFact(chunk_ref="C1", claim="The contract value is £75,000.", key="total_amount",
                       value_number=75000, unit="GBP", quote="total contract value is £75,000"),
         # real chunk, but the quote is not in it
-        ExtractedFact(chunk_ref="C1", claim="A variation approving extra charges was signed.", quote="a variation approving the extra charges was signed on 1 March"),
+        ExtractedFact(chunk_ref="C1", claim="A variation approving extra charges was signed.", key="other",
+                      value_number=None, unit=None, quote="a variation approving the extra charges was signed on 1 March"),
+        # real chunk and a real number from it ("30 days"), but attached to an invented statement
+        ExtractedFact(chunk_ref="C1", claim="The contract was approved by 30 directors.", key="other",
+                      value_number=30, unit=None, quote="approved by 30 directors"),
     ])
-    state = await run_graph(DEMO_QUESTION, retriever, ScriptedLLM({EvidenceExtraction: [extraction, EvidenceExtraction()]}))
+    state = await run_graph(
+        DEMO_QUESTION, retriever, ScriptedLLM({EvidenceExtraction: [extraction, EvidenceExtraction(facts=[])]})
+    )
 
     first_chunk = state["retrieved_documents"][0]
     assert (first_chunk["ref"], first_chunk["filename"], first_chunk["page"]) == ("C1", "Contract.pdf", 4)
     claims = [e["claim"] for e in state["evidence"]]
     assert claims == ["The total contract value is £40,000."]
-    assert state["discarded_facts"] == 3
+    assert state["discarded_facts"] == 4
     assert any("discarded" in limitation for limitation in state["report"]["limitations"])
-    assert state["report"]["stats"]["discarded_facts"] == 3
+    assert state["report"]["stats"]["discarded_facts"] == 4
     assert_no_hallucinated_citations(state)
     assert "75,000" not in state["final_answer"] and "Finance Director" not in state["final_answer"]
 
@@ -406,3 +417,98 @@ async def test_simple_lookup_question_does_not_trigger_calculation(samples_dir):
     terms = [e for e in state["evidence"] if e["key"] == "payment_terms_days"]
     assert terms and (terms[0]["value_number"], terms[0]["filename"], terms[0]["page"]) == (30, "Contract.pdf", 4)
     assert state["report"]["status"] == "no_issues_found"
+
+
+# ================================================== behaviour with a real model
+async def test_chunk_references_are_accepted_in_the_spellings_models_use(samples_dir):
+    retriever = sample_library(samples_dir, "Contract.pdf", "Invoice_102.pdf")
+
+    def extraction(system: str, user: str) -> EvidenceExtraction:
+        facts = []
+        if 'file="Contract.pdf" page=4' in user:
+            ref = user.split(' file="Contract.pdf" page=4')[0].rsplit("ref=", 1)[1]
+            facts.append(ExtractedFact(chunk_ref=f"[{ref.lower()}]", claim="The contract value is £40,000.", key="total_amount",
+                                       value_number=40000, unit="£", quote="The total contract value is £40,000"))
+        if 'file="Invoice_102.pdf" page=1' in user:
+            ref = user.split(' file="Invoice_102.pdf" page=1')[0].rsplit("ref=", 1)[1]
+            facts.append(ExtractedFact(chunk_ref=f"Chunk {ref}", claim="The invoice total is £58,000.", key="total_amount",
+                                       value_number=58000, unit="pounds sterling", quote="Total amount due: £58,000"))
+        return EvidenceExtraction(facts=facts)
+
+    state = await run_graph(DEMO_QUESTION, retriever, ScriptedLLM({EvidenceExtraction: extraction}))
+    assert state["discarded_facts"] == 0
+    assert {(e["filename"], e["value_number"], e["unit"]) for e in state["evidence"]} == {
+        ("Contract.pdf", 40000.0, "GBP"), ("Invoice_102.pdf", 58000.0, "GBP"),
+    }
+    assert [c["type"] for c in state["report"]["contradictions"]] == ["amount_mismatch"]
+    assert state["report"]["contradictions"][0]["difference"] == 18000
+
+
+async def test_first_search_leaves_room_for_a_follow_up_search():
+    retriever = InMemoryRetriever()
+    for number in range(1, 31):
+        retriever.add_text(f"Note_{number}.txt", [f"Memo {number} about supplier payments. Total amount due: £{number}00. Approval pending review {number}."])
+    settings = settings_with(MAX_RETRIEVED_CHUNKS=12, RERANK_TOP_K=4, RAG_TOP_K=8)
+    seen_rounds: list[int] = []
+
+    def wants_more(system: str, user: str) -> SufficiencyAssessment:
+        seen_rounds.append(len(prompts.read_json_section(user, "CONTEXT")["documents_with_retrieved_text"]))
+        return SufficiencyAssessment(sufficient=False, missing=["signed approval"], follow_up_queries=[f"approval pending review {len(seen_rounds)}"])
+
+    state = await run_graph("Review the supplier payment memos and their approvals.", retriever,
+                            ScriptedLLM({SufficiencyAssessment: wants_more}), settings)
+    assert seen_rounds[0] <= 8  # the first round may not use the whole budget of 12
+    assert state["retrieval_rounds"] >= 2  # so the follow-up search could actually run
+    assert len(state["retrieved_documents"]) <= 12
+    assert any("limit of 12 retrieved chunks" in text or "found nothing new" in text for text in state["report"]["limitations"])
+
+
+async def test_later_steps_see_the_standalone_question_not_the_bare_follow_up(samples_dir):
+    history = [{"role": "user", "content": "Compare the contract and invoice."}]
+    llm = ScriptedLLM()
+    state = await run_graph("What about the payment terms?", sample_library(samples_dir), llm, history=history)
+    assert state["question"] == "What about the payment terms?"
+    assert state["report"]["question"] == "What about the payment terms?"  # the user's own words are reported
+    _, extraction_prompt = llm.prompts["EvidenceExtraction"][0]
+    assert "Compare the contract and invoice" in prompts.read_section(extraction_prompt, "USER REQUEST")
+
+
+async def test_report_says_when_the_reviewer_changed_the_models_draft(samples_dir):
+    draft = RiskAssessment(
+        level="high", confidence=0.8, decision="review",
+        reasons=[RiskReason(text="The invoice total exceeds the contract total.", evidence_ids=["x1"])],
+        recommended_action="Hold the invoice.", summary="The invoice exceeds the contract by £19,250.",
+    )
+    state = await run_graph(DEMO_QUESTION, sample_library(samples_dir), ScriptedLLM({RiskAssessment: draft}))
+    report = state["report"]
+    assert "19,250" not in report["summary"]
+    assert any("reviewer corrected the draft" in text and "19250" in text for text in report["limitations"])
+    assert report["risk_reasons"][0]["citations"]  # the lower-case id "x1" still resolved to its sources
+
+
+async def test_sufficiency_answers_are_read_sensibly(samples_dir):
+    library = sample_library(samples_dir, "Contract.pdf")
+    question = "What payment term appears in the contract?"
+
+    nothing_missing = SufficiencyAssessment(sufficient=True, missing=["None"], follow_up_queries=[])
+    state = await run_graph(question, library, ScriptedLLM({SufficiencyAssessment: nothing_missing}))
+    assert state["missing_evidence"] == [] and state["sufficiency"]["sufficient"] is True
+
+    unexplained = SufficiencyAssessment(sufficient=False, missing=[], follow_up_queries=[])
+    state = await run_graph(question, library, ScriptedLLM({SufficiencyAssessment: unexplained}))
+    assert state["sufficiency"]["sufficient"] is False
+    assert state["missing_evidence"] == ["The evidence was judged insufficient, but what is missing was not specified."]
+    assert state["report"]["status"] == "review_required"
+
+
+async def test_a_rejected_llm_request_stops_the_run_instead_of_silently_using_rules(samples_dir):
+    """Wrong API key or model name must never look like a successful investigation."""
+
+    class BadKeyLLM(DownLLM):
+        async def _structured(self, schema, system, user):
+            error = RuntimeError("API key not valid. Please pass a valid API key.")
+            error.status_code = 400  # type: ignore[attr-defined]
+            raise error
+
+    with pytest.raises(LLMConfigurationError, match="rejected the request"):
+        await run_graph(DEMO_QUESTION, sample_library(samples_dir), BadKeyLLM())

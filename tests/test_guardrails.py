@@ -80,6 +80,13 @@ def test_injection_attempts_are_detected(text):
         "Suppliers must follow the instructions on the purchase order.",
         "Please ignore the previous invoice INV-099, which was issued in error.",
         "The previous system was replaced in 2025.",
+        "Please disregard the previous invoice; a corrected one is attached.",
+        "Following the review, you are now entitled to a 5% discount.",
+        "Employees must not share passwords or credentials with suppliers.",
+        "Staff must never send API keys by email.",
+        "The assistant manager must approve all purchase orders above £1,000.",
+        "Our AI team should report progress to the board every quarter.",
+        "Do not report expenses twice.",
     ],
 )
 def test_ordinary_business_text_is_not_flagged(text):
@@ -351,3 +358,63 @@ def test_fallback_analysis_resolves_follow_ups_from_history():
     analysis = heuristics.fallback_analysis("What about the payment terms?", history)
     assert analysis.standalone_question == "What about the payment terms? (follow-up to: Compare the contract and invoice.)"
     assert analysis.task_type == "document_investigation"
+
+
+# ---------------------------------------- reviewer tolerance for ordinary prose
+def test_rounded_and_abbreviated_figures_are_not_treated_as_invented():
+    known = {40000.0, 58000.0, 18250.0, 31.25, 30.0, 60.0, 100.0}
+    assert unknown_numbers("The invoice is about 31% higher.", known) == []  # 31.25 rounded
+    assert unknown_numbers("It exceeds the contract by roughly £18.3k.", known) == []  # 18,250 rounded, k suffix
+    assert unknown_numbers("Payment terms are 100% longer (60 days instead of 30).", known) == []
+    assert unknown_numbers("The overcharge is £25k.", known) == [25000.0]
+    assert unknown_numbers("The invoice is almost 50% higher.", known) == [50.0]
+
+
+def test_reviewer_accepts_reference_ids_in_any_spelling():
+    from app.agents.assessment import clean_ids
+
+    assert clean_ids(["x1", "[E2]", " m1 ", "", None]) == ["X1", "E2", "M1"]
+    issues, corrected, _ = review({"reasons": [{"text": "The invoice exceeds the contract.", "evidence_ids": ["x1", "[E2]"]}]})
+    assert issues == []
+
+
+# -------------------------------------------------- uploads from real machines
+def test_utf16_text_files_are_accepted_and_read(settings):
+    from app.rag.loaders import load_pages
+    from app.security.validation import validate_upload
+
+    data = "Total amount due: £58,000".encode("utf-16")  # what Windows PowerShell writes with ">"
+    assert validate_upload("note.txt", data, settings) == ("note.txt", ".txt")
+    assert load_pages(data, ".txt")[0].text == "Total amount due: £58,000"
+
+
+def test_filenames_in_other_scripts_are_kept():
+    from app.security.validation import sanitize_filename
+
+    assert sanitize_filename("عقد.pdf") == "عقد.pdf"
+    assert sanitize_filename("合同 2026.pdf") == "合同 2026.pdf"
+    assert sanitize_filename('evil"name<>.pdf') == "evil_name__.pdf"
+
+
+def test_oversized_docx_archive_is_rejected(settings, monkeypatch):
+    import io
+    import zipfile
+
+    from app.errors import FileTooLarge
+    from app.security import validation
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", "0" * 200_000)  # compresses to almost nothing
+    monkeypatch.setattr(validation, "MAX_DOCX_UNPACKED_BYTES", 100_000)
+    with pytest.raises(FileTooLarge, match="unpacked"):
+        validation.validate_upload("bomb.docx", buffer.getvalue(), settings)
+
+
+def test_document_type_is_guessed_from_whole_words():
+    from app.rag.loaders import guess_document_type
+
+    assert guess_document_type("Expo_Contract.pdf", "") == "contract"  # "po" inside "Expo" is not a purchase order
+    assert guess_document_type("PO-4421.pdf", "") == "purchase_order"
+    assert guess_document_type("INV_102.pdf", "") == "invoice"
+    assert guess_document_type("Vendor_Note.txt", "Note from supplier\nRegarding invoice INV-102") == "other"

@@ -20,19 +20,23 @@ from app.schemas.investigation import RetrievedChunk
 UNTRUSTED_OPEN = "<<<UNTRUSTED DOCUMENT CONTENT"
 UNTRUSTED_CLOSE = "<<<END UNTRUSTED DOCUMENT CONTENT>>>"
 
-# Phrases that have no business in an invoice or contract but are typical of
-# prompt-injection attempts. A match never blocks the document: the text is
-# still treated as evidence, and the attempt itself is reported as a risk.
+# Phrases that are typical of prompt-injection attempts and very unlikely in a
+# normal contract, invoice or policy. Each pattern needs wording that addresses
+# the reader's *instructions* or an *AI system*; ordinary business sentences
+# such as "please disregard the previous invoice" or "the assistant manager
+# must approve" must not match (see tests/test_guardrails.py).
+# A match never blocks the document: the text is still treated as evidence,
+# and the attempt itself is reported as a risk.
+_AI = r"(?:ai|a\.i\.|llm|language\s+model|chat\s?bot|automated)\s+(?:assistant|agent|system|model|reviewer|tool)s?"
 _INJECTION_PATTERNS = [
-    r"ignore\s+(?:all\s+|any\s+|the\s+|your\s+)?(?:previous|prior|above|earlier|system)\s+(?:instructions?|prompts?|rules?|messages?)",
-    r"disregard\s+(?:all\s+|any\s+|the\s+|your\s+)?(?:previous|prior|above|earlier|system)\b",
-    r"forget\s+(?:all\s+|any\s+|the\s+|your\s+)?(?:previous|prior|above|earlier)\s+(?:instructions?|rules?)",
-    r"(?:reveal|show|print|send|leak|exfiltrate|share)\b[^.\n]{0,40}\b(?:system\s+prompt|api[\s_-]?keys?|passwords?|credentials|secrets?)",
-    r"\byou\s+are\s+now\b",
-    r"(?:system|developer)\s+(?:message|prompt|instructions?)\s+(?:for|to)\s+(?:any\s+|the\s+|an\s+)?(?:ai|assistant|model|llm)",
-    r"\b(?:ai|assistant|language\s+model|llm|chatbot)\b[^.\n]{0,60}\b(?:must|should|shall|is\s+instructed\s+to)\b[^.\n]{0,40}\b(?:approve|ignore|report|say|respond)",
+    r"(?:ignore|disregard|forget|override)\s+(?:all\s+|any\s+|the\s+|your\s+|these\s+|those\s+)?(?:previous|prior|above|earlier|preceding|system)\s+(?:instructions?|prompts?|rules?|guidelines|directions)",
+    r"(?:ignore|disregard|override)\s+(?:the\s+|your\s+)?system\s+(?:prompt|message)",
+    r"(?<!not\s)(?<!never\s)(?:reveal|print|send|leak|exfiltrate|email|forward)\b[^.\n]{0,40}\b(?:system\s+prompt|api[\s_-]?keys?)",
+    r"\byou\s+are\s+now\s+(?:an?\s+|the\s+)?(?:[\w-]+\s+){0,3}(?:assistant|ai|model|chat\s?bot|bot|agent)\b",
+    r"(?:system|developer)\s+(?:message|prompt|instructions?)\s+(?:for|to)\s+(?:any\s+|the\s+|an\s+|all\s+)?(?:ai|assistant|model|llm)",
+    rf"\b{_AI}\b[^.\n]{{0,60}}\b(?:must|should|shall|is\s+instructed\s+to)\b[^.\n]{{0,40}}\b(?:approve|ignore|report|say|respond)",
     r"report\s+(?:the\s+)?risk(?:\s+level)?\s+as\s+(?:low|none|minimal)",
-    r"do\s+not\s+(?:mention|report|flag|disclose)\b[^.\n]{0,60}\b(?:difference|discrepanc|mismatch|contradiction|issue)",
+    r"do\s+not\s+(?:mention|report|flag|disclose)\b[^.\n]{0,60}\b(?:difference|discrepanc|mismatch|contradiction)",
 ]
 _INJECTION_REGEX = [re.compile(pattern, re.IGNORECASE) for pattern in _INJECTION_PATTERNS]
 

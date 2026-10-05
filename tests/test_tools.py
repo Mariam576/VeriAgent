@@ -195,3 +195,57 @@ def test_format_value():
     assert format_value(None, "GBP") == "unknown"
     assert key_label("payment_terms_days") == "payment terms"
     assert key_label("unit_price") == "unit price"
+
+
+# ------------------------------------------- contradictions on realistic input
+def test_unit_spelling_does_not_hide_a_real_mismatch():
+    found = find_contradictions([
+        evidence("E1", "Contract.pdf", "contract", "total_amount", 40000, "GBP"),
+        evidence("E2", "Invoice.pdf", "invoice", "total_amount", 58000, "pounds sterling"),
+        evidence("E3", "Contract.pdf", "contract", "payment_terms_days", 30, "days"),
+        evidence("E4", "Invoice.pdf", "invoice", "payment_terms_days", 60, "calendar days"),
+    ])
+    assert [(c.type, c.severity) for c in found] == [("amount_mismatch", "high"), ("payment_terms_mismatch", "medium")]
+
+
+def test_only_total_amount_and_payment_terms_are_compared():
+    assert find_contradictions([
+        evidence("E1", "Invoice_A.pdf", "invoice", "unit_price", 10),
+        evidence("E2", "Invoice_B.pdf", "invoice", "unit_price", 12),
+        evidence("E3", "Contract.pdf", "contract", "year", 2025, None),
+        evidence("E4", "Invoice_A.pdf", "invoice", "year", 2026, None),
+    ]) == []
+
+
+def test_a_policy_threshold_is_not_compared_with_an_invoice_total():
+    assert find_contradictions([
+        evidence("E1", "Policy.pdf", "policy", "total_amount", 1000),
+        evidence("E2", "Invoice.pdf", "invoice", "total_amount", 58000),
+    ]) == []
+
+
+def test_subtotal_tagged_as_total_does_not_inflate_the_findings():
+    # The invoice contributes a subtotal (46,000) and the real total (58,000) under the same key.
+    found = find_contradictions([
+        evidence("E1", "Contract.pdf", "contract", "total_amount", 40000),
+        evidence("E2", "Invoice.pdf", "invoice", "total_amount", 46000),
+        evidence("E3", "Invoice.pdf", "invoice", "total_amount", 58000),
+    ])
+    assert [(c.type, c.severity) for c in found] == [("amount_mismatch", "high"), ("internal_inconsistency", "low")]
+    assert (found[0].value_a, found[0].value_b) == (40000, 58000)  # the larger value is taken as the total
+    assert "more than one value" in found[1].description and found[1].evidence_ids == ["E2", "E3"]
+
+
+def test_lakh_formatted_amounts_are_compared_correctly():
+    from app.agents.heuristics import rule_based_extraction
+    from app.schemas.investigation import RetrievedChunk
+
+    def chunk(ref, filename, doc_type, text):
+        return RetrievedChunk(chunk_id=ref, document_id=filename, filename=filename, document_type=doc_type, page=1, text=text, ref=ref)
+
+    facts = rule_based_extraction([
+        chunk("C1", "Contract.pdf", "contract", "The total contract value is Rs. 1,50,000."),
+        chunk("C2", "Invoice.pdf", "invoice", "Total amount due: Rs.1,58,000"),
+    ]).facts
+    totals = sorted((fact.value_number, fact.unit) for fact in facts if fact.key == "total_amount")
+    assert totals == [(150000.0, "PKR"), (158000.0, "PKR")]

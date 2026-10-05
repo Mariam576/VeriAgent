@@ -12,6 +12,11 @@ Two groups live here:
    these typed fields; nothing important is parsed out of free prose.
    The ``Field(description=...)`` texts are sent to the model as part of the
    schema, so they double as instructions.
+
+   Every field in these schemas is required (no defaults). A field that may
+   be empty is declared "nullable" (``float | None``) instead of optional.
+   Providers are free to skip optional fields, and a skipped ``key`` or
+   ``value_number`` would silently disable contradiction detection.
 """
 
 from __future__ import annotations
@@ -25,11 +30,16 @@ Severity = Literal["low", "medium", "high"]
 
 RISK_ORDER: dict[str, int] = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
-# Comparison keys with a fixed meaning. The model may also invent its own
-# snake_case keys for other quantities that should agree across documents.
+# Comparison keys. Evidence items that share one of the first two keys describe
+# the same quantity, so their values can be compared across documents.
+# Version 1 compares exactly these two quantities. Comparing arbitrary
+# quantities (line items, quantities, dates) needs matching logic that
+# belongs to the "advanced document comparison" planned for Version 3.
 KEY_TOTAL_AMOUNT = "total_amount"
 KEY_PAYMENT_TERMS = "payment_terms_days"
 KEY_OTHER = "other"
+COMPARABLE_KEYS = (KEY_TOTAL_AMOUNT, KEY_PAYMENT_TERMS)
+FactKey = Literal["total_amount", "payment_terms_days", "other"]
 
 
 # ============================================================ domain objects
@@ -117,17 +127,15 @@ class RequestAnalysis(BaseModel):
     needs_rag: bool = Field(description="True when answering requires searching the uploaded documents.")
     needs_calculation: bool = Field(description="True when amounts, differences, totals or percentages matter.")
     needs_external_verification: bool = Field(
-        default=False, description="True only if the answer would need information from outside the documents."
+        description="True only if the answer would need information from outside the documents."
     )
     decision_requested: bool = Field(
-        default=False,
         description="True when the user asks whether something should be approved, paid, accepted or rejected.",
     )
     standalone_question: str = Field(
         description="The user's request rewritten so it is understandable without the earlier conversation."
     )
     search_queries: list[str] = Field(
-        default_factory=list,
         description=(
             "1 to 4 short search queries for finding the relevant passages. Use one query per topic or "
             "per document, e.g. 'contract total value', 'invoice total amount', 'payment terms'."
@@ -138,28 +146,31 @@ class RequestAnalysis(BaseModel):
 class ExtractedFact(BaseModel):
     chunk_ref: str = Field(description="The reference of the chunk the fact comes from, exactly as given, e.g. 'C2'.")
     claim: str = Field(description="One factual statement, in plain words, that the chunk supports.")
-    key: str = Field(
-        default=KEY_OTHER,
+    key: FactKey = Field(
         description=(
-            "'total_amount' for the overall total value/price/amount due of the document; "
-            "'payment_terms_days' for the number of days allowed for payment; another short snake_case "
-            "name for any other quantity that the same quantity in a different document should match; "
-            "otherwise 'other'."
+            "'total_amount' ONLY for the overall total value of the whole document (contract value, invoice "
+            "total, amount due); 'payment_terms_days' for the number of days allowed for payment; "
+            "'other' for everything else, including line items, subtotals, taxes, thresholds and dates."
         ),
     )
     value_number: float | None = Field(
-        default=None, description="The numeric value of the fact if it has one (40000 for '£40,000'), else null."
+        description="The numeric value of the fact if it is an amount or a number of days (40000 for '£40,000'), else null."
     )
     unit: str | None = Field(
-        default=None, description="ISO currency code (GBP, USD, EUR...) for money, 'days' for durations, else null."
+        description="ISO currency code (GBP, USD, EUR, PKR...) for money, 'days' for durations, else null."
     )
-    quote: str = Field(description="A short passage copied word for word from the chunk that supports the claim.")
+    quote: str = Field(
+        description=(
+            "A short passage copied word for word from the chunk that supports the claim. If the fact has a "
+            "number, the quote must contain that number exactly as it is written in the chunk."
+        )
+    )
 
 
 class EvidenceExtraction(BaseModel):
     """Node 3 output: factual claims found in the retrieved chunks."""
 
-    facts: list[ExtractedFact] = Field(default_factory=list)
+    facts: list[ExtractedFact] = Field(description="The extracted facts. An empty list if nothing relevant is stated.")
 
 
 class SufficiencyAssessment(BaseModel):
@@ -167,20 +178,20 @@ class SufficiencyAssessment(BaseModel):
 
     sufficient: bool = Field(description="True only if the evidence is enough to answer the question reliably.")
     missing: list[str] = Field(
-        default_factory=list,
-        description="Each piece of evidence that would be needed but was not found, e.g. 'approved purchase order'.",
+        description=(
+            "Each piece of evidence that would be needed but was not found, e.g. 'approved purchase order'. "
+            "An empty list if nothing is missing."
+        ),
     )
     follow_up_queries: list[str] = Field(
-        default_factory=list,
-        description="Up to 3 new search queries that might find the missing evidence. Empty if none would help.",
+        description="Up to 3 new search queries that might find the missing evidence. An empty list if none would help.",
     )
 
 
 class RiskReason(BaseModel):
     text: str = Field(description="One reason for the risk level, in one sentence.")
     evidence_ids: list[str] = Field(
-        default_factory=list,
-        description="Ids of the items that support this reason (E.. evidence, X.. contradiction, K.. calculation, M.. missing evidence).",
+        description="Ids of the items that support this reason (E.. evidence, X.. contradiction, K.. calculation, M.. missing evidence, S.. suspicious content).",
     )
 
 
@@ -189,7 +200,7 @@ class RiskAssessment(BaseModel):
 
     level: RiskLevel
     confidence: float = Field(ge=0.0, le=1.0, description="How sure you are, between 0 and 1.")
-    reasons: list[RiskReason] = Field(default_factory=list)
+    reasons: list[RiskReason] = Field(description="The reasons for the risk level, each with supporting ids.")
     decision: Literal["proceed", "review", "reject"] = Field(
         description="proceed = no issue found; review = a person must look at it first; reject = should not go ahead."
     )

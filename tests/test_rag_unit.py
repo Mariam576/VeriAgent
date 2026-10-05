@@ -7,9 +7,10 @@ from app.rag.citations import (
     citations_from_evidence,
     format_citation,
     is_grounded,
-    numbers_in_text,
+    quote_in_text,
     unsupported_citations,
 )
+from app.numbers import normalize_unit, number_appears, numbers_in_text, parse_number
 from app.rag.reranker import lexical_overlap, rerank
 from app.schemas.investigation import EvidenceItem, RetrievedChunk
 
@@ -114,3 +115,38 @@ def test_citation_without_a_retrieved_chunk_is_reported():
     no_chunk = Citation(document="contract.pdf", page=4, document_id="contract", chunk_ids=[])
     assert unsupported_citations([good], retrieved) == []
     assert unsupported_citations([good, wrong_page, invented, no_chunk], retrieved) == [wrong_page, invented, no_chunk]
+
+
+# ------------------------------------------- grounding against real-world text
+def test_a_number_elsewhere_in_the_chunk_does_not_support_an_invented_claim():
+    text = "7.3 Payment terms: the Client shall pay each valid invoice within 30 days of the invoice date."
+    # "30" really is in the chunk, but not in this (invented) quote.
+    assert is_grounded("approved by 30 directors", 30, text) is False
+    # A real quote that does not contain the number is not enough either.
+    assert is_grounded("the Client shall pay each valid invoice", 30, text) is False
+    assert is_grounded("pay each valid invoice within 30 days", 30, text) is True
+
+
+def test_numeric_quotes_may_be_short_and_in_any_number_format():
+    assert is_grounded("£40,000", 40000, "The total contract value is £40,000.") is True
+    assert is_grounded("Rs. 1,50,000", 150000, "Total amount due: Rs. 1,50,000 only") is True
+    assert is_grounded("EUR 40.000,00", 40000, "Gesamtbetrag: EUR 40.000,00") is True
+
+
+def test_quotes_survive_pdf_line_breaks_hyphenation_dashes_and_ellipses():
+    text = "The Supplier shall invoice the Client quarterly in arrears. Pay-\nment is due within 30 days – no exceptions.\nReference INV-\n102 applies."
+    assert quote_in_text("Payment is due within 30 days", text)  # word broken across lines
+    assert quote_in_text("due within 30 days - no exceptions", text)  # en dash vs hyphen
+    assert quote_in_text("Reference INV-102 applies", text)  # code broken across lines
+    assert quote_in_text("The Supplier shall invoice ... Payment is due within 30 days", text)  # shortened with "..."
+    assert quote_in_text("The Supplier shall invoice the Client… no exceptions", text)
+    assert not quote_in_text("Payment is due within 30 days ... The Supplier shall invoice", text)  # wrong order
+    assert not quote_in_text("The Supplier shall invoice ... a signed approval exists", text)  # one part invented
+    assert not quote_in_text("...", text)
+
+
+def test_number_helpers_are_shared_with_the_rest_of_the_app():
+    assert numbers_in_text("£40,000 within 30 days") == [40000.0, 30.0]
+    assert parse_number("1,50,000") == [150000.0]
+    assert number_appears(150000, "Rs. 1,50,000")
+    assert normalize_unit("pounds sterling") == "GBP"

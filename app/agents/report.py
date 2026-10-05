@@ -44,15 +44,21 @@ CAPABILITIES = (
 
 
 def _cite(item: EvidenceItem) -> CitationOut:
-    return CitationOut(document=item.filename, page=item.page)
+    return CitationOut(document=item.filename, page=item.page, document_id=item.document_id)
+
+
+def _cite_suspicious(item: dict[str, Any]) -> CitationOut:
+    return CitationOut(document=item["document"], page=item["page"], document_id=item.get("document_id"))
 
 
 def _unique(citations: list[CitationOut]) -> list[CitationOut]:
+    # Two different files may share a name, so the document id is part of the identity.
     seen: set[tuple[str, int]] = set()
     result = []
     for citation in citations:
-        if (citation.document, citation.page) not in seen:
-            seen.add((citation.document, citation.page))
+        identity = (citation.document_id or citation.document, citation.page)
+        if identity not in seen:
+            seen.add(identity)
             result.append(citation)
     return result
 
@@ -190,11 +196,14 @@ def build_report(state: dict[str, Any], *, human_approval_enabled: bool, llm_pro
             elif identifier in contradiction_by_id:
                 cited += [_cite(by_id[i]) for i in contradiction_by_id[identifier].evidence_ids if i in by_id]
             elif identifier in suspicious_by_id:
-                cited.append(CitationOut(document=suspicious_by_id[identifier]["document"], page=suspicious_by_id[identifier]["page"]))
+                cited.append(_cite_suspicious(suspicious_by_id[identifier]))
         reasons_out.append(FindingOut(type="risk", statement=reason["text"], severity=risk_level, citations=_unique(cited)))
 
-    sources = [CitationOut(document=c.document, page=c.page) for c in citations_from_evidence(evidence)]
-    sources = _unique(sources + [CitationOut(document=s["document"], page=s["page"]) for s in suspicious])
+    sources = [
+        CitationOut(document=c.document, page=c.page, document_id=c.document_id)
+        for c in citations_from_evidence(evidence)
+    ]
+    sources = _unique(sources + [_cite_suspicious(item) for item in suspicious])
 
     if status == "not_applicable":
         summary, action = CAPABILITIES, "Upload documents and ask a question about them."
@@ -276,7 +285,7 @@ def render_report(report: InvestigationReport) -> str:
     return "\n".join(lines)
 
 
-def findings_for_storage(report: InvestigationReport, document_ids: dict[str, str]) -> list[dict[str, Any]]:
+def findings_for_storage(report: InvestigationReport) -> list[dict[str, Any]]:
     """Flatten the report into rows for the ``findings`` table."""
     import uuid
 
@@ -284,11 +293,11 @@ def findings_for_storage(report: InvestigationReport, document_ids: dict[str, st
         if not citations:
             return {"source_document_id": None, "page_number": None}
         first = citations[0]
-        document_id = document_ids.get(first.document)
-        return {
-            "source_document_id": uuid.UUID(document_id) if document_id else None,
-            "page_number": first.page,
-        }
+        try:
+            document_id = uuid.UUID(first.document_id) if first.document_id else None
+        except ValueError:
+            document_id = None
+        return {"source_document_id": document_id, "page_number": first.page}
 
     rows: list[dict[str, Any]] = []
     for finding in report.key_findings:

@@ -26,6 +26,7 @@ STATUS_LABELS = {
 class CitationOut(BaseModel):
     document: str
     page: int
+    document_id: str | None = None
 
 
 class FindingOut(BaseModel):
@@ -99,6 +100,12 @@ class InvestigationRequest(BaseModel):
     question: str = Field(min_length=1, examples=["Review this invoice against the contract and tell me whether it should be approved."])
     document_ids: list[uuid.UUID] = Field(
         default_factory=list, description="Optional: only search these documents. Empty = all your documents."
+    )
+    document_type: str | None = Field(
+        default=None, description="Optional metadata filter: only search documents of this type, e.g. 'invoice'."
+    )
+    year: int | None = Field(
+        default=None, ge=1980, le=2100, description="Optional metadata filter: only search documents from this year."
     )
 
 

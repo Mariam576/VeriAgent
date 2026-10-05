@@ -8,6 +8,7 @@ Concept - why async?
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from functools import lru_cache
@@ -23,6 +24,9 @@ from sqlalchemy.ext.asyncio import (
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+DB_STARTUP_ATTEMPTS = 15
+DB_STARTUP_DELAY_SECONDS = 2.0
 
 
 @lru_cache
@@ -58,6 +62,22 @@ async def init_db() -> None:
 
     settings = get_settings()
     engine = get_engine()
+
+    # The database container may still be starting when the API starts.
+    # Wait for it a bounded number of times instead of crashing immediately.
+    for attempt in range(1, DB_STARTUP_ATTEMPTS + 1):
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            break
+        except Exception as exc:  # noqa: BLE001
+            if attempt == DB_STARTUP_ATTEMPTS:
+                raise RuntimeError(
+                    "Could not connect to the database. Check DATABASE_URL and that PostgreSQL is running."
+                ) from exc
+            logger.warning("Database not ready yet (attempt %d/%d), retrying...", attempt, DB_STARTUP_ATTEMPTS)
+            await asyncio.sleep(DB_STARTUP_DELAY_SECONDS)
+
     async with engine.begin() as conn:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)

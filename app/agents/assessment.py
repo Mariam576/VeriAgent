@@ -10,17 +10,29 @@ evidence always gives the same result and every number can be explained.
 
 from __future__ import annotations
 
+import re
 from fractions import Fraction
 from typing import Any
 
 from app.agents.heuristics import fallback_risk
-from app.rag.citations import citations_from_evidence, numbers_in_text, unsupported_citations
+from app.numbers import NUMBER_CORE, numbers_in_text, parse_number
+from app.rag.citations import citations_from_evidence, unsupported_citations
 from app.schemas.investigation import RISK_ORDER, Calculation, Contradiction, EvidenceItem, RetrievedChunk
 from app.security.guardrails import detect_prompt_injection
 
 RISK_LEVELS = ["low", "medium", "high", "critical"]
 
 _SEVERITY_POINTS = {"low": 1, "medium": 2, "high": 3}
+
+
+def clean_ids(identifiers: list[Any] | None) -> list[str]:
+    """Normalise reference ids from the model: "x1", "[E2]" and " m1 " become X1, E2, M1."""
+    cleaned = [
+        re.sub(r"[^A-Za-z0-9]", "", str(identifier)).upper()
+        for identifier in identifiers or []
+        if identifier is not None
+    ]
+    return [identifier for identifier in cleaned if identifier]
 
 
 # -------------------------------------------------------------- risk baseline
@@ -79,7 +91,7 @@ def confidence_ceiling(
     documents = {item.document_id for item in evidence}
     score += 0.15 if len(documents) >= 2 else 0.05
     score += 0.15 * (len(evidence) / (len(evidence) + discarded_facts))
-    numeric = [item for item in contradictions if item.type not in ("unit_mismatch",)]
+    numeric = [item for item in contradictions if item.type not in ("unit_mismatch", "internal_inconsistency")]
     if all(item.difference is not None for item in numeric):
         score += 0.10
     score -= min(0.05 * len(missing_evidence), 0.15)
@@ -144,6 +156,26 @@ def known_numbers(
     return {abs(value) for value in numbers}
 
 
+# "£18k", "1.2m", "3bn": a number followed directly by a magnitude suffix.
+_SUFFIXED_NUMBER = re.compile(rf"(?<!\w)(?<!\d[.,])(?P<number>{NUMBER_CORE})\s?(?P<suffix>k|m|mn|bn|million|billion|thousand)?(?![\w]|[.,]\d)", re.I)
+_MAGNITUDE = {"k": 1e3, "thousand": 1e3, "m": 1e6, "mn": 1e6, "million": 1e6, "bn": 1e9, "billion": 1e9}
+
+
+def _is_known(value: float, known: set[float]) -> bool:
+    """Is ``value`` one of the known numbers, allowing for ordinary rounding in prose?
+
+    A model that writes "about 31%" for a tool result of 31.25, or "£18.3k"
+    for 18,250, is rounding, not inventing. The value is accepted when it
+    equals a known number rounded to a whole number or to one or two decimals.
+    """
+    for candidate in known:
+        if abs(value - candidate) <= 0.005 * max(1.0, abs(candidate)):
+            return True
+        if any(abs(value - round(candidate, digits)) < 1e-9 for digits in (0, 1, 2)):
+            return True
+    return False
+
+
 def unknown_numbers(text: str, known: set[float]) -> list[float]:
     """Numbers in ``text`` that appear nowhere in the documents or tool results.
 
@@ -151,11 +183,16 @@ def unknown_numbers(text: str, known: set[float]) -> list[float]:
     "2 contradictions" or list numbering, not facts from a document.
     """
     unknown = []
-    for value in numbers_in_text(text):
-        if value <= 10 and float(value).is_integer():
+    for match in _SUFFIXED_NUMBER.finditer(text):
+        readings = parse_number(match.group("number"))
+        if not readings:
             continue
-        if not any(abs(value - candidate) <= 0.005 * max(1.0, abs(candidate)) for candidate in known):
-            unknown.append(value)
+        scale = _MAGNITUDE.get((match.group("suffix") or "").lower(), 1.0)
+        candidates = [reading * scale for reading in readings]
+        if scale == 1.0 and any(value <= 10 and float(value).is_integer() for value in candidates):
+            continue
+        if not any(_is_known(value, known) for value in candidates):
+            unknown.append(candidates[0])
     return unknown
 
 
@@ -257,7 +294,7 @@ def review_draft(
     numbers = known_numbers(question, retrieved, evidence, contradictions, calculations)
     kept_reasons = []
     for index, reason in enumerate(draft.get("reasons", []), start=1):
-        ids = reason.get("evidence_ids") or []
+        ids = clean_ids(reason.get("evidence_ids"))
         if not ids or any(identifier not in valid_ids for identifier in ids):
             issues.append(f"Reason {index} has no supporting citation.")
             continue
@@ -265,7 +302,7 @@ def review_draft(
         if strangers:
             issues.append(f"Reason {index} mentions a figure that is not in the evidence ({strangers[0]:g}).")
             continue
-        kept_reasons.append(reason)
+        kept_reasons.append({**reason, "evidence_ids": ids})
     if len(kept_reasons) != len(draft.get("reasons", [])):
         corrected["reasons"] = kept_reasons or [reason.model_dump() for reason in safe.reasons]
 

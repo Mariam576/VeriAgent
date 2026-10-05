@@ -223,3 +223,48 @@ async def test_adapter_returns_tool_call_requests_without_running_them():
     calls = await llm.choose_tools(system="s", user="u", tools=[calculate_difference])
     assert calls == [ToolCallRequest(name="calculate_difference", args={"value_a": 58000, "value_b": 40000}, id="call-1")]
     assert executed == []  # the model only asked; Python decides whether to run it
+
+
+# ------------------------------------------------- permanent provider errors
+class HttpError(Exception):
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404])
+async def test_rejected_requests_fail_fast_instead_of_being_retried(status):
+    llm = FlakyLLM(failures=99, error=HttpError(status, "API key not valid"), max_retries=3)
+    with pytest.raises(LLMConfigurationError, match=f"HTTP {status}"):
+        await ask(llm)
+    assert llm.attempts == 1
+
+
+@pytest.mark.parametrize("status", [408, 429, 500, 503])
+async def test_temporary_http_errors_are_retried(status):
+    llm = FlakyLLM(failures=1, error=HttpError(status, "try later"), max_retries=2)
+    assert (await ask(llm)).reply == "ok"
+    assert llm.attempts == 2
+
+
+async def test_status_code_is_found_on_a_wrapped_cause():
+    from app.llm.base import is_permanent_error, provider_status_code
+
+    try:
+        try:
+            raise HttpError(404, "model not found")
+        except HttpError as inner:
+            raise RuntimeError("SDK wrapper error") from inner
+    except RuntimeError as wrapped:
+        assert provider_status_code(wrapped) == 404
+        assert is_permanent_error(wrapped)
+    assert not is_permanent_error(RuntimeError("connection reset by peer"))
+    assert is_permanent_error(RuntimeError("API key not valid. Please pass a valid API key."))
+
+
+async def test_provider_error_text_is_redacted_before_it_is_reported():
+    secret_error = RuntimeError("request failed for key AIzaSyA1234567890abcdefghijklmnopqrstu")
+    llm = FlakyLLM(failures=99, error=secret_error, max_retries=0)
+    with pytest.raises(LLMUnavailableError) as raised:
+        await ask(llm)
+    assert "AIzaSyA1234567890" not in str(raised.value) and "[REDACTED]" in str(raised.value)

@@ -11,11 +11,14 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
-      # Lets you inspect the database from your PC. Change DB_PORT in .env if
-      # 5432 is already used by another PostgreSQL on your machine.
-      - "${DB_PORT:-5432}:5432"
+      # Lets you inspect the database from your own PC only (127.0.0.1), on
+      # port 5433 so it does not clash with a PostgreSQL installed on Windows.
+      # Change DB_PORT in .env if you need another port.
+      - "127.0.0.1:${DB_PORT:-5433}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d veriagent"]
+      # "-h 127.0.0.1" waits for the real server, not the temporary one that
+      # runs while the database is being initialised for the first time.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d veriagent"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -32,8 +35,11 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    restart: unless-stopped
     ports:
-      - "${API_PORT:-8000}:8000"
+      # Bound to 127.0.0.1: reachable from this computer only. The API has
+      # placeholder authentication, so it must not be exposed to a network.
+      - "127.0.0.1:${API_PORT:-8000}:8000"
     volumes:
       - uploads:/app/uploads
       # Keeps the downloaded embedding model between restarts.

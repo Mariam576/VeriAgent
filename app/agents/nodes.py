@@ -20,9 +20,14 @@ Where the LLM is used, and where it is not:
     correct_findings       no LLM: applies the reviewer's fixes
     final_report           no LLM: report assembled from structured findings
 
-If the LLM is not configured at all (missing key) the investigation stops with
-a clear error. If it is configured but temporarily failing, each step falls
-back to rules and the report says so under "Limitations".
+Two kinds of LLM failure are handled differently (see app/llm/base.py):
+
+* Not usable at all - missing key, or the provider rejects the request (wrong
+  key, unknown model: HTTP 400/401/403/404). The investigation stops with a
+  clear error. Carrying on with rules would look like success and hide the cause.
+* Temporarily failing - timeout, rate limit, server error, unusable output -
+  after the bounded retries. The step falls back to rules, and the report says
+  so under "Limitations".
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from app.agents import heuristics, prompts
 from app.agents.assessment import (
     baseline_risk,
+    clean_ids,
     confidence_ceiling,
     known_numbers,
     review_draft,
@@ -51,11 +57,14 @@ from app.agents.state import InvestigationState
 from app.config import Settings
 from app.formatting import key_label
 from app.llm.base import BaseLLM, LLMConfigurationError, LLMError
+from app.numbers import normalize_unit
 from app.rag.citations import is_grounded, normalize
 from app.rag.reranker import select_diverse
 from app.rag.retriever import Retriever, SearchFilters
 from app.schemas.investigation import (
+    COMPARABLE_KEYS,
     KEY_OTHER,
+    KEY_PAYMENT_TERMS,
     Calculation,
     Contradiction,
     EvidenceExtraction,
@@ -79,7 +88,9 @@ MAX_EVIDENCE_ITEMS = 40
 MAX_LLM_TOOL_CALLS = 5
 MAX_REVIEW_ROUNDS = 2
 
-_UNIT_ALIASES = {"£": "GBP", "$": "USD", "€": "EUR", "day": "days", "pounds": "GBP", "dollars": "USD", "euros": "EUR"}
+_CHUNK_REF = re.compile(r"\bC\d+\b", re.IGNORECASE)
+# Answers such as "none" in a list of missing evidence mean "nothing is missing".
+_NOTHING = {"none", "n/a", "na", "nothing", "nil", "no", "-", "not applicable", "nothing is missing", "none identified"}
 
 NodeFunction = Callable[[Any, InvestigationState], Awaitable[dict[str, Any]]]
 
@@ -125,17 +136,18 @@ def event(node: str, message: str) -> dict[str, Any]:
 
 def _clean_key(key: str | None) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", "_", (key or "").strip().lower()).strip("_")
-    return cleaned or KEY_OTHER
+    return cleaned if cleaned in COMPARABLE_KEYS else KEY_OTHER
 
 
-def _clean_unit(unit: str | None) -> str | None:
-    if not unit or not unit.strip():
-        return None
-    stripped = unit.strip()
-    alias = _UNIT_ALIASES.get(stripped.lower())
-    if alias:
-        return alias
-    return stripped.upper() if len(stripped) == 3 and stripped.isalpha() else stripped.lower()
+def _find_chunk(reference: str, by_ref: dict[str, RetrievedChunk]) -> RetrievedChunk | None:
+    """Resolve the model's chunk reference. Accepts "C2", "c2", "[C2]", "Chunk C2", "ref=C2"."""
+    match = _CHUNK_REF.search(reference or "")
+    return by_ref.get(match.group(0).upper()) if match else None
+
+
+def _question(state: InvestigationState) -> str:
+    """The request as later steps should read it: the standalone rewrite when there is one."""
+    return state.get("standalone_question") or state["question"]
 
 
 class InvestigationNodes:
@@ -175,6 +187,9 @@ class InvestigationNodes:
         queries = dedupe_keep_order([standalone, *analysis.search_queries])[:MAX_SEARCH_QUERIES]
         update.update(
             analysis=analysis.model_dump(),
+            # Later steps read this, so a follow-up like "what about the payment
+            # terms?" keeps the context of the earlier turns.
+            standalone_question=standalone,
             search_queries=queries if analysis.needs_rag else [],
             events=[event("analyze_request", "Analyzing request...")],
         )
@@ -197,7 +212,12 @@ class InvestigationNodes:
             update["events"] = [event("retrieve", "No new search queries to run.")]
             return update
 
-        filters = SearchFilters(document_ids=list(state.get("document_ids", [])))
+        chosen = state.get("filters", {})
+        filters = SearchFilters(
+            document_ids=list(state.get("document_ids", [])),
+            document_type=chosen.get("document_type"),
+            year=chosen.get("year"),
+        )
         # Independent searches run at the same time (async I/O, spec section 32).
         results = await asyncio.gather(
             *(
@@ -224,7 +244,13 @@ class InvestigationNodes:
                     candidates[chunk.chunk_id] = chunk
 
         # Guardrail: never hold more than MAX_RETRIEVED_CHUNKS chunks in total.
-        room = max(self.settings.MAX_RETRIEVED_CHUNKS - len(existing), 0)
+        # The first search may not use the whole budget, so that a later
+        # "retrieve again" round still has room for what it finds.
+        budget = self.settings.MAX_RETRIEVED_CHUNKS
+        if not existing:
+            reserve = min(self.settings.RERANK_TOP_K, budget // 3)
+            budget = max(budget - reserve, 1)
+        room = max(budget - len(existing), 0)
         selected = select_diverse(sorted(candidates.values(), key=lambda c: c.rerank_score, reverse=True), room)
         new_chunks = [
             chunk.model_copy(update={"ref": f"C{len(existing) + index}"})
@@ -257,7 +283,7 @@ class InvestigationNodes:
             extraction = await self.llm.structured(
                 EvidenceExtraction,
                 system=prompts.system_prompt(prompts.EXTRACT_TASK),
-                user=prompts.build_extraction_prompt(state["question"], new_chunks),
+                user=prompts.build_extraction_prompt(_question(state), new_chunks),
                 purpose="extract_evidence",
             )
             update["llm_calls"] = 1
@@ -299,7 +325,7 @@ class InvestigationNodes:
         for fact in facts:
             if len(existing) + len(accepted) >= MAX_EVIDENCE_ITEMS:
                 break
-            chunk = by_ref.get(fact.chunk_ref.strip().upper())
+            chunk = _find_chunk(fact.chunk_ref, by_ref)
             claim = fact.claim.strip()
             # Unknown chunk reference = invented source. Not grounded = unsupported claim.
             if chunk is None or not claim or not is_grounded(fact.quote, fact.value_number, chunk.text):
@@ -310,6 +336,7 @@ class InvestigationNodes:
             key = _clean_key(fact.key)
             if fact.value_number is None:
                 key = KEY_OTHER  # a comparison key needs a number to compare
+            unit = "days" if key == KEY_PAYMENT_TERMS else normalize_unit(fact.unit)
             identity = (chunk.document_id, key, fact.value_number, normalize(claim))
             typed_identity = (chunk.document_id, key, fact.value_number)
             if identity in seen or (key != KEY_OTHER and typed_identity in seen_typed):
@@ -324,7 +351,7 @@ class InvestigationNodes:
                     claim=claim[:400],
                     key=key,
                     value_number=fact.value_number,
-                    unit=_clean_unit(fact.unit),
+                    unit=unit,
                     quote=fact.quote.strip()[:400],
                     extracted_by=source,  # type: ignore[arg-type]
                     # Source fields come from the database record, not from the model.
@@ -382,20 +409,19 @@ class InvestigationNodes:
 
         # --- Part 1: calculations every numeric contradiction needs. Chosen by code, run by the tool.
         for item in contradictions:
-            if item.type == "unit_mismatch":
-                continue
+            if item.type in ("unit_mismatch", "internal_inconsistency"):
+                continue  # different currencies cannot be subtracted; one-document notes need no maths
             label = key_label(item.key)
             difference = run(
                 "calculate_difference", {"value_a": item.value_b, "value_b": item.value_a},
                 f"{label}: {item.source_b} minus {item.source_a}", "system",
             )
             item.difference = difference.result
-            if item.unit_b != "days":
-                change = run(
-                    "calculate_percentage_change", {"old": item.value_a, "new": item.value_b},
-                    f"{label}: percentage change from {item.source_a} to {item.source_b}", "system",
-                )
-                item.percentage_change = change.result
+            change = run(
+                "calculate_percentage_change", {"old": item.value_a, "new": item.value_b},
+                f"{label}: percentage change from {item.source_a} to {item.source_b}", "system",
+            )
+            item.percentage_change = change.result
 
         # --- Part 2: tool calling. The model may request further calculations.
         numeric_evidence = [item for item in evidence if item.value_number is not None]
@@ -404,7 +430,7 @@ class InvestigationNodes:
             try:
                 requests = await self.llm.choose_tools(
                     system=prompts.system_prompt(prompts.TOOLS_TASK),
-                    user=prompts.build_tools_prompt(state["question"], evidence, calculations),
+                    user=prompts.build_tools_prompt(_question(state), evidence, calculations),
                     tools=CALCULATOR_TOOLS,
                     purpose="choose_calculations",
                 )
@@ -420,7 +446,7 @@ class InvestigationNodes:
                 requests = requests[:MAX_LLM_TOOL_CALLS]
                 # Guardrail on tool arguments: the model may only pass numbers
                 # that exist in the evidence or in earlier tool results.
-                allowed = known_numbers(state["question"], [], evidence, contradictions, calculations)
+                allowed = known_numbers(_question(state), [], evidence, contradictions, calculations)
                 messages: list[Any] = [
                     AIMessage(
                         content="",
@@ -468,7 +494,9 @@ class InvestigationNodes:
         previous = state.get("sufficiency")
         if not evidence:
             # Nothing was found at all: no need to spend an LLM call to learn that.
-            assessment = SufficiencyAssessment(sufficient=False, missing=[heuristics.MISSING_ANY_EVIDENCE])
+            assessment = SufficiencyAssessment(
+                sufficient=False, missing=[heuristics.MISSING_ANY_EVIDENCE], follow_up_queries=[]
+            )
         elif previous and state.get("retrieval_rounds", 0) > 1 and not state.get("new_chunk_ids"):
             # The follow-up search found nothing new, so the earlier assessment still stands.
             assessment = SufficiencyAssessment(**previous).model_copy(update={"follow_up_queries": []})
@@ -479,7 +507,7 @@ class InvestigationNodes:
                     SufficiencyAssessment,
                     system=prompts.system_prompt(prompts.SUFFICIENCY_TASK),
                     user=prompts.build_sufficiency_prompt(
-                        state["question"], bool(analysis.get("decision_requested")), evidence, contradictions,
+                        _question(state), bool(analysis.get("decision_requested")), evidence, contradictions,
                         calculations, state.get("executed_queries", []),
                         sorted({chunk["filename"] for chunk in state.get("retrieved_documents", [])}),
                     ),
@@ -491,7 +519,7 @@ class InvestigationNodes:
             except LLMError as exc:
                 logger.warning("check_sufficiency fell back to rules: %s", exc)
                 assessment = heuristics.fallback_sufficiency(
-                    question=state["question"],
+                    question=_question(state),
                     decision_requested=bool(analysis.get("decision_requested")),
                     investigating=analysis.get("task_type") == "document_investigation",
                     evidence=[item.model_dump() for item in evidence],
@@ -501,7 +529,10 @@ class InvestigationNodes:
                 update["used_fallback"] = True
                 update["limitations"] = ["The language model was unavailable while judging evidence sufficiency; simple rules were used instead."]
 
-        missing = dedupe_keep_order(assessment.missing)
+        missing = [text for text in dedupe_keep_order(assessment.missing) if text.strip(" .").lower() not in _NOTHING]
+        if not assessment.sufficient and not missing:
+            # "Not sufficient" without saying why must still be visible in the report.
+            missing = ["The evidence was judged insufficient, but what is missing was not specified."]
         sufficient = assessment.sufficient and not missing
         update["sufficiency"] = {"sufficient": sufficient, "missing": missing, "follow_up_queries": assessment.follow_up_queries}
         update["missing_evidence"] = missing
@@ -513,6 +544,11 @@ class InvestigationNodes:
             if normalize(query) not in already_run
         ]
         room_left = len(state.get("retrieved_documents", [])) < self.settings.MAX_RETRIEVED_CHUNKS
+        if not sufficient and new_queries and not room_left:
+            update.setdefault("limitations", []).append(
+                f"The limit of {self.settings.MAX_RETRIEVED_CHUNKS} retrieved chunks was reached, so no further "
+                "search for the missing evidence was run."
+            )
         if not sufficient and new_queries and room_left:
             if iteration < self.settings.MAX_AGENT_ITERATIONS:
                 update["retrieve_again"] = True
@@ -558,7 +594,7 @@ class InvestigationNodes:
                     RiskAssessment,
                     system=prompts.system_prompt(prompts.RISK_TASK),
                     user=prompts.build_risk_prompt(
-                        state["question"], bool(analysis.get("decision_requested")), evidence, contradictions,
+                        _question(state), bool(analysis.get("decision_requested")), evidence, contradictions,
                         calculations, missing, suspicious, baseline,
                     ),
                     purpose="assess_risk",
@@ -582,6 +618,8 @@ class InvestigationNodes:
             used_fallback=bool(state.get("used_fallback") or update.get("used_fallback")),
         )
         draft = assessment.model_dump()
+        for reason in draft["reasons"]:
+            reason["evidence_ids"] = clean_ids(reason["evidence_ids"])  # "x1", "[E2]" -> X1, E2
         draft.update(source=source, baseline_level=baseline, confidence_ceiling=ceiling)
         if source == "rules":
             draft["confidence"] = ceiling  # rule-based drafts take the evidence-based value directly
@@ -613,7 +651,7 @@ class InvestigationNodes:
     def _run_review(self, state: InvestigationState) -> tuple[list[str], dict[str, Any], dict[str, list[str]]]:
         return review_draft(
             state["risk_draft"],
-            question=state["question"],
+            question=_question(state) + " " + state["question"],
             retrieved=[RetrievedChunk(**chunk) for chunk in state.get("retrieved_documents", [])],
             evidence=[EvidenceItem(**item) for item in state.get("evidence", [])],
             contradictions=[Contradiction(**item) for item in state.get("contradictions", [])],
@@ -631,6 +669,11 @@ class InvestigationNodes:
         update: dict[str, Any] = {
             "risk_draft": corrected,
             "events": [event("correct_findings", f"Correcting {len(issues)} issue(s) found in review...")],
+            # Transparency: the reader should know that the model's draft was changed, and why.
+            "limitations": [
+                "The reviewer corrected the draft assessment: " + " ".join(issues[:4])
+                + (f" (and {len(issues) - 4} more)" if len(issues) > 4 else "")
+            ],
         }
         if drops["evidence"]:
             keep = [item for item in state.get("evidence", []) if item["id"] not in drops["evidence"]]

@@ -5,7 +5,7 @@ Only non-secret configuration is returned (provider and model names, never keys)
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 from pydantic import BaseModel
 
 from app.config import get_settings
@@ -23,10 +23,12 @@ class HealthResponse(BaseModel):
     embedding_provider: str
 
 
-@router.get("/health", response_model=HealthResponse)
-async def health() -> HealthResponse:
+@router.get("/health", response_model=HealthResponse, responses={503: {"model": HealthResponse}})
+async def health(response: Response) -> HealthResponse:
     settings = get_settings()
     db_ok = await check_db()
+    if not db_ok:
+        response.status_code = 503  # lets Docker's health check notice a lost database
     return HealthResponse(
         status="ok" if db_ok else "degraded",
         version=settings.APP_VERSION,

@@ -7,7 +7,8 @@ from app.llm.base import BaseLLM, LLMConfigurationError
 from app.llm.langchain_adapter import LangChainLLM
 
 
-def create_gemini_llm(settings: Settings) -> BaseLLM:
+def create_gemini_llm(settings: Settings, *, client_args: dict | None = None) -> BaseLLM:
+    """Build the Gemini LLM. ``client_args`` is passed to the HTTP client (tests inject a fake transport)."""
     if settings.GEMINI_API_KEY is None:
         raise LLMConfigurationError(
             "GEMINI_API_KEY is not set. Add it to your .env file "
@@ -30,6 +31,8 @@ def create_gemini_llm(settings: Settings) -> BaseLLM:
     }
     if settings.LLM_TEMPERATURE is not None:
         options["temperature"] = settings.LLM_TEMPERATURE
+    if client_args:
+        options["client_args"] = client_args
 
     return LangChainLLM(
         ChatGoogleGenerativeAI(**options),

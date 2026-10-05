@@ -36,9 +36,11 @@ class InvestigationState(TypedDict, total=False):
     messages: Annotated[list[AnyMessage], add_messages]
     user_id: str
     investigation_id: str
-    question: str
+    question: str  # exactly what the user typed
+    standalone_question: str  # the same request, rewritten to make sense without the conversation
     history: list[dict[str, str]]  # earlier turns of the conversation: {"role", "content"}
     document_ids: list[str]  # optional: restrict the investigation to these documents
+    filters: dict[str, Any]  # optional metadata filters: document_type, year
 
     # --------------------------------------------------- request analysis
     analysis: dict[str, Any]
@@ -89,6 +91,7 @@ def initial_state(
     question: str,
     history: list[dict[str, str]] | None = None,
     document_ids: list[str] | None = None,
+    filters: dict[str, Any] | None = None,
 ) -> InvestigationState:
     from langchain_core.messages import HumanMessage
 
@@ -97,8 +100,10 @@ def initial_state(
         user_id=user_id,
         investigation_id=investigation_id,
         question=question,
+        standalone_question=question,
         history=history or [],
         document_ids=document_ids or [],
+        filters=filters or {},
         search_queries=[],
         executed_queries=[],
         retrieved_documents=[],

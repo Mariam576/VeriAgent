@@ -41,6 +41,13 @@ def _write_file(path: Path, data: bytes) -> None:
     path.write_bytes(data)
 
 
+def _extract_and_chunk(data: bytes, extension: str, chunk_size: int, chunk_overlap: int):
+    """All the CPU-bound work on one document, done together in a worker thread."""
+    pages = load_pages(data, extension)
+    full_text = "\n".join(page.text for page in pages)
+    return pages, chunk_pages(pages, chunk_size, chunk_overlap), guess_year(full_text)
+
+
 async def ingest_document(
     session: AsyncSession,
     *,
@@ -83,16 +90,13 @@ async def ingest_document(
     try:
         await asyncio.to_thread(_write_file, path, data)
 
-        # 4. Extract and clean text, page by page. Parsing is CPU work, so it
-        #    runs in a worker thread instead of blocking the event loop.
-        pages = await asyncio.to_thread(load_pages, data, extension)
-        full_text = "\n".join(page.text for page in pages)
+        # 4. Extract and clean text page by page, then 5. chunk it. Parsing is
+        #    CPU work, so it runs in a worker thread instead of blocking the event loop.
+        pages, chunks, year = await asyncio.to_thread(
+            _extract_and_chunk, data, extension, settings.CHUNK_SIZE, settings.CHUNK_OVERLAP
+        )
         if document_type is None:
             document.document_type = guess_document_type(safe_name, pages[0].text if pages else "")
-        year = guess_year(full_text)
-
-        # 5. Chunk.
-        chunks = chunk_pages(pages, settings.CHUNK_SIZE, settings.CHUNK_OVERLAP)
         if not chunks:
             raise DocumentProcessingError("The document contains no text to index.")
 

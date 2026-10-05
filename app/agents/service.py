@@ -30,7 +30,7 @@ from app.llm.factory import get_llm
 from app.rag.retriever import PgVectorRetriever
 from app.schemas.response import InvestigationReport
 from app.security.guardrails import redact_secrets
-from app.security.validation import validate_question
+from app.security.validation import validate_document_type, validate_question
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +52,14 @@ async def run_investigation(
     user: User,
     question: str,
     document_ids: list[uuid.UUID] | None = None,
+    document_type: str | None = None,
+    year: int | None = None,
     conversation_id: uuid.UUID | None = None,
     history: list[dict[str, str]] | None = None,
 ) -> tuple[Investigation, InvestigationReport]:
     settings = get_settings()
     question = validate_question(question, settings)  # input validation
+    filters = {"document_type": validate_document_type(document_type), "year": year}
 
     # Ownership check: a user can only investigate their own documents.
     document_ids = list(dict.fromkeys(document_ids or []))
@@ -79,6 +82,7 @@ async def run_investigation(
                 question=question,
                 history=history,
                 document_ids=[str(document_id) for document_id in document_ids],
+                filters={name: value for name, value in filters.items() if value is not None},
             ),
             config={"recursion_limit": recursion_limit(settings.MAX_AGENT_ITERATIONS)},
         )
@@ -95,16 +99,21 @@ async def run_investigation(
             ) from exc
         raise
 
-    report = InvestigationReport(**state["report"])
+    # Output validation: the whole report passes through the redaction filter,
+    # so nothing that looks like a key or password leaves the system.
+    report = InvestigationReport.model_validate_json(
+        redact_secrets(InvestigationReport(**state["report"]).model_dump_json(), settings)
+    )
     report.stats.duration_ms = round((time.perf_counter() - started) * 1000, 1)
-    # Output validation: nothing that looks like a key or password leaves the system.
-    report.summary = redact_secrets(report.summary, settings)
-    report.recommended_action = redact_secrets(report.recommended_action, settings)
-    report.answer_text = redact_secrets(report.answer_text, settings)
+    if report.stats.llm_calls == 0 and state.get("used_fallback"):
+        # Be explicit when no model answered at all, so a rule-based result is never mistaken for an LLM one.
+        report.stats.llm_provider = f"{report.stats.llm_provider} (unavailable - rules used)"
 
-    document_ids_by_name = {chunk["filename"]: chunk["document_id"] for chunk in state.get("retrieved_documents", [])}
     tool_calls = [
-        {key: call[key] for key in ("tool_name", "arguments", "result", "status", "latency_ms")}
+        {
+            "tool_name": str(call["tool_name"])[:100],  # the name may come from the model
+            **{key: call[key] for key in ("arguments", "result", "status", "latency_ms")},
+        }
         for call in state.get("tool_calls", [])
     ]
     await repositories.save_investigation_result(
@@ -114,7 +123,7 @@ async def run_investigation(
         risk_level=report.risk_level,
         confidence_score=report.confidence,
         report=report.model_dump(mode="json"),
-        findings=findings_for_storage(report, document_ids_by_name),
+        findings=findings_for_storage(report),
         tool_calls=tool_calls,
     )
     logger.info(

@@ -1,10 +1,17 @@
 """Step 3 of the spec: User -> LLM -> Response.
 
-Sends one tiny request through the configured provider so you can confirm
-your API key and model name work before running a full investigation.
+Checks the configured provider with the same kinds of request the agent
+makes, so you know your API key and model work before a full investigation:
+
+    1. a plain structured answer
+    2. request analysis        (structured output with enums and lists)
+    3. evidence extraction     (structured output with nullable fields, on a tiny document)
+    4. tool calling            (the model must ask for the calculator)
 
     docker compose exec api python -m scripts.check_llm
     (or locally)  python -m scripts.check_llm
+
+Uses 4 small requests. With LLM_PROVIDER=mock no real model is called.
 """
 
 from __future__ import annotations
@@ -12,26 +19,70 @@ from __future__ import annotations
 import asyncio
 import sys
 
+from app.agents import prompts
 from app.config import get_settings
 from app.llm.base import LLMError, LLMPing
 from app.llm.factory import get_llm
+from app.schemas.investigation import EvidenceExtraction, EvidenceItem, RequestAnalysis, RetrievedChunk
+from app.tools.calculator import CALCULATOR_TOOLS
+
+QUESTION = "Compare the invoice total with the contract value."
+SAMPLE_CHUNK = RetrievedChunk(
+    chunk_id="check-1", document_id="check-doc", filename="Sample_Invoice.pdf", document_type="invoice",
+    page=1, ref="C1", text="Invoice INV-7\nTotal amount due: £58,000\nPayment terms: 60 days from invoice date.",
+)
+
+
+def _evidence(id_: str, filename: str, doc_type: str, value: float) -> EvidenceItem:
+    return EvidenceItem(
+        id=id_, claim=f"{filename} states a total amount of {value:,.0f} GBP.", key="total_amount",
+        value_number=value, unit="GBP", chunk_id=id_, document_id=filename, filename=filename,
+        document_type=doc_type, page=1,
+    )
 
 
 async def main() -> int:
     settings = get_settings()
-    print(f"Provider: {settings.LLM_PROVIDER}   Model: {settings.llm_model_name or '(not set)'}")
+    print(f"Provider: {settings.LLM_PROVIDER}   Model: {settings.llm_model_name or '(not set)'}\n")
     try:
         llm = get_llm()
-        answer = await llm.structured(
-            LLMPing,
-            system="You are a connectivity test. Answer briefly.",
-            user="Reply with the single word: pong",
-            purpose="connectivity_check",
+
+        ping = await llm.structured(
+            LLMPing, system="You are a connectivity test. Answer briefly.",
+            user="Reply with the single word: pong", purpose="check_ping",
         )
+        print(f"1. structured answer    OK   reply={ping.reply!r}")
+
+        analysis = await llm.structured(
+            RequestAnalysis, system=prompts.system_prompt(prompts.ANALYZE_TASK),
+            user=prompts.build_analysis_prompt(QUESTION, []), purpose="check_analysis",
+        )
+        print(f"2. request analysis     OK   task_type={analysis.task_type} queries={analysis.search_queries}")
+
+        extraction = await llm.structured(
+            EvidenceExtraction, system=prompts.system_prompt(prompts.EXTRACT_TASK),
+            user=prompts.build_extraction_prompt(QUESTION, [SAMPLE_CHUNK]), purpose="check_extraction",
+        )
+        total = next((fact for fact in extraction.facts if fact.key == "total_amount"), None)
+        if total is None or total.value_number != 58000:
+            print(f"3. evidence extraction  WARN the model did not return the total as a typed fact: {extraction.facts}")
+        else:
+            print(f"3. evidence extraction  OK   total_amount={total.value_number:,.0f} {total.unit} from {total.chunk_ref}")
+
+        evidence = [_evidence("E1", "Contract.pdf", "contract", 40000), _evidence("E2", "Invoice.pdf", "invoice", 58000)]
+        calls = await llm.choose_tools(
+            system=prompts.system_prompt(prompts.TOOLS_TASK),
+            user=prompts.build_tools_prompt("What is the ratio of the invoice total to the contract total?", evidence, []),
+            tools=CALCULATOR_TOOLS, purpose="check_tools",
+        )
+        if calls:
+            print(f"4. tool calling         OK   requested={[(call.name, call.args) for call in calls]}")
+        else:
+            print("4. tool calling         WARN the model requested no tool (the agent still runs its standard calculations)")
     except LLMError as exc:
         print(f"FAILED: {exc}")
         return 1
-    print(f"OK - the model answered: {answer.reply!r}")
+    print("\nThe provider works. You can run an investigation now.")
     return 0
 
 

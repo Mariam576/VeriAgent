@@ -39,7 +39,13 @@ class LLMError(Exception):
 
 
 class LLMConfigurationError(LLMError):
-    """The provider is not set up (missing key or model). Retrying cannot help."""
+    """The provider is not set up correctly, or it rejected the request outright.
+
+    Examples: missing or invalid API key, unknown model name, a request the
+    provider refuses (HTTP 400/401/403/404). Retrying cannot help, and quietly
+    continuing with rule-based fallbacks would hide the real problem, so the
+    investigation stops and the user is told what to fix.
+    """
 
 
 class LLMUnavailableError(LLMError):
@@ -64,6 +70,48 @@ class LLMPing(BaseModel):
 def _looks_like_rate_limit(exc: BaseException) -> bool:
     text = f"{type(exc).__name__} {exc}".lower()
     return "429" in text or "resource_exhausted" in text or "rate limit" in text or "quota" in text
+
+
+# HTTP statuses that mean "this request will never work": bad key, no permission, unknown model, bad request.
+_PERMANENT_STATUS_CODES = {400, 401, 403, 404, 405, 422}
+_PERMANENT_MARKERS = (
+    "api key not valid", "api_key_invalid", "invalid api key", "incorrect api key",
+    "permission_denied", "unauthenticated", "is not found for api version", "model not found",
+)
+
+
+def provider_status_code(exc: BaseException) -> int | None:
+    """The HTTP status behind a provider error, wherever the SDK stored it.
+
+    SDK wrappers re-raise their own exception types "from" the original one,
+    so the whole chain of causes is searched.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        for attribute in ("status_code", "code"):
+            value = getattr(current, attribute, None)
+            if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599:
+                return value
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def is_permanent_error(exc: BaseException) -> bool:
+    status = provider_status_code(exc)
+    if status is not None:
+        return status in _PERMANENT_STATUS_CODES
+    text = str(exc).lower()
+    return any(marker in text for marker in _PERMANENT_MARKERS)
+
+
+def _safe(text: object, limit: int = 300) -> str:
+    """Provider error text, shortened and with anything key-like removed, for logs and messages."""
+    from app.config import get_settings
+    from app.security.guardrails import redact_secrets
+
+    return redact_secrets(str(text), get_settings())[:limit]
 
 
 class BaseLLM(ABC):
@@ -137,12 +185,23 @@ class BaseLLM(ABC):
             except asyncio.TimeoutError:
                 last_error = TimeoutError(f"no answer within {self._timeout:.0f}s")
             except Exception as exc:  # noqa: BLE001 - any provider error is retried a bounded number of times
+                if is_permanent_error(exc):
+                    status = provider_status_code(exc)
+                    logger.error(
+                        "llm_call_rejected provider=%s model=%s purpose=%s status=%s error=%s",
+                        self.provider, self.model, purpose or "-", status, _safe(exc),
+                    )
+                    raise LLMConfigurationError(
+                        f"{self.provider} rejected the request"
+                        f"{f' (HTTP {status})' if status else ''}: {_safe(exc)} "
+                        "Check the API key and the model name in your .env file."
+                    ) from exc
                 last_error = exc
 
             logger.warning(
                 "llm_call_failed provider=%s purpose=%s attempt=%d/%d error=%s: %s",
                 self.provider, purpose or "-", attempt, attempts,
-                type(last_error).__name__, str(last_error)[:300],
+                type(last_error).__name__, _safe(last_error),
             )
             if attempt < attempts:
                 delay = self._backoff * (2 ** (attempt - 1))
@@ -152,7 +211,7 @@ class BaseLLM(ABC):
 
         raise LLMUnavailableError(
             f"{self.provider} failed after {attempts} attempt(s): "
-            f"{type(last_error).__name__}: {str(last_error)[:300]}"
+            f"{type(last_error).__name__}: {_safe(last_error)}"
         )
 
 

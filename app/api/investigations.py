@@ -27,7 +27,12 @@ router = APIRouter(prefix="/investigations", tags=["investigations"])
 async def create_investigation(request: InvestigationRequest, user: CurrentUser, session: DbSession) -> InvestigationReport:
     """Run a full investigation over your uploaded documents and return the structured report."""
     _, report = await run_investigation(
-        session, user=user, question=request.question, document_ids=request.document_ids
+        session,
+        user=user,
+        question=request.question,
+        document_ids=request.document_ids,
+        document_type=request.document_type,
+        year=request.year,
     )
     return report
 
