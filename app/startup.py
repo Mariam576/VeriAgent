@@ -46,6 +46,22 @@ def configuration_problems(settings: Settings) -> list[str]:
             "but TRUST_PROXY_HEADERS=true says this server is reachable from the internet. Set AUTH_MODE=jwt."
         )
 
+    if settings.AUTH_MODE == "jwt" and settings.JWT_SECRET is not None:
+        from app.security.tokens import MIN_SECRET_CHARS
+
+        if len(settings.JWT_SECRET.get_secret_value()) < MIN_SECRET_CHARS:
+            problems.append(
+                f"JWT_SECRET must have at least {MIN_SECRET_CHARS} characters (it signs the sign-in tokens). "
+                "Use a long random value, or leave it empty and VeriAgent creates one itself."
+            )
+
+    try:
+        from app.database.urls import parse_database_url
+
+        parse_database_url(settings.DATABASE_URL)
+    except ValueError as exc:
+        problems.append(str(exc))
+
     return problems
 
 
@@ -63,6 +79,19 @@ def configuration_warnings(settings: Settings) -> list[str]:
             "ACTION_SERVER=github needs GITHUB_TOKEN and GITHUB_REPOSITORY (written as owner/repository). "
             "Until both are set, no follow-up issue is offered."
         )
+
+    try:
+        from app.database.urls import parse_database_url
+
+        target = parse_database_url(settings.DATABASE_URL)
+        if not target.is_local and target.tls != "verified":
+            warnings.append(
+                "The database is on another machine and its certificate is not checked, so the connection "
+                "could be intercepted. Add sslmode=verify-full to DATABASE_URL (Neon's own string, with "
+                "channel_binding=require, is already checked)."
+            )
+    except ValueError:
+        pass  # reported as a problem
 
     if settings.TRUST_PROXY_HEADERS and settings.ALLOW_REGISTRATION and not settings.SIGNUP_CODE:
         warnings.append(

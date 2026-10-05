@@ -232,3 +232,80 @@ async def test_upkeep_removes_expired_sign_ins_and_closes_stuck_documents(client
         await session.execute(update(Document).where(Document.id == fresh_id).values(status="failed"))
         await session.commit()
     assert (await run_maintenance())["stuck_documents"] == 0  # nothing left to do
+
+
+# ============================================================ found in review
+@integration
+async def test_after_a_restart_an_interrupted_document_fails_at_once_and_can_be_uploaded_again(client, user_headers, samples_dir, monkeypatch):
+    """A document caught by a restart said "Reading..." for 15 to 75 minutes, and uploading it again did nothing."""
+    from app.maintenance import STUCK_MESSAGE, run_maintenance
+    from app.rag import ingestion
+
+    async def lost_in_the_restart(*args, **kwargs):
+        return None  # the job vanished with the old process: nothing is ever written
+
+    monkeypatch.setattr(ingestion, "process_document", lost_in_the_restart)
+    first = (await upload(client, user_headers, samples_dir / "Contract.pdf", background="true")).json()
+    assert await get_jobs().wait_idle(10)
+    assert (await client.get(f"/documents/{first['id']}", headers=user_headers)).json()["status"] == "processing"
+    monkeypatch.undo()
+
+    # The ordinary round leaves it alone: it was uploaded seconds ago.
+    assert (await client.get(f"/documents/{first['id']}", headers=user_headers)).json()["status"] == "processing"
+    # The round at start-up knows that no job can be alive.
+    assert (await run_maintenance(at_startup=True))["stuck_documents"] >= 1
+    failed = (await client.get(f"/documents/{first['id']}", headers=user_headers)).json()
+    assert (failed["status"], failed["error"]) == ("failed", STUCK_MESSAGE)
+
+    again = await upload(client, user_headers, samples_dir / "Contract.pdf", background="true")
+    assert again.status_code == 202 and again.json()["duplicate"] is False
+    assert await get_jobs().wait_idle(30)
+    listed = (await client.get("/documents", headers=user_headers)).json()["documents"]
+    assert [(item["filename"], item["status"], item["error"]) for item in listed] == [("Contract.pdf", "ready", None)]
+
+
+@integration
+async def test_a_document_whose_job_is_still_waiting_is_not_given_up_on(client, user_headers, samples_dir, monkeypatch):
+    """The 15 minutes counted from the upload, so a job that waited in a long queue was declared lost while it was alive."""
+    from app.database.models import Document
+    from app.database.session import get_session_factory
+    from app.maintenance import documents_with_a_job, run_maintenance
+    from app.rag import ingestion
+
+    gate = asyncio.Event()
+    real = ingestion.process_document
+
+    async def held_back(*args, **kwargs):
+        await gate.wait()
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(ingestion, "process_document", held_back)
+    document = (await upload(client, user_headers, samples_dir / "Invoice_102.pdf", background="true")).json()
+    document_id = uuid.UUID(document["id"])
+    async with get_session_factory()() as session:  # as if it had been uploaded two hours ago
+        await session.execute(update(Document).where(Document.id == document_id).values(uploaded_at=datetime.now(timezone.utc) - timedelta(hours=2)))
+        await session.commit()
+    assert documents_with_a_job() == {document_id}
+
+    await run_maintenance()
+    assert (await client.get(f"/documents/{document['id']}", headers=user_headers)).json()["status"] == "processing"
+
+    gate.set()
+    assert await get_jobs().wait_idle(30)
+    assert documents_with_a_job() == set()
+    ready = (await client.get(f"/documents/{document['id']}", headers=user_headers)).json()
+    assert (ready["status"], ready["error"]) == ("ready", None)
+
+
+def test_job_names_are_visible_while_the_job_is_alive():
+    async def scenario() -> None:
+        jobs = BackgroundJobs(max_concurrent=1)
+        gate = asyncio.Event()
+        jobs.submit("document:first", gate.wait)
+        jobs.submit("document:second", gate.wait)  # waits for its turn
+        await asyncio.sleep(0)
+        assert jobs.names() == {"document:first", "document:second"}
+        gate.set()
+        assert await jobs.wait_idle(5) and jobs.names() == set()
+
+    asyncio.run(scenario())

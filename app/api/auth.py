@@ -49,7 +49,7 @@ from app.schemas.auth import (
 )
 from app.security import tokens
 from app.security.google import verify_google_credential_async
-from app.security.passwords import MIN_PASSWORD_CHARS, hash_password, needs_rehash, validate_password, verify_password
+from app.security.passwords import MIN_PASSWORD_CHARS, hash_password_async, needs_rehash, validate_password, verify_password_async
 from app.security.permissions import CurrentUser, DbSession
 from app.security.rate_limit import RateLimiter, check, client_address
 
@@ -62,7 +62,14 @@ COOKIE_PATH = "/auth"
 REFRESH_RACE_SECONDS = 10
 
 attempts_by_address = RateLimiter(limit=20, window_seconds=60)  # any sign-in request, per client address
-failed_logins = RateLimiter(limit=5, window_seconds=900)  # wrong passwords, per email address
+# Wrong passwords. Two counters, because each alone has a weakness:
+#   * per account AND address (5 in 15 minutes): stops guessing, and a stranger's wrong
+#     guesses do not lock the owner out, who comes from another address;
+#   * per account from anywhere (20 in 15 minutes): an attacker who changes address for every
+#     guess is still stopped. Only this one can lock the owner out for a while, and it takes
+#     a sustained effort to keep it up. Signing in with Google is never affected.
+failed_logins = RateLimiter(limit=5, window_seconds=900)
+failed_logins_per_account = RateLimiter(limit=20, window_seconds=900)
 
 
 def user_out(user: User) -> UserOut:
@@ -102,7 +109,9 @@ async def _issue_tokens(
     session: DbSession, request: Request, response: Response, user: User, family_id: uuid.UUID | None = None
 ) -> TokenResponse:
     settings = get_settings()
-    access_token, expires_in = tokens.create_access_token(user.id, await tokens.signing_secret(session))
+    access_token, expires_in = tokens.create_access_token(
+        user.id, await tokens.signing_secret(session), version=user.token_version
+    )
     refresh_token, refresh_hash = tokens.new_refresh_token()
     lifetime = timedelta(days=settings.REFRESH_TOKEN_DAYS)
     await repositories.store_refresh_token(session, user.id, refresh_hash, utcnow() + lifetime, family_id)
@@ -147,8 +156,7 @@ async def register(body: RegisterRequest, request: Request, response: Response, 
     _check_signup_allowed(body.signup_code)
     email = body.email.strip().lower()
     validate_password(body.password, email)
-    # Hashing is deliberately slow CPU work, so it runs in a worker thread.
-    password_hash = await asyncio.to_thread(hash_password, body.password)
+    password_hash = await hash_password_async(body.password)
     user = await repositories.create_account(
         session, email=email, name=(body.name or "").strip() or email.split("@")[0], password_hash=password_hash
     )
@@ -161,18 +169,21 @@ async def register(body: RegisterRequest, request: Request, response: Response, 
 async def login(body: LoginRequest, request: Request, response: Response, session: DbSession) -> TokenResponse:
     check(attempts_by_address, client_address(request), "sign-in attempts")
     email = body.email.strip().lower()
-    if not failed_logins.allowed(email):
-        check(failed_logins, email, "failed sign-in attempts for this account")
+    here = f"{email}|{client_address(request)}"
+    for limiter, key in ((failed_logins, here), (failed_logins_per_account, email)):
+        if not limiter.allowed(key):
+            check(limiter, key, "failed sign-in attempts for this account")
     user = await repositories.get_user_by_email(session, email)
     await session.commit()
-    password_ok = await asyncio.to_thread(verify_password, body.password, user.password_hash if user else None)
+    password_ok = await verify_password_async(body.password, user.password_hash if user else None)
     if user is None or not password_ok or not user.is_active:
-        failed_logins.hit(email)
+        failed_logins.hit(here)
+        failed_logins_per_account.hit(email)
         # One message for every failure: it must not reveal whether the account exists.
         raise Unauthorized("Email or password is incorrect.")
-    failed_logins.forget(email)
+    failed_logins.forget(here)
     if needs_rehash(user.password_hash):
-        user.password_hash = await asyncio.to_thread(hash_password, body.password)
+        user.password_hash = await hash_password_async(body.password)
         await session.commit()
     return await _issue_tokens(session, request, response, user)
 
@@ -195,9 +206,12 @@ async def google_sign_in(body: GoogleSignInRequest, request: Request, response: 
             if not user.email_verified and user.password_hash is not None:
                 # Nobody ever proved that this address belongs to whoever chose the password
                 # (email is not verified at registration). Google has now proved who owns it,
-                # so the old password and every existing session are dropped. Otherwise
-                # someone could register with your address first and keep access.
+                # so the old password and every existing session are dropped - the refresh
+                # tokens and, through the token version, the access tokens that are still
+                # running. Otherwise someone could register with your address first, stay
+                # signed in, and set a new password a minute after you took the account back.
                 user.password_hash = None
+                user.token_version += 1
                 await repositories.revoke_all_refresh_tokens(session, user.id)
             user.google_sub, user.email_verified = identity.sub, True
             await session.commit()
@@ -242,10 +256,15 @@ async def refresh(request: Request, response: Response, session: DbSession) -> T
 
 @router.post("/logout", status_code=204)
 async def logout(request: Request, session: DbSession) -> Response:
+    """Sign out on this device: the refresh cookie is spent and the access token stops working now."""
     _require_same_origin(request)
     presented = request.cookies.get(REFRESH_COOKIE)
     if presented:
-        await repositories.use_refresh_token(session, tokens.hash_refresh_token(presented))
+        token, _ = await repositories.use_refresh_token(session, tokens.hash_refresh_token(presented))
+        if token is not None:
+            # Other devices of this account keep their refresh cookie: they fetch a new
+            # access token at their next request and notice nothing.
+            await repositories.end_access_tokens(session, token.user_id)
     response = Response(status_code=204)
     _clear_cookie(response)
     return response
@@ -264,14 +283,15 @@ async def change_password(
     if user.email is None:
         raise ValidationFailed("This account has no email address and cannot have a password.")
     if user.password_hash is not None:
-        current_ok = await asyncio.to_thread(verify_password, body.current_password or "", user.password_hash)
+        current_ok = await verify_password_async(body.current_password or "", user.password_hash)
         if not current_ok:
-            check(failed_logins, user.email, "failed password attempts for this account")
+            check(failed_logins_per_account, user.email, "failed password attempts for this account")
             raise Unauthorized("The current password is incorrect.")
     validate_password(body.new_password, user.email)
-    new_hash = await asyncio.to_thread(hash_password, body.new_password)
+    new_hash = await hash_password_async(body.new_password)
     account = await session.get(User, user.id)
     account.password_hash = new_hash
+    account.token_version += 1  # access tokens issued before this moment stop working
     await session.commit()
     # A changed password ends every other session; this one continues with fresh tokens.
     await repositories.revoke_all_refresh_tokens(session, user.id)

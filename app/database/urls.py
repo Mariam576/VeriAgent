@@ -22,21 +22,36 @@ Two more things are handled here:
 * ``channel_binding=require`` protects the password exchange against a
   man-in-the-middle. asyncpg cannot do channel binding, so for asyncpg the
   server's certificate is verified instead, which gives the same protection.
+
+The translation never asks for *less* protection than the string did. If it
+cannot be read at all, the error says how to write it and does not repeat any
+part of the string (it contains the password).
 """
 
 from __future__ import annotations
 
+import ssl
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from functools import lru_cache
+from typing import Any, Literal
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
-# Parameters that only libpq understands. They are removed from the asyncpg URL.
-_LIBPQ_ONLY = {
-    "sslmode", "channel_binding", "sslrootcert", "sslcert", "sslkey", "sslcrl", "gssencmode", "target_session_attrs",
-    "options", "connect_timeout", "application_name",
-}
 _SCHEMES = ("postgresql+asyncpg", "postgresql+psycopg", "postgresql", "postgres")
+# Words in the query string that are not passed on to libpq (asyncpg's spelling, or our own).
+_NOT_FOR_LIBPQ = ("ssl", "pgbouncer", "prepared_statement_cache_size")
+_VERIFYING = ("verify-ca", "verify-full")
+_UNREADABLE = (
+    "DATABASE_URL could not be read. It has the form postgresql://user:password@host:port/database. "
+    "If the password contains one of / ? # @ : or %, write that character percent-encoded (for example %40 for @)."
+)
+
+# How the connection is protected:
+#   off         not encrypted
+#   default     the driver's default: encrypted if the server offers it, never verified
+#   unverified  always encrypted, but the server's certificate is not checked
+#   verified    always encrypted, and the certificate is checked against trusted authorities
+Tls = Literal["off", "default", "unverified", "verified"]
 
 
 @dataclass(frozen=True)
@@ -45,46 +60,97 @@ class DatabaseTarget:
     connect_args: dict[str, Any] = field(default_factory=dict)  # extra arguments for asyncpg
     psycopg_url: str = ""  # for psycopg (the checkpointer)
     pooled: bool = False  # the address is a transaction pooler: no prepared statements
+    host: str = ""
+    tls: Tls = "default"
 
     @property
     def psycopg_prepare_threshold(self) -> int | None:
         """0 = prepare every statement at once (fast); None = never prepare (needed behind a pooler)."""
         return None if self.pooled else 0
 
+    @property
+    def is_local(self) -> bool:
+        """This computer, or a neighbouring container (Docker Compose service names have no dot)."""
+        return self.host in ("localhost", "127.0.0.1", "::1", "") or "." not in self.host and ":" not in self.host
+
 
 def is_pooled(host: str, port: int | None, query: dict[str, str]) -> bool:
     return "-pooler." in host or port == 6543 or query.get("pgbouncer", "").lower() == "true"
 
 
+@lru_cache
+def _verifying_context(check_hostname: bool, cafile: str | None) -> ssl.SSLContext:
+    """TLS that checks the server's certificate against the authorities this computer trusts.
+
+    asyncpg also accepts the *word* "verify-full", but then it insists on a
+    certificate file in ``~/.postgresql/root.crt`` and never looks at the
+    system's list of authorities - the list every hosted database's certificate
+    is signed against. A context built here uses that list.
+    """
+    context = ssl.create_default_context(cafile=cafile)
+    context.check_hostname = check_hostname
+    return context
+
+
+def _tls_wanted(query: dict[str, str]) -> tuple[Tls, bool]:
+    """What the connection string asks for: (protection, also check the host name)."""
+    mode = (query.get("sslmode") or "").lower()
+    if not mode and "ssl" in query:  # written the asyncpg way
+        mode = {"true": "require", "1": "require", "false": "disable", "0": "disable"}.get(query["ssl"].lower(), query["ssl"].lower())
+    if query.get("channel_binding", "").lower() == "require":
+        # Channel binding protects the password exchange against a man in the middle. asyncpg
+        # cannot do it, so the certificate is verified instead - whatever sslmode says, because
+        # libpq too refuses to connect unprotected when channel binding is required.
+        return "verified", mode != "verify-ca"
+    if mode in _VERIFYING:
+        return "verified", mode == "verify-full"
+    if mode == "require":
+        return "unverified", False
+    if mode == "disable":
+        return "off", False
+    return "default", False
+
+
 def parse_database_url(url: str) -> DatabaseTarget:
-    parts = urlsplit(url.strip())
+    try:
+        parts = urlsplit(url.strip())
+        host, port = parts.hostname or "", parts.port
+    except ValueError:
+        raise ValueError(_UNREADABLE) from None  # "from None": the original message quotes part of the password
     if parts.scheme not in _SCHEMES:
         raise ValueError("DATABASE_URL must start with postgresql:// (or postgres://).")
+    if not host:
+        raise ValueError(_UNREADABLE)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    pooled = is_pooled(parts.hostname or "", parts.port, query)
+    pooled = is_pooled(host, port, query)
+    tls, check_hostname = _tls_wanted(query)
 
-    # ---- asyncpg
+    # ---- asyncpg: nothing from the query string is passed through as it is, because asyncpg
+    # rejects every word it does not know. What matters is translated into typed arguments.
     connect_args: dict[str, Any] = {}
-    mode = query.get("sslmode", "").lower()
-    if mode in ("require", "verify-ca", "verify-full"):
-        wants_binding = query.get("channel_binding", "").lower() == "require"
-        connect_args["ssl"] = "verify-full" if wants_binding else mode
-    elif mode == "disable":
+    if tls == "verified":
+        cafile = query.get("sslrootcert") or None
+        connect_args["ssl"] = _verifying_context(check_hostname, None if cafile == "system" else cafile)
+    elif tls == "unverified":
+        connect_args["ssl"] = "require"
+    elif tls == "off":
         connect_args["ssl"] = False
-    elif "ssl" in query:  # already written for asyncpg
-        connect_args["ssl"] = query["ssl"]
+    if query.get("connect_timeout", "").isdigit() and int(query["connect_timeout"]) > 0:
+        connect_args["timeout"] = float(query["connect_timeout"])
+    if query.get("application_name"):
+        connect_args["server_settings"] = {"application_name": query["application_name"]}
+    for_asyncpg: dict[str, str] = {}
     if pooled:
         connect_args["statement_cache_size"] = 0
         # Each prepared statement gets a name nobody else can have, in case the driver prepares one anyway.
         connect_args["prepared_statement_name_func"] = lambda: f"__asyncpg_{uuid.uuid4()}__"
-    kept = {key: value for key, value in query.items() if key not in _LIBPQ_ONLY and key not in ("ssl", "pgbouncer")}
-    if pooled:
-        kept["prepared_statement_cache_size"] = "0"
-    async_url = urlunsplit(("postgresql+asyncpg", parts.netloc, parts.path, urlencode(kept), ""))
+        for_asyncpg["prepared_statement_cache_size"] = "0"
+    async_url = urlunsplit(("postgresql+asyncpg", parts.netloc, parts.path, urlencode(for_asyncpg), ""))
 
     # ---- psycopg (libpq): the string as the provider wrote it, minus what only asyncpg or we understand
-    libpq = {key: value for key, value in query.items() if key not in ("ssl", "pgbouncer", "prepared_statement_cache_size")}
-    if "ssl" in query and "sslmode" not in libpq and query["ssl"].lower() in ("require", "verify-ca", "verify-full", "true"):
-        libpq["sslmode"] = "require" if query["ssl"].lower() == "true" else query["ssl"].lower()
-    psycopg_url = urlunsplit(("postgresql", parts.netloc, parts.path, urlencode(libpq), ""))
-    return DatabaseTarget(async_url=async_url, connect_args=connect_args, psycopg_url=psycopg_url, pooled=pooled)
+    libpq = {key: value for key, value in query.items() if key not in _NOT_FOR_LIBPQ}
+    if "sslmode" not in libpq and "ssl" in query:
+        libpq["sslmode"] = {"unverified": "require", "off": "disable"}.get(tls, query["ssl"].lower() if tls == "verified" else "prefer")
+    # quote_via=quote: libpq reads %20 as a space but does not read "+" as one.
+    psycopg_url = urlunsplit(("postgresql", parts.netloc, parts.path, urlencode(libpq, quote_via=quote), ""))
+    return DatabaseTarget(async_url=async_url, connect_args=connect_args, psycopg_url=psycopg_url, pooled=pooled, host=host, tls=tls)

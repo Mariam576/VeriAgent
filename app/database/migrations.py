@@ -65,6 +65,10 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
             "CREATE UNIQUE INDEX IF NOT EXISTS users_google_sub_key ON users (google_sub)",
         ],
     ),
+    (
+        "v3_002_token_version",
+        ["ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0"],
+    ),
 ]
 
 # Any fixed number: it only has to be the same in every API process.

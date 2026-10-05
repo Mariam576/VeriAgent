@@ -1,4 +1,5 @@
 # Start everything:   docker compose up --build      then open http://localhost:8000
+# Coming from Version 2? Add --remove-orphans once: it removes the old "ui" container.
 # Stop:               docker compose down
 # Stop + wipe data:   docker compose down -v
 services:
@@ -38,6 +39,9 @@ services:
       db:
         condition: service_healthy
     restart: unless-stopped
+    # Time to close open progress streams and note unfinished investigations as "interrupted"
+    # (the server itself gives up waiting after 20 seconds, see the Dockerfile).
+    stop_grace_period: 30s
     ports:
       # Bound to 127.0.0.1: reachable from this computer only. To let other
       # people use it, deploy it properly (docs/DEPLOYMENT.md) instead of opening this port.

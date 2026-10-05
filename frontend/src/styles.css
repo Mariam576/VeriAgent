@@ -1089,6 +1089,10 @@ ul.plain li {
   box-shadow: 0 20px 50px rgb(0 0 0 / 30%);
 }
 
+.modal:focus {
+  outline: none; /* focus is moved here when the dialog opens; the dialog itself needs no ring */
+}
+
 .modal-wide {
   width: min(100%, 980px);
 }

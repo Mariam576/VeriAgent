@@ -168,3 +168,27 @@ async def test_findings_carry_the_quote_that_supports_them(client, user_headers,
     assert (citation["document"], citation["page"]) == ("Contract.pdf", 4)
     assert "£40,000" in citation["quote"] and len(citation["quote"]) <= 300
     assert all(source["quote"] is None for source in report["sources"])  # the source list stays a plain list of pages
+
+
+async def test_upload_limits_protect_a_shared_server(client, user_headers, samples_dir, settings, monkeypatch):
+    """Found in review: investigations were limited per account, uploads were not."""
+    from app.api import documents as documents_api
+
+    documents_api.uploads_by_user.reset()
+    monkeypatch.setattr(settings, "MAX_DOCUMENTS_PER_USER", 2)
+    assert (await upload(client, user_headers, samples_dir / "Contract.pdf")).status_code == 201
+    assert (await upload(client, user_headers, samples_dir / "Invoice_102.pdf")).status_code == 201
+    full = await upload(client, user_headers, samples_dir / "Procurement_Policy.pdf")
+    assert full.status_code == 409 and "already holds 2 documents" in full.json()["error"]["message"]
+    # Deleting one makes room again.
+    listed = (await client.get("/documents", headers=user_headers)).json()["documents"]
+    assert (await client.delete(f"/documents/{listed[0]['id']}", headers=user_headers)).status_code == 204
+    assert (await upload(client, user_headers, samples_dir / "Procurement_Policy.pdf")).status_code == 201
+
+    monkeypatch.setattr(settings, "MAX_DOCUMENTS_PER_USER", 0)
+    monkeypatch.setattr(settings, "MAX_UPLOADS_PER_HOUR", 2)
+    assert (await upload(client, user_headers, samples_dir / "Contract.pdf")).status_code == 201
+    assert (await upload(client, user_headers, samples_dir / "Contract.pdf")).status_code == 201  # a duplicate counts as well
+    limited = await upload(client, user_headers, samples_dir / "Contract.pdf")
+    assert limited.status_code == 429 and "uploads in one hour" in limited.json()["error"]["message"]
+    documents_api.uploads_by_user.reset()

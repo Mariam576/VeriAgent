@@ -49,7 +49,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         settings.EMBEDDING_PROVIDER,
     )
     await get_checkpointer()  # opens its connection pool and creates the checkpoint tables
-    await run_maintenance()
+    await run_maintenance(at_startup=True)
     jobs = get_jobs()
     if settings.MAINTENANCE_INTERVAL_MINUTES > 0:
         jobs.every("maintenance", settings.MAINTENANCE_INTERVAL_MINUTES * 60, run_maintenance)

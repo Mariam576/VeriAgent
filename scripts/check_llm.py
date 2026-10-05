@@ -7,11 +7,16 @@ makes, so you know your API key and model work before a full investigation:
     2. request analysis        (structured output with enums and lists)
     3. evidence extraction     (structured output with nullable fields, on a tiny document)
     4. tool calling            (the model must ask for the calculator)
+    5. embeddings              (one passage and one question, with the configured provider)
 
     docker compose exec api python -m scripts.check_llm
     (or locally)  python -m scripts.check_llm
 
-Uses 4 small requests. With LLM_PROVIDER=mock no real model is called.
+Uses 4 small model requests and 2 embedding requests. With LLM_PROVIDER=mock and
+EMBEDDING_PROVIDER=hash nothing outside this computer is called.
+
+Run it once with the settings you are going to deploy (see docs/DEPLOYMENT.md): a
+hosting platform's free plan gives you no shell to try things out on the server.
 """
 
 from __future__ import annotations
@@ -21,8 +26,11 @@ import sys
 
 from app.agents import prompts
 from app.config import get_settings
+from app.embeddings.base import EmbeddingError
+from app.embeddings.factory import get_embedding_provider
 from app.llm.base import LLMError, LLMPing
 from app.llm.factory import get_llm
+from app.security.guardrails import redact_secrets
 from app.schemas.investigation import EvidenceExtraction, EvidenceItem, RequestAnalysis, RetrievedChunk
 from app.tools.calculator import CALCULATOR_TOOLS
 
@@ -82,7 +90,25 @@ async def main() -> int:
     except LLMError as exc:
         print(f"FAILED: {exc}")
         return 1
-    print("\nThe provider works. You can run an investigation now.")
+
+    print(f"\nEmbeddings: {settings.EMBEDDING_PROVIDER}   Size: {settings.EMBEDDING_DIM}")
+    try:
+        embedder = get_embedding_provider()
+        passages = [SAMPLE_CHUNK.text, "The cafeteria is closed on public holidays."]
+        vectors = await embedder.aembed_documents(passages)
+        query = await embedder.aembed_text("What is the total amount due on the invoice?")
+        sizes = {len(vector) for vector in [*vectors, query]}
+        if sizes != {settings.EMBEDDING_DIM}:
+            print(f"FAILED: the vectors have {sorted(sizes)} numbers, EMBEDDING_DIM is {settings.EMBEDDING_DIM}.")
+            return 1
+        related, unrelated = (sum(a * b for a, b in zip(query, vector, strict=True)) for vector in vectors)
+        verdict = "OK  " if related > unrelated else "WARN"
+        print(f"5. embeddings           {verdict} model={embedder.model_id} similarity: invoice passage {related:.2f}, unrelated passage {unrelated:.2f}")
+    except EmbeddingError as exc:
+        print(f"FAILED: {redact_secrets(str(exc), settings)}")
+        return 1
+
+    print("\nThe model and the embeddings work. You can run an investigation now.")
     return 0
 
 

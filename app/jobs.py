@@ -55,6 +55,10 @@ class BackgroundJobs:
     def active(self) -> int:
         return sum(not task.done() for task in self._tasks)
 
+    def names(self) -> set[str]:
+        """The names of the jobs that are waiting or running right now."""
+        return {task.get_name().removeprefix("job:") for task in self._tasks if not task.done()}
+
     def submit(self, name: str, job: Job) -> None:
         """Start ``job`` after the current request. A failing job is logged, never raised."""
         limit = self._semaphore()

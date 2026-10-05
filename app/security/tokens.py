@@ -10,6 +10,13 @@ Concept - two tokens:
       cannot read, and only its hash is stored in the database, so it can be
       revoked (sign out) and stolen copies can be detected.
 
+Concept - ending an access token early:
+    "No database lookup" has a price: a signed token stays valid until it
+    expires, whatever happened in the meantime. VeriAgent loads the user for
+    every request anyway, so it pays one integer comparison to close that
+    gap: the token carries the account's ``token_version``, and a token with
+    an older number is refused (see ``create_access_token``).
+
 Concept - what a JWT is not:
     The content of a JWT is readable by anyone who has it (it is encoded, not
     encrypted). It proves who issued it, nothing more. So it carries the user
@@ -70,16 +77,22 @@ def reset_signing_secret() -> None:
     _signing_secret = None
 
 
-def create_access_token(user_id: uuid.UUID, secret: str, now: datetime | None = None) -> tuple[str, int]:
-    """Returns (token, seconds until it expires)."""
+def create_access_token(user_id: uuid.UUID, secret: str, now: datetime | None = None, version: int = 0) -> tuple[str, int]:
+    """Returns (token, seconds until it expires).
+
+    ``version`` is the account's ``token_version`` at this moment. When the
+    account's credentials change (new password, sign-out, an address taken
+    back through Google) that number is raised, and every access token made
+    before stops working at once instead of living on until it expires.
+    """
     now = now or datetime.now(timezone.utc)
     lifetime = timedelta(minutes=get_settings().ACCESS_TOKEN_MINUTES)
-    claims = {"sub": str(user_id), "iat": now, "exp": now + lifetime, "iss": ISSUER, "typ": "access"}
+    claims = {"sub": str(user_id), "iat": now, "exp": now + lifetime, "iss": ISSUER, "typ": "access", "ver": int(version)}
     return jwt.encode(claims, secret, algorithm=ALGORITHM), int(lifetime.total_seconds())
 
 
-def read_access_token(token: str, secret: str) -> uuid.UUID:
-    """The user id inside a valid access token. Raises ``Unauthorized`` for anything else."""
+def read_access_claims(token: str, secret: str) -> tuple[uuid.UUID, int]:
+    """(user id, token version) inside a valid access token. Raises ``Unauthorized`` for anything else."""
     try:
         claims = jwt.decode(
             token, secret,
@@ -89,11 +102,16 @@ def read_access_token(token: str, secret: str) -> uuid.UUID:
         )
         if claims.get("typ") != "access":
             raise Unauthorized("Please sign in again.")
-        return uuid.UUID(str(claims["sub"]))
+        return uuid.UUID(str(claims["sub"])), int(claims.get("ver", 0))
     except jwt.ExpiredSignatureError as exc:
         raise Unauthorized("Your session has expired. Please sign in again.") from exc
-    except (jwt.InvalidTokenError, ValueError) as exc:
+    except (jwt.InvalidTokenError, ValueError, TypeError) as exc:
         raise Unauthorized("Please sign in again.") from exc
+
+
+def read_access_token(token: str, secret: str) -> uuid.UUID:
+    """The user id inside a valid access token. Raises ``Unauthorized`` for anything else."""
+    return read_access_claims(token, secret)[0]
 
 
 def new_refresh_token() -> tuple[str, str]:

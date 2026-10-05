@@ -61,7 +61,9 @@ def escape_markdown(text: object) -> str:
     contains ``![x](http://attacker/pixel.png)`` would make the reader's browser
     call that address, ``[Pay here](...)`` would put a phishing link into the
     report, and "$40,000 ... $58,000" would be displayed as a formula.
-    The interface has the same function (``ui/safe_text.py``).
+    Used wherever a report leaves VeriAgent as Markdown, for example in the
+    text of a follow-up issue (app/actions/proposals.py). The web interface
+    needs no such step: React writes text into the page as text.
     """
     value = " ".join(str(text if text is not None else "").split())
     # A bare address would be turned into a link automatically; an invisible break prevents that.

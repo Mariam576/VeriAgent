@@ -23,6 +23,20 @@ describe("SseParser", () => {
     expect(parser.push("event: tool\r\ndata: {}\r\n\r\n")).toEqual([{ event: "tool", data: "{}" }]);
   });
 
+  it("accepts a Windows line ending that is split between two pieces", () => {
+    const parser = new SseParser();
+    const text = "event: a\r\ndata: 1\r\n\r\nevent: b\r\ndata: 2\r\n\r\n";
+    for (let cut = 1; cut < text.length; cut += 1) {
+      const fresh = new SseParser();
+      const events = [...fresh.push(text.slice(0, cut)), ...fresh.push(text.slice(cut))];
+      expect(events).toEqual([
+        { event: "a", data: "1" },
+        { event: "b", data: "2" },
+      ]);
+    }
+    expect(parser.push("")).toEqual([]);
+  });
+
   it("joins data that is spread over several lines", () => {
     const parser = new SseParser();
     expect(parser.push("data: first\ndata: second\n\n")).toEqual([{ event: "message", data: "first\nsecond" }]);

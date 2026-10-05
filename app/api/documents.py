@@ -12,7 +12,7 @@ from fastapi import APIRouter, File, Form, Query, Response, UploadFile
 from app.config import get_settings
 from app.database import repositories
 from app.embeddings.factory import get_embedding_provider
-from app.errors import FileTooLarge, NotFound
+from app.errors import Conflict, FileTooLarge, NotFound
 from app.jobs import get_jobs
 from app.rag.ingestion import ingest_document, process_in_background, register_document
 from app.comparison.profile import PROFILED_TYPES
@@ -22,9 +22,13 @@ from app.forensics.store import get_forensics_store
 from app.schemas.comparison import ProfileOut
 from app.schemas.document import DocumentList, DocumentOut, ForensicsOut
 from app.security.permissions import CurrentUser, DbSession
+from app.security.rate_limit import RateLimiter, check
 from app.security.validation import validate_document_type
 
 router = APIRouter(prefix="/documents", tags=["documents"])
+
+# Uploads per account in one hour; the limit itself comes from MAX_UPLOADS_PER_HOUR.
+uploads_by_user = RateLimiter(limit=60, window_seconds=3600)
 
 
 @router.post("/upload", response_model=DocumentOut, status_code=201, responses={202: {"model": DocumentOut}})
@@ -48,6 +52,14 @@ async def upload_document(
     afterwards: ask ``GET /documents/{id}`` until the status is "ready" or "failed".
     """
     settings = get_settings()
+    if settings.MAX_UPLOADS_PER_HOUR:
+        uploads_by_user.limit = settings.MAX_UPLOADS_PER_HOUR
+        check(uploads_by_user, str(user.id), "uploads in one hour")
+    if settings.MAX_DOCUMENTS_PER_USER and await repositories.count_documents(session, user.id) >= settings.MAX_DOCUMENTS_PER_USER:
+        raise Conflict(
+            f"This account already holds {settings.MAX_DOCUMENTS_PER_USER} documents, the most this server allows. "
+            "Delete one you no longer need, then upload again."
+        )
     # Read at most one byte more than the limit, so a huge upload is rejected
     # without loading all of it into memory.
     data = await file.read(settings.max_upload_bytes + 1)

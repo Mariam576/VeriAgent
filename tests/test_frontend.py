@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
 
-from app.web import CONTENT_SECURITY_POLICY, NOT_BUILT, mount_interface
+from app.web import CONTENT_SECURITY_POLICY, MAX_JSON_BODY_BYTES, NOT_BUILT, UPLOAD_OVERHEAD_BYTES, mount_interface
 
 
 def app_with(directory) -> FastAPI:
@@ -39,7 +40,7 @@ async def test_the_interface_is_served_with_strict_headers(built):
     assert page.status_code == 200 and "<title>VeriAgent</title>" in page.text
     assert page.headers["content-security-policy"] == CONTENT_SECURITY_POLICY
     assert page.headers["x-content-type-options"] == "nosniff" and page.headers["x-frame-options"] == "DENY"
-    assert page.headers["referrer-policy"] == "no-referrer" and page.headers["cache-control"] == "no-cache"
+    assert page.headers["referrer-policy"] == "strict-origin-when-cross-origin" and page.headers["cache-control"] == "no-cache"
 
     script = await get(app, "/assets/index-abc123.js")
     assert script.status_code == 200 and "javascript" in script.headers["content-type"]
@@ -97,3 +98,80 @@ async def test_the_real_app_keeps_streaming_through_the_header_middleware(client
     docs = await client.get("/docs")
     assert docs.status_code == 200 and "content-security-policy" not in docs.headers
     assert (await client.get("/auth/config")).headers["content-security-policy"] == CONTENT_SECURITY_POLICY
+
+
+# ------------------------------------------------------------ request size limit
+class Login(BaseModel):
+    email: str
+    password: str
+
+
+def app_that_reads_bodies(built) -> tuple[FastAPI, list[int]]:
+    app = FastAPI()
+    seen: list[int] = []
+
+    @app.post("/auth/login")
+    async def login(body: Login) -> dict[str, int]:
+        seen.append(len(body.password))
+        return {"length": len(body.password)}
+
+    @app.post("/documents/upload")
+    async def upload(request: Request) -> dict[str, int]:
+        size = len(await request.body())
+        seen.append(size)
+        return {"size": size}
+
+    mount_interface(app, str(built))
+    return app, seen
+
+
+async def test_an_oversized_request_is_refused_before_it_is_read(built):
+    """Found in review: one 150 MB sign-in request, from nobody in particular, took the server to 590 MB."""
+    app, seen = app_that_reads_bodies(built)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        fine = await client.post("/auth/login", json={"email": "a@b.c", "password": "x" * 1000})
+        assert fine.status_code == 200 and fine.json() == {"length": 1000}
+
+        huge = await client.post("/auth/login", json={"email": "a@b.c", "password": "x" * (MAX_JSON_BODY_BYTES + 1)})
+        assert huge.status_code == 413 and huge.json()["error"]["code"] == "request_too_large"
+        assert huge.headers["x-content-type-options"] == "nosniff"  # the refusal carries the security headers too
+        assert seen == [1000]  # the endpoint never saw it
+
+
+async def test_the_size_is_counted_when_it_is_not_announced(built):
+    """Without a Content-Length header (chunked sending) the bytes are counted as they arrive."""
+    app, seen = app_that_reads_bodies(built)
+
+    async def pieces():
+        yield b'{"email": "a@b.c", "password": "'
+        for _ in range(MAX_JSON_BODY_BYTES // 65_536 + 2):
+            yield b"x" * 65_536
+        yield b'"}'
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        request = client.build_request("POST", "/auth/login", content=pieces(), headers={"content-type": "application/json"})
+        assert "content-length" not in request.headers
+        response = await client.send(request)
+    assert response.status_code == 413 and response.json()["error"]["code"] == "request_too_large"
+    assert seen == []
+
+
+async def test_uploads_have_their_own_larger_limit(built, monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "MAX_UPLOAD_MB", 1)
+    app, seen = app_that_reads_bodies(built)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        allowed = await client.post("/documents/upload", content=b"x" * (1024 * 1024))  # far more than a JSON body may have
+        assert allowed.status_code == 200 and allowed.json() == {"size": 1024 * 1024}
+        too_big = await client.post("/documents/upload", content=b"x" * (1024 * 1024 + UPLOAD_OVERHEAD_BYTES + 1))
+        assert too_big.status_code == 413
+        assert too_big.json()["error"] == {"code": "file_too_large", "message": "The file is larger than the 1 MB limit."}
+        assert (await client.get("/")).status_code == 200  # requests without a body are untouched
+    assert seen == [1024 * 1024]
+
+
+@pytest.mark.integration
+async def test_the_real_app_refuses_an_oversized_sign_in(client):
+    response = await client.post("/auth/login", json={"email": "someone@example.com", "password": "x" * 300_000})
+    assert response.status_code == 413 and response.json()["error"]["code"] == "request_too_large"

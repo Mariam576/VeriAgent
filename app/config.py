@@ -153,6 +153,9 @@ class Settings(BaseSettings):
     # Use false where the disk is not permanent (most free hosting): nothing then depends on the file.
     KEEP_UPLOADED_FILES: bool = True
     MAX_UPLOAD_MB: int = Field(default=20, ge=1, le=200)
+    # Protect the disk and the embedding quota on a shared deployment. 0 = no limit.
+    MAX_UPLOADS_PER_HOUR: int = Field(default=0, ge=0)  # per account
+    MAX_DOCUMENTS_PER_USER: int = Field(default=0, ge=0)
     ALLOWED_EXTENSIONS: str = ".pdf,.docx,.txt"
     UPLOAD_DIR: str = "uploads"
 
@@ -166,7 +169,7 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("GEMINI_API_KEY", "GROK_API_KEY", "JWT_SECRET", "SIGNUP_CODE", mode="before")
+    @field_validator("GEMINI_API_KEY", "GROK_API_KEY", "JWT_SECRET", "SIGNUP_CODE", "GITHUB_TOKEN", mode="before")
     @classmethod
     def _empty_secret_is_none(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():

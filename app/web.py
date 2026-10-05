@@ -18,6 +18,7 @@ Concept - security headers:
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -92,7 +93,10 @@ class SecurityHeaders:
                         headers.append((name, value.encode()))
 
                 add(b"x-content-type-options", "nosniff")  # never guess a file's type from its content
-                add(b"referrer-policy", "no-referrer")
+                # Other sites learn our address (the origin) but never which page or investigation.
+                # "no-referrer" would be stricter, but Google's sign-in button needs the origin
+                # to check it against the origins registered for the client id.
+                add(b"referrer-policy", "strict-origin-when-cross-origin")
                 add(b"x-frame-options", "DENY")  # the page may not be embedded in another site
                 if https:
                     # "From now on, only ever talk to this site over HTTPS."
@@ -110,9 +114,92 @@ class SecurityHeaders:
         await self.app(scope, receive, send_with_headers)
 
 
+# The largest JSON body any endpoint has a use for is a question or a note: a few kilobytes.
+MAX_JSON_BODY_BYTES = 256 * 1024
+# Room for the multipart wrapping around an uploaded file.
+UPLOAD_OVERHEAD_BYTES = 64 * 1024
+UPLOAD_PATH = "/documents/upload"
+
+
+class _BodyTooLarge(Exception):
+    pass
+
+
+class BodyLimit:
+    """Refuses request bodies that are larger than any endpoint could need.
+
+    Concept - limit before you read:
+        A JSON body is read into memory in full before the endpoint, its
+        validation or any rate limit runs. Without a cap, one request with a
+        200 MB body - sent by someone who is not even signed in - is enough to
+        use up a small server's memory. So the size is checked here, at the
+        door: first the announced size (the Content-Length header), then the
+        bytes as they arrive, because the header can be missing or wrong.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http" or scope.get("method") in ("GET", "HEAD", "OPTIONS"):
+            await self.app(scope, receive, send)
+            return
+        settings = get_settings()
+        is_upload = scope.get("path", "").rstrip("/") == UPLOAD_PATH
+        limit = settings.max_upload_bytes + UPLOAD_OVERHEAD_BYTES if is_upload else MAX_JSON_BODY_BYTES
+
+        announced = dict(scope.get("headers", [])).get(b"content-length", b"").decode("latin-1").strip()
+        if announced.isdigit() and int(announced) > limit:
+            await self._refuse(send, is_upload, settings.MAX_UPLOAD_MB)
+            return
+
+        received = 0
+        exceeded = refused = started = False
+
+        async def counting_receive() -> dict[str, Any]:
+            nonlocal received, exceeded
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    exceeded = True
+                    raise _BodyTooLarge
+            return message
+
+        async def guarded_send(message: dict[str, Any]) -> None:
+            nonlocal refused, started
+            if exceeded:
+                # Whatever the application makes of the interrupted body (FastAPI turns it into
+                # "400, could not parse the body"), the caller gets the real reason instead.
+                if not started and not refused:
+                    refused = True
+                    await self._refuse(send, is_upload, settings.MAX_UPLOAD_MB)
+                return
+            started = started or message["type"] == "http.response.start"
+            await send(message)
+
+        try:
+            await self.app(scope, counting_receive, guarded_send)
+        except _BodyTooLarge:
+            pass
+        if exceeded and not started and not refused:
+            await self._refuse(send, is_upload, settings.MAX_UPLOAD_MB)
+
+    @staticmethod
+    async def _refuse(send: Any, is_upload: bool, upload_mb: int) -> None:
+        message = f"The file is larger than the {upload_mb} MB limit." if is_upload else "The request is too large."
+        body = json.dumps({"error": {"code": "file_too_large" if is_upload else "request_too_large", "message": message}}).encode()
+        await send({
+            "type": "http.response.start", "status": 413,
+            "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()), (b"connection", b"close")],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
 def mount_interface(app: FastAPI, directory: str) -> None:
     """Serve the built interface at "/". Must be called after all API routes are registered."""
-    app.add_middleware(SecurityHeaders)
+    app.add_middleware(BodyLimit)
+    app.add_middleware(SecurityHeaders)  # added last = outermost: its headers are on the refusals too
     dist = Path(directory)
     if (dist / "index.html").is_file():
         # Registered last: a request reaches the static files only if no API route matched.

@@ -54,8 +54,12 @@ services:
         value: "true"
       - key: CLIENT_ADDRESS_HEADER     # set by Cloudflare, which sits in front of Render
         value: cf-connecting-ip
-      - key: MAX_INVESTIGATIONS_PER_DAY
+      - key: MAX_INVESTIGATIONS_PER_DAY   # per account
         value: "25"
+      - key: MAX_UPLOADS_PER_HOUR         # per account
+        value: "30"
+      - key: MAX_DOCUMENTS_PER_USER       # the free database is small
+        value: "200"
 
       # ---- sized for a small machine and a small database
       - key: MAX_BACKGROUND_JOBS

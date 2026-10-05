@@ -18,7 +18,9 @@ export class SseParser {
 
   /** Add the next piece of the response. Returns the events it completed. */
   push(chunk: string): RawEvent[] {
-    this.buffer += chunk.replace(/\r\n/g, "\n");
+    // Normalised on the whole buffer, not on the piece: a Windows line ending may arrive
+    // split in two ("\r" at the end of one piece, "\n" at the start of the next).
+    this.buffer = (this.buffer + chunk).replace(/\r\n/g, "\n");
     const events: RawEvent[] = [];
     let end = this.buffer.indexOf("\n\n");
     while (end !== -1) {

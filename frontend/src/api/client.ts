@@ -45,7 +45,7 @@ export class ApiError extends Error {
 let accessToken: string | null = null;
 let devUser: string | null = null;
 let onSignedOut: (() => void) | null = null;
-let refreshing: Promise<boolean> | null = null;
+let refreshing: Promise<"ok" | "signed_out"> | null = null;
 
 export function setAccessToken(token: string | null): void {
   accessToken = token;
@@ -89,23 +89,61 @@ async function errorFrom(response: Response): Promise<ApiError> {
   return new ApiError(message, response.status, code);
 }
 
-/** Exchange the refresh cookie for a new access token. Several callers share one attempt. */
-export function refreshSession(): Promise<boolean> {
+// How long to wait before asking for a new access token a second time (see requestRefresh).
+let refreshRetryMs = 400;
+
+/** Tests only: do not really wait. */
+export function setRefreshRetryMs(ms: number): void {
+  refreshRetryMs = ms;
+}
+
+/**
+ * Exchange the refresh cookie for a new access token.
+ *
+ * Returns the new session, or null when the server says the sign-in is over.
+ * Throws when the server could not be asked at all (it is restarting, or the
+ * network is down): that is not "signed out", and the cookie is still good.
+ *
+ * A refresh token is used once. If another tab of this browser exchanged the
+ * same cookie a moment ago, this request is refused - but by then the browser
+ * holds the new cookie from that tab's answer. So one refusal is followed by
+ * one more attempt before the page gives up.
+ */
+async function requestRefresh(): Promise<TokenResponse | null> {
+  for (const lastAttempt of [false, true]) {
+    let response: Response;
+    try {
+      response = await fetch("/auth/refresh", { method: "POST", credentials: "same-origin" });
+    } catch {
+      throw new ApiError("The server cannot be reached right now. Try again in a moment.", 0, "unreachable");
+    }
+    if (response.ok) return (await response.json()) as TokenResponse;
+    if (response.status !== 401 && response.status !== 403) {
+      throw new ApiError("The server is not available right now. Try again in a moment.", response.status, "unavailable");
+    }
+    if (!lastAttempt) await new Promise((resolve) => setTimeout(resolve, refreshRetryMs));
+  }
+  return null;
+}
+
+/** Get a new access token. Several callers share one attempt. */
+export function refreshSession(): Promise<"ok" | "signed_out"> {
   refreshing ??= (async () => {
     try {
-      const response = await fetch("/auth/refresh", { method: "POST", credentials: "same-origin" });
-      if (!response.ok) return false;
-      const body = (await response.json()) as TokenResponse;
-      accessToken = body.access_token;
-      return true;
-    } catch {
-      return false;
+      const session = await requestRefresh();
+      if (session) accessToken = session.access_token;
+      return session ? "ok" : "signed_out";
     } finally {
       refreshing = null;
     }
   })();
   return refreshing;
 }
+
+// Requests that must not be answered with "get a new token and repeat": they are the
+// sign-in itself. Everything else under /auth (change password, delete account, who am I)
+// is an ordinary request and is repeated like any other.
+const SIGN_IN_PATHS = ["/auth/refresh", "/auth/login", "/auth/register", "/auth/google", "/auth/logout", "/auth/config"];
 
 async function send(path: string, init: RequestInit = {}, retry = true): Promise<Response> {
   const response = await fetch(path, {
@@ -114,8 +152,9 @@ async function send(path: string, init: RequestInit = {}, retry = true): Promise
     headers: { ...authHeaders(), ...(init.headers as Record<string, string> | undefined) },
   });
   // An access token that ran out: get a new one once, then repeat the request.
-  if (response.status === 401 && retry && accessToken && !path.startsWith("/auth/")) {
-    if (await refreshSession()) return send(path, init, false);
+  if (response.status === 401 && retry && accessToken && !SIGN_IN_PATHS.includes(path)) {
+    // If the server cannot be asked, this throws, and the person stays signed in.
+    if ((await refreshSession()) === "ok") return send(path, init, false);
     accessToken = null;
     onSignedOut?.();
   }
@@ -168,10 +207,7 @@ export const api = {
     json<TokenResponse>("/auth/login", { method: "POST", ...body({ email, password }) }),
   google: (credential: string, signupCode: string) =>
     json<TokenResponse>("/auth/google", { method: "POST", ...body({ credential, signup_code: signupCode || null }) }),
-  restore: async (): Promise<TokenResponse | null> => {
-    const response = await fetch("/auth/refresh", { method: "POST", credentials: "same-origin" });
-    return response.ok ? ((await response.json()) as TokenResponse) : null;
-  },
+  restore: (): Promise<TokenResponse | null> => requestRefresh(),
   me: () => json<User>("/auth/me"),
   logout: () => json<void>("/auth/logout", { method: "POST" }),
   changePassword: (currentPassword: string | null, newPassword: string) =>

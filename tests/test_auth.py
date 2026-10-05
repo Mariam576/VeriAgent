@@ -151,11 +151,11 @@ def jwt_mode(monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "AUTH_MODE", "jwt")
     monkeypatch.setattr(settings, "GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID)
-    auth_api.attempts_by_address.reset()
-    auth_api.failed_logins.reset()
+    for limiter in (auth_api.attempts_by_address, auth_api.failed_logins, auth_api.failed_logins_per_account):
+        limiter.reset()
     yield settings
-    auth_api.attempts_by_address.reset()
-    auth_api.failed_logins.reset()
+    for limiter in (auth_api.attempts_by_address, auth_api.failed_logins, auth_api.failed_logins_per_account):
+        limiter.reset()
 
 
 @pytest.fixture
@@ -539,3 +539,137 @@ async def test_old_placeholder_data_can_be_adopted_by_an_account(client, jwt_mod
         await adopt(old_name, "nobody@example.com")
     with pytest.raises(SystemExit, match="no placeholder user"):
         await adopt("no-such-name", account["email"])
+
+
+# =============================================================== found in review
+def bearer(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_a_token_carries_the_account_version_it_was_made_with(settings):
+    secret, user_id = "s" * 48, uuid.uuid4()
+    assert tokens.read_access_claims(tokens.create_access_token(user_id, secret)[0], secret) == (user_id, 0)
+    assert tokens.read_access_claims(tokens.create_access_token(user_id, secret, version=7)[0], secret) == (user_id, 7)
+    # A token from before the version existed counts as version 0; nonsense is refused.
+    old = jwt.encode({"sub": str(user_id), "iat": 1, "exp": 9999999999, "iss": tokens.ISSUER, "typ": "access"}, secret, algorithm="HS256")
+    assert tokens.read_access_claims(old, secret) == (user_id, 0)
+    odd = jwt.encode({"sub": str(user_id), "iat": 1, "exp": 9999999999, "iss": tokens.ISSUER, "typ": "access", "ver": "x"}, secret, algorithm="HS256")
+    with pytest.raises(Unauthorized):
+        tokens.read_access_claims(odd, secret)
+
+
+@pytest.mark.integration
+async def test_taking_an_address_back_ends_the_strangers_running_session(client, jwt_mode, google):
+    """The stranger's refresh token was revoked, but the access token in their hands lived on for
+    half an hour - long enough to set a new password on the account that had just lost its old one."""
+    victim_email = f"test-{RUN_ID}-{uuid.uuid4().hex[:8]}@gmail.com"
+    async with other_client() as attacker:
+        squatted = await register(attacker, email=victim_email, password="attacker knows this")
+        assert (await attacker.get("/auth/me", headers=squatted["headers"])).status_code == 200
+
+        owner = await client.post("/auth/google", json={"credential": google_credential(google, email=victim_email)})
+        assert owner.status_code == 200
+
+        assert (await attacker.get("/auth/me", headers=squatted["headers"])).status_code == 401
+        assert (await attacker.get("/memory", headers=squatted["headers"])).status_code == 401
+        takeover = await attacker.post("/auth/password", headers=squatted["headers"], json={"new_password": "attacker's new one"})
+        assert takeover.status_code == 401
+        assert (await attacker.post("/auth/login", json={"email": victim_email, "password": "attacker's new one"})).status_code == 401
+    # The owner's own, new token works.
+    assert (await client.get("/auth/me", headers=bearer(owner.json()["access_token"]))).status_code == 200
+
+
+@pytest.mark.integration
+async def test_signing_out_ends_the_access_token_at_once(client, jwt_mode):
+    account = await register(client)
+    async with other_client() as phone:
+        on_phone = (await phone.post("/auth/login", json={"email": account["email"], "password": PASSWORD})).json()
+        assert (await client.post("/auth/logout")).status_code == 204
+        # The token that was in the browser's memory is worthless now, not in half an hour.
+        assert (await client.get("/auth/me", headers=account["headers"])).status_code == 401
+        assert (await client.get("/documents", headers=account["headers"])).status_code == 401
+        # The phone was not signed out: its old access token is refused, the page fetches a new one, and carries on.
+        assert (await phone.get("/auth/me", headers=bearer(on_phone["access_token"]))).status_code == 401
+        renewed = await phone.post("/auth/refresh")
+        assert renewed.status_code == 200
+        assert (await phone.get("/auth/me", headers=bearer(renewed.json()["access_token"]))).status_code == 200
+
+
+@pytest.mark.integration
+async def test_a_changed_password_ends_access_tokens_on_other_devices(client, jwt_mode):
+    account = await register(client)
+    async with other_client() as phone:
+        on_phone = (await phone.post("/auth/login", json={"email": account["email"], "password": PASSWORD})).json()
+        changed = await client.post("/auth/password", headers=account["headers"], json={"current_password": PASSWORD, "new_password": "a brand new secret"})
+        assert changed.status_code == 200
+        assert (await phone.get("/auth/me", headers=bearer(on_phone["access_token"]))).status_code == 401
+        assert (await phone.post("/auth/refresh")).status_code == 401
+    assert (await client.get("/auth/me", headers=account["headers"])).status_code == 401  # the token from before the change
+    assert (await client.get("/auth/me", headers=bearer(changed.json()["access_token"]))).status_code == 200
+
+
+@pytest.mark.integration
+async def test_a_strangers_wrong_guesses_do_not_lock_the_owner_out(client, jwt_mode, monkeypatch):
+    """Five wrong passwords by anyone who knew the email address locked the owner out for 15 minutes, again and again."""
+    monkeypatch.setattr(jwt_mode, "TRUST_PROXY_HEADERS", True)
+    monkeypatch.setattr(jwt_mode, "CLIENT_ADDRESS_HEADER", "x-forwarded-for")
+    account = await register(client)
+    stranger, owner = {"X-Forwarded-For": "203.0.113.5"}, {"X-Forwarded-For": "198.51.100.7"}
+    for _ in range(5):
+        assert (await client.post("/auth/login", headers=stranger, json={"email": account["email"], "password": "guess number x"})).status_code == 401
+    # The stranger is stopped, even with the right password ...
+    assert (await client.post("/auth/login", headers=stranger, json={"email": account["email"], "password": PASSWORD})).status_code == 429
+    # ... the owner, who comes from somewhere else, is not.
+    assert (await client.post("/auth/login", headers=owner, json={"email": account["email"], "password": PASSWORD})).status_code == 200
+
+
+@pytest.mark.integration
+async def test_changing_address_for_every_guess_does_not_give_unlimited_guesses(client, jwt_mode, monkeypatch):
+    monkeypatch.setattr(jwt_mode, "TRUST_PROXY_HEADERS", True)
+    monkeypatch.setattr(jwt_mode, "CLIENT_ADDRESS_HEADER", "x-forwarded-for")
+    monkeypatch.setattr(auth_api, "failed_logins_per_account", RateLimiter(limit=8, window_seconds=900))
+    account = await register(client)
+    statuses = []
+    for number in range(10):
+        response = await client.post(
+            "/auth/login", headers={"X-Forwarded-For": f"203.0.113.{number}"}, json={"email": account["email"], "password": f"guess number {number}"}
+        )
+        statuses.append(response.status_code)
+    assert statuses == [401] * 8 + [429] * 2
+
+
+def test_password_hashing_fits_a_small_server():
+    from app.security import passwords
+
+    # 19 MiB per hash (the library default is 64 MiB): OWASP's setting for memory-constrained servers.
+    assert passwords._hasher.memory_cost == 19_456 and passwords._hasher.time_cost == 2 and passwords._hasher.parallelism == 1
+    assert hash_password(PASSWORD).startswith("$argon2id$v=19$m=19456,t=2,p=1$")
+    # A hash made with other settings still verifies, and is renewed at the next sign-in.
+    from argon2 import PasswordHasher
+
+    older = PasswordHasher(time_cost=3, memory_cost=65_536, parallelism=4).hash(PASSWORD)
+    assert verify_password(PASSWORD, older) and passwords.needs_rehash(older) and not passwords.needs_rehash(hash_password(PASSWORD))
+
+
+async def test_only_a_few_passwords_are_hashed_at_the_same_moment(monkeypatch):
+    """Found in review: 12 sign-in attempts at once, by nobody in particular, used 590 MB on a 512 MB host."""
+    import asyncio
+    import threading
+
+    from app.security import passwords
+
+    lock, running, most = threading.Lock(), 0, 0
+
+    def slow_verify(password: str, password_hash: str | None) -> bool:
+        nonlocal running, most
+        with lock:
+            running += 1
+            most = max(most, running)
+        time.sleep(0.03)
+        with lock:
+            running -= 1
+        return True
+
+    monkeypatch.setattr(passwords, "verify_password", slow_verify)
+    results = await asyncio.gather(*(passwords.verify_password_async("x", None) for _ in range(12)))
+    assert all(results) and most == passwords.MAX_CONCURRENT_HASHES

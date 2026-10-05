@@ -15,7 +15,10 @@ from app.startup import ConfigurationError, check_configuration, configuration_p
 
 def settings(**values: object) -> Settings:
     """Settings built from the given values only (the .env file of the project is not read)."""
-    base = {"LLM_PROVIDER": "mock", "EMBEDDING_PROVIDER": "hash", "AUTH_MODE": "jwt"}
+    base = {
+        "LLM_PROVIDER": "mock", "EMBEDDING_PROVIDER": "hash", "AUTH_MODE": "jwt",
+        "DATABASE_URL": "postgresql://postgres:postgres@localhost:5432/veriagent",
+    }
     return Settings(_env_file=None, **{**base, **values})
 
 
@@ -51,6 +54,30 @@ def test_no_sign_in_on_a_public_server_stops_the_start():
     assert configuration_problems(settings(AUTH_MODE="dev")) == []
 
 
+def test_a_signing_key_that_is_too_short_stops_the_start():
+    """Found in review: the server started, and then every sign-in answered "500 Something went wrong"."""
+    with pytest.raises(ConfigurationError, match="JWT_SECRET must have at least 32 characters"):
+        check_configuration(settings(JWT_SECRET="my-secret"))
+    assert configuration_problems(settings(JWT_SECRET="x" * 32)) == []
+    assert configuration_problems(settings(JWT_SECRET="")) == []  # empty = VeriAgent creates one itself
+
+
+def test_an_unreadable_database_address_stops_the_start_without_repeating_it():
+    with pytest.raises(ConfigurationError) as raised:
+        check_configuration(settings(DATABASE_URL="postgresql://owner:pa/ss-w0rd@db.example.com/d"))
+    assert "percent-encoded" in str(raised.value) and "ss-w0rd" not in str(raised.value)
+
+
+def test_a_remote_database_without_a_checked_certificate_is_pointed_out():
+    remote = "postgresql://u:p@db.example.com/d"
+    assert any("certificate is not checked" in warning for warning in configuration_warnings(settings(DATABASE_URL=remote + "?sslmode=require")))
+    assert any("certificate is not checked" in warning for warning in configuration_warnings(settings(DATABASE_URL=remote)))
+    for checked in ("?sslmode=verify-full", "?sslmode=require&channel_binding=require"):
+        assert configuration_warnings(settings(DATABASE_URL=remote + checked)) == []
+    # The database of Docker Compose or of your own PC is not "another machine".
+    assert configuration_warnings(settings(DATABASE_URL="postgresql://postgres:postgres@db:5432/veriagent")) == []
+
+
 # ------------------------------------------------------------------ warnings
 def test_a_missing_key_is_a_warning_not_a_refusal(caplog):
     chosen = settings(LLM_PROVIDER="gemini", GEMINI_API_KEY="")
@@ -80,6 +107,8 @@ def test_incomplete_github_settings_are_pointed_out():
     assert any("GITHUB_TOKEN" in warning for warning in configuration_warnings(settings(ACTION_SERVER="github")))
     complete = settings(ACTION_SERVER="github", GITHUB_TOKEN="a-token", GITHUB_REPOSITORY="someone/project")
     assert configuration_warnings(complete) == []
+    # "GITHUB_TOKEN=" in the .env file means "not set", like the other keys.
+    assert settings(ACTION_SERVER="github", GITHUB_TOKEN="", GITHUB_REPOSITORY="someone/project").GITHUB_TOKEN is None
 
 
 def test_no_message_contains_a_secret(caplog):
@@ -143,8 +172,24 @@ def test_the_render_blueprint_only_uses_settings_that_exist(monkeypatch):
     monkeypatch.setattr(startup, "_installed", lambda module: module != "sentence_transformers")
     values = {name: entry["value"] for name, entry in entries.items() if "value" in entry and name not in build_only}
     assert all(isinstance(value, str) for value in values.values())  # YAML would turn a bare false into a boolean
-    chosen = settings(**values, GEMINI_API_KEY="a-key", SIGNUP_CODE="a-code", JWT_SECRET="x" * 44)
+    chosen = settings(
+        **values, GEMINI_API_KEY="a-key", SIGNUP_CODE="a-code", JWT_SECRET="x" * 44,
+        DATABASE_URL="postgresql://owner:pw@ep-cool-name-123456.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
+    )
     assert configuration_problems(chosen) == []
     assert configuration_warnings(chosen) == []
     assert entries["LOCAL_EMBEDDINGS"]["value"] == "false" and chosen.EMBEDDING_PROVIDER == "gemini"
     assert chosen.AUTH_MODE == "jwt" and chosen.TRUST_PROXY_HEADERS and not chosen.KEEP_UPLOADED_FILES
+
+
+def test_every_setting_is_explained_in_the_example_file():
+    """A setting that exists in the code but not in .env.example is one nobody will find."""
+    import re
+    from pathlib import Path
+
+    example = (Path(__file__).parent.parent / ".env.example").read_text(encoding="utf-8")
+    written = set(re.findall(r"^#?\s*([A-Z][A-Z0-9_]+)=", example, re.MULTILINE))
+    fixed_in_code = {"APP_NAME", "APP_VERSION"}
+    assert set(Settings.model_fields) - written - fixed_in_code == set()
+    only_for_docker_or_langsmith = {"API_PORT", "DB_PORT", "LANGSMITH_API_KEY", "LANGSMITH_PROJECT", "LANGSMITH_TRACING"}
+    assert written - set(Settings.model_fields) == only_for_docker_or_langsmith

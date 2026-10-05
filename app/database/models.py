@@ -44,6 +44,9 @@ class User(Base):
     # True once someone proved they own the address (today: by signing in with Google).
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    # Raised whenever the account's credentials change. Access tokens carry the number they
+    # were made with; one with an older number is refused (app/security/tokens.py).
+    token_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
 class RefreshToken(Base):

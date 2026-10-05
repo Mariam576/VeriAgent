@@ -59,11 +59,15 @@ async def get_current_user(
     settings = get_settings()
     token = credentials.credentials.strip() if credentials and credentials.credentials.strip() else None
     if token is not None:
-        user_id = tokens.read_access_token(token, await tokens.signing_secret(session))
+        user_id, version = tokens.read_access_claims(token, await tokens.signing_secret(session))
         user = await repositories.get_user(session, user_id)
         if user is None or not user.is_active:
             # Deleted or disabled after the token was issued.
             raise Unauthorized("Please sign in again.")
+        if version != user.token_version:
+            # Issued before the password changed, before a sign-out, or before the address was taken
+            # back by its owner. The page answers this by asking for a new token with its refresh cookie.
+            raise Unauthorized("Your session has expired. Please sign in again.")
         return user
     if settings.AUTH_MODE == "dev":
         name = (x_user_id or DEFAULT_USER_NAME).strip()

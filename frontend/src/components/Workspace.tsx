@@ -28,6 +28,7 @@ interface Props {
 }
 
 const POLL_MS = 1500;
+const MAX_POLL_MS = 30_000;
 
 export function Workspace({ user, config, onUserChanged, onSignOut, onAccountDeleted }: Props) {
   const [documents, setDocuments] = useState<DocumentInfo[]>([]);
@@ -47,11 +48,14 @@ export function Workspace({ user, config, onUserChanged, onSignOut, onAccountDel
   const [notice, setNotice] = useState("");
   const stop = useRef<AbortController | null>(null);
 
-  const loadDocuments = useCallback(async () => {
+  /** Returns false when the list could not be loaded. `quiet`: a background check that shows no message. */
+  const loadDocuments = useCallback(async (quiet = false): Promise<boolean> => {
     try {
       setDocuments(await api.documents());
+      return true;
     } catch (error) {
-      setNotice(errorText(error));
+      if (!quiet) setNotice(errorText(error));
+      return false;
     }
   }, []);
 
@@ -70,12 +74,32 @@ export function Workspace({ user, config, onUserChanged, onSignOut, onAccountDel
     api.actionConfig().then(setActionConfig).catch(() => setActionConfig(null));
   }, [loadDocuments, loadHistory]);
 
-  // Documents uploaded in the background: ask again until none is "processing".
+  // Documents uploaded in the background: ask again until none is "processing". A check that
+  // fails (the server is restarting) does not end the asking; it only becomes less frequent.
+  const processing = documents.some((document) => document.status === "processing");
   useEffect(() => {
-    if (!documents.some((document) => document.status === "processing")) return;
-    const timer = window.setTimeout(() => void loadDocuments(), POLL_MS);
-    return () => window.clearTimeout(timer);
-  }, [documents, loadDocuments]);
+    if (!processing) return;
+    let stopped = false;
+    let delay = POLL_MS;
+    let timer = 0;
+    const check = async () => {
+      const ok = await loadDocuments(true);
+      if (stopped) return;
+      delay = ok ? POLL_MS : Math.min(delay * 2, MAX_POLL_MS);
+      timer = window.setTimeout(() => void check(), delay);
+    };
+    timer = window.setTimeout(() => void check(), delay);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [processing, loadDocuments]);
+
+  // A document that was deleted, or is no longer ready, cannot stay ticked for comparison.
+  useEffect(() => {
+    const ready = new Set(documents.filter((document) => document.status === "ready").map((document) => document.id));
+    setCompareIds((current) => (current.every((id) => ready.has(id)) ? current : current.filter((id) => ready.has(id))));
+  }, [documents]);
 
   const ask = async (question: string) => {
     setBusy(true);
@@ -209,7 +233,15 @@ export function Workspace({ user, config, onUserChanged, onSignOut, onAccountDel
         </section>
 
         <aside className="panel right">
-          <ResultPanel report={report} summary={selected} actionConfig={actionConfig} onReport={reportChanged} onError={setNotice} />
+          {/* key: nothing typed or shown for one investigation (an error, a half-made decision) stays for the next */}
+          <ResultPanel
+            key={report?.investigation_id ?? selected?.id ?? "none"}
+            report={report}
+            summary={selected}
+            actionConfig={actionConfig}
+            onReport={reportChanged}
+            onError={setNotice}
+          />
         </aside>
       </main>
 

@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import (
 
 from app.config import get_settings
 from app.database.urls import parse_database_url
+from app.security.guardrails import redact_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -79,10 +80,14 @@ async def init_db() -> None:
             break
         except Exception as exc:  # noqa: BLE001
             if attempt == DB_STARTUP_ATTEMPTS:
+                reason = redact_secrets(f"{type(exc).__name__}: {exc}", settings)[:300]
                 raise RuntimeError(
-                    "Could not connect to the database. Check DATABASE_URL and that PostgreSQL is running."
+                    f"Could not connect to the database ({reason}). Check DATABASE_URL and that PostgreSQL is running."
                 ) from exc
-            logger.warning("Database not ready yet (attempt %d/%d), retrying...", attempt, DB_STARTUP_ATTEMPTS)
+            # The reason is what tells a sleeping database ("connection refused") from a wrong
+            # password or a certificate problem. Passwords are removed before it is logged.
+            reason = redact_secrets(f"{type(exc).__name__}: {exc}", settings)[:300]
+            logger.warning("Database not ready yet (attempt %d/%d): %s", attempt, DB_STARTUP_ATTEMPTS, reason)
             await asyncio.sleep(DB_STARTUP_DELAY_SECONDS)
 
     async with engine.begin() as conn:

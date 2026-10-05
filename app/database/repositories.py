@@ -136,6 +136,17 @@ async def revoke_all_refresh_tokens(session: AsyncSession, user_id: uuid.UUID) -
     await session.commit()
 
 
+async def end_access_tokens(session: AsyncSession, user_id: uuid.UUID) -> None:
+    """Make every access token issued so far for this account worthless, at once.
+
+    Other devices notice at their next request, exchange their refresh cookie
+    for a new access token and carry on - unless their refresh token was
+    revoked as well, in which case they are signed out.
+    """
+    await session.execute(update(User).where(User.id == user_id).values(token_version=User.token_version + 1))
+    await session.commit()
+
+
 async def delete_expired_refresh_tokens(session: AsyncSession) -> int:
     result = await session.execute(delete(RefreshToken).where(RefreshToken.expires_at < utcnow()))
     await session.commit()
@@ -156,6 +167,11 @@ async def delete_user(session: AsyncSession, user_id: uuid.UUID) -> None:
 
 
 # ----------------------------------------------------------------- documents
+async def count_documents(session: AsyncSession, user_id: uuid.UUID) -> int:
+    count = await session.scalar(select(func.count(Document.id)).where(Document.user_id == user_id))
+    return int(count or 0)
+
+
 async def count_chunks(session: AsyncSession, document_id: uuid.UUID) -> int:
     count = await session.scalar(select(func.count(DocumentChunk.id)).where(DocumentChunk.document_id == document_id))
     return int(count or 0)

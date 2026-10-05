@@ -29,6 +29,7 @@ from app.errors import AppError, DocumentProcessingError, ServiceUnavailable
 from app.forensics.analyze import analyze_document
 from app.rag.chunking import chunk_pages
 from app.rag.loaders import guess_document_type, guess_year, load_pages
+from app.security.guardrails import redact_secrets
 from app.security.validation import validate_upload
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,7 @@ async def process_document(
                 )
         document.page_count = len(pages)
         document.status = "ready"
+        document.error = None  # a job that was given up on (see app/maintenance.py) may finish after all
         await session.commit()
         if not settings.KEEP_UPLOADED_FILES:
             # Everything the application needs is in the database now (text, vectors, inspection result).
@@ -220,7 +222,7 @@ async def process_document(
         failed = await session.get(Document, document_id)
         if failed is not None:
             failed.status = "failed"
-            failed.error = message[:500]
+            failed.error = redact_secrets(message, settings)[:500]  # a provider's error text is never trusted to be clean
             await session.commit()
         await asyncio.to_thread(path.unlink, True)
         raise error from exc

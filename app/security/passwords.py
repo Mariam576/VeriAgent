@@ -14,6 +14,9 @@ Concept - never store a password:
 
 from __future__ import annotations
 
+import asyncio
+import weakref
+
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
@@ -22,7 +25,14 @@ from app.errors import ValidationFailed
 MIN_PASSWORD_CHARS = 10
 MAX_PASSWORD_CHARS = 128
 
-_hasher = PasswordHasher()  # library defaults follow the current OWASP guidance
+# Argon2id with 19 MiB of memory, 2 passes, 1 thread: one of the settings OWASP recommends.
+# The library's default takes 64 MiB per hash. On a host with 512 MB, a handful of sign-in
+# attempts arriving together would then use up the machine (found in review, see below).
+_hasher = PasswordHasher(time_cost=2, memory_cost=19_456, parallelism=1)
+# How many passwords may be hashed at the same moment. Hashing is deliberately expensive,
+# and signing in needs no account, so without a limit anyone could make the server spend
+# all its memory and CPU on it. Further attempts wait their turn.
+MAX_CONCURRENT_HASHES = 2
 # Passwords that attackers try first. A real deployment would check a breach list.
 _COMMON = {
     "password", "password1", "password123", "1234567890", "12345678910", "qwertyuiop", "qwerty12345",
@@ -58,6 +68,28 @@ def verify_password(password: str, password_hash: str | None) -> bool:
         return _hasher.verify(password_hash or _DUMMY_HASH, password) and password_hash is not None
     except (VerifyMismatchError, VerificationError, InvalidHashError):
         return False
+
+
+_turns: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = weakref.WeakKeyDictionary()
+
+
+def _turn() -> asyncio.Semaphore:
+    """One semaphore per event loop (the application has one; every test has its own)."""
+    loop = asyncio.get_running_loop()
+    if loop not in _turns:
+        _turns[loop] = asyncio.Semaphore(MAX_CONCURRENT_HASHES)
+    return _turns[loop]
+
+
+async def hash_password_async(password: str) -> str:
+    """Hash in a worker thread (it is slow CPU work), at most ``MAX_CONCURRENT_HASHES`` at a time."""
+    async with _turn():
+        return await asyncio.to_thread(hash_password, password)
+
+
+async def verify_password_async(password: str, password_hash: str | None) -> bool:
+    async with _turn():
+        return await asyncio.to_thread(verify_password, password, password_hash)
 
 
 def needs_rehash(password_hash: str) -> bool:

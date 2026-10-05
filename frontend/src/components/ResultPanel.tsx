@@ -149,7 +149,9 @@ export function ResultPanel({ report, summary, actionConfig, onReport, onError }
       <p className="summary">{report.summary}</p>
 
       {report.human_review.status === "pending" ? (
-        <ApprovalBox report={report} actionConfig={actionConfig} onDecided={onReport} onError={onError} />
+        // key: a fresh form for every investigation. Without it the chosen decision, the note and
+        // a ticked "create an issue" box would carry over to the next investigation that is opened.
+        <ApprovalBox key={report.investigation_id} report={report} actionConfig={actionConfig} onDecided={onReport} onError={onError} />
       ) : (
         <p className="review-line">
           <strong>Human review:</strong> {reviewLine(report)}
