@@ -182,3 +182,27 @@ async def test_connections_closed_by_the_database_are_replaced(client, user_head
 
     assert (await client.get("/documents", headers=user_headers)).status_code == 200  # the SQLAlchemy pool recovered
     assert await saver.aget_tuple(config) is None  # and so did the checkpointer's pool
+
+
+# ============================================ found in the second review of Version 3
+def test_a_password_with_a_space_or_a_percent_sign_is_written_one_way_for_both_drivers():
+    """One driver took the space, the other refused it and printed the password into the log."""
+    target = parse_database_url("postgresql://app user:Zq9 S3cret%Tail@db.example.com:5432/veriagent?sslmode=require")
+    assert target.async_url == "postgresql+asyncpg://app%20user:Zq9%20S3cret%25Tail@db.example.com:5432/veriagent"
+    assert target.psycopg_url == "postgresql://app%20user:Zq9%20S3cret%25Tail@db.example.com:5432/veriagent?sslmode=require"
+    assert psycopg.conninfo.conninfo_to_dict(target.psycopg_url)["password"] == "Zq9 S3cret%Tail"
+    # A password that was already written percent-encoded is not encoded a second time.
+    already = parse_database_url("postgresql://u:p%40ss%20word@db.example.com/x")
+    assert already.psycopg_url == "postgresql://u:p%40ss%20word@db.example.com/x"
+
+
+def test_a_certificate_file_means_the_certificate_is_checked(tmp_path):
+    """libpq reads "sslmode=require" plus a certificate file as "check against that file". So do we."""
+    authorities = ssl.get_default_verify_paths().cafile or ssl.get_default_verify_paths().openssl_cafile
+    target = parse_database_url(f"postgresql://u:p@db.example.com/x?sslmode=require&sslrootcert={authorities}")
+    assert target.tls == "verified" and verifies(target.connect_args["ssl"], hostname=False)
+
+    missing = tmp_path / "no-such-file.pem"
+    with pytest.raises(ValueError) as error:
+        parse_database_url(f"postgresql://u:s3cret@db.example.com/x?sslmode=verify-full&sslrootcert={missing}")
+    assert "sslrootcert" in str(error.value) and "s3cret" not in str(error.value)

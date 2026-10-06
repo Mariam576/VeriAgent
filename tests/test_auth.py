@@ -673,3 +673,156 @@ async def test_only_a_few_passwords_are_hashed_at_the_same_moment(monkeypatch):
     monkeypatch.setattr(passwords, "verify_password", slow_verify)
     results = await asyncio.gather(*(passwords.verify_password_async("x", None) for _ in range(12)))
     assert all(results) and most == passwords.MAX_CONCURRENT_HASHES
+
+
+# ============================================ found in the second review of Version 3
+def bearer_of(access_token: str) -> dict:
+    return {"Authorization": f"Bearer {access_token}"}
+
+
+@pytest.mark.integration
+async def test_a_spent_refresh_cookie_cannot_sign_the_owner_out(client, jwt_mode):
+    """Anyone who ever saw an old cookie could end the owner's access tokens, again and again."""
+    await register(client)
+    spent = client.cookies.get("veriagent_refresh")
+    fresh = (await client.post("/auth/refresh")).json()  # the cookie is replaced; the old one is spent
+    async with other_client() as stranger:
+        assert (await stranger.post("/auth/logout", cookies={"veriagent_refresh": spent})).status_code == 204
+    assert (await client.get("/auth/me", headers=bearer_of(fresh["access_token"]))).status_code == 200
+
+
+@pytest.mark.integration
+async def test_signing_out_with_the_access_token_alone_ends_it(client, jwt_mode):
+    """Two tabs: the other tab has just replaced the cookie. Signing out here still ends the access token."""
+    account = await register(client)
+    async with other_client() as tab:  # no cookie of its own
+        assert (await tab.post("/auth/logout", headers=account["headers"])).status_code == 204
+        assert (await tab.post("/auth/logout", headers=bearer_of("not-a-token"))).status_code == 204  # harmless
+    assert (await client.get("/auth/me", headers=account["headers"])).status_code == 401
+
+
+@pytest.mark.integration
+async def test_a_password_change_cannot_be_overtaken_by_a_stolen_session(client, jwt_mode, monkeypatch):
+    """Found in review: while the new password was being hashed, a thief with a copied cookie fetched a
+    token that the change did not end - and could then delete the account. Now the change is one step
+    in the database, and whatever was issued before it stops working."""
+    account = await register(client)
+    new_password = "a brand new secret"
+    async with other_client() as thief:
+        stolen = (await thief.post("/auth/login", json={"email": account["email"], "password": PASSWORD})).json()
+        assert stolen["access_token"]
+        taken: dict = {}
+        hash_as_usual = auth_api.hash_password_async
+
+        async def hash_while_the_thief_acts(password: str) -> str:
+            # The moment the review used: the owner's request is waiting for the slow hash.
+            first = (await thief.post("/auth/refresh")).json()
+            await thief.post("/auth/logout", headers=bearer_of(first["access_token"]), cookies={})  # raises the version
+            second = await thief.post("/auth/refresh")
+            taken["access"] = second.json().get("access_token") if second.status_code == 200 else first["access_token"]
+            return await hash_as_usual(password)
+
+        monkeypatch.setattr(auth_api, "hash_password_async", hash_while_the_thief_acts)
+        changed = await client.post(
+            "/auth/password", headers=account["headers"], json={"current_password": PASSWORD, "new_password": new_password}
+        )
+        assert changed.status_code == 200
+        assert (await thief.get("/auth/me", headers=bearer_of(taken["access"]))).status_code == 401
+        assert (await thief.post("/auth/refresh")).status_code == 401
+    async with other_client() as owner:
+        assert (await owner.post("/auth/login", json={"email": account["email"], "password": PASSWORD})).status_code == 401
+        assert (await owner.post("/auth/login", json={"email": account["email"], "password": new_password})).status_code == 200
+
+
+@pytest.mark.integration
+async def test_the_database_counts_the_token_version_itself(client, jwt_mode):
+    """A version worked out from a stale copy would repeat a number that tokens already carry."""
+    from app.database import repositories
+
+    account = await register(client)
+    user_id = uuid.UUID(account["user"]["id"])
+    async with get_session_factory()() as first, get_session_factory()() as second:
+        stale = await first.get(User, user_id)
+        seen = stale.token_version
+        await repositories.end_access_tokens(second, user_id)  # someone else raises it meanwhile
+        version = await repositories.replace_password(first, user_id, hash_password("another long secret"))
+        assert version == seen + 2
+        live = (await second.execute(select(RefreshToken).where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None)))).scalars().all()
+        assert live == []
+        # A sign-in that was checked against the account as it was before no longer starts a session.
+        assert await repositories.store_refresh_token(
+            first, user_id, tokens.new_refresh_token()[1], datetime.now(timezone.utc) + timedelta(days=1), expected_version=seen
+        ) is None
+
+
+@pytest.mark.integration
+async def test_wrong_passwords_that_arrive_together_are_all_counted(client, jwt_mode, monkeypatch):
+    """Found in review: 300 guesses sent at the same moment were all checked, because each one
+    looked at the counter before any of them had been counted."""
+    import asyncio
+
+    monkeypatch.setattr(jwt_mode, "TRUST_PROXY_HEADERS", True)
+    monkeypatch.setattr(jwt_mode, "CLIENT_ADDRESS_HEADER", "x-forwarded-for")
+    monkeypatch.setattr(auth_api, "failed_logins_per_account", RateLimiter(limit=6, window_seconds=900))
+    account = await register(client)
+    checked = 0
+    verify_as_usual = auth_api.verify_password_async
+
+    async def counting(password, password_hash):
+        nonlocal checked
+        checked += 1
+        return await verify_as_usual(password, password_hash)
+
+    monkeypatch.setattr(auth_api, "verify_password_async", counting)
+
+    async def guess(number: int) -> int:
+        async with other_client() as guesser:
+            response = await guesser.post(
+                "/auth/login", headers={"X-Forwarded-For": f"203.0.113.{number}"},
+                json={"email": account["email"], "password": f"guess number {number}"},
+            )
+            return response.status_code
+
+    statuses = await asyncio.gather(*(guess(number) for number in range(30)))
+    assert checked == 6 and sorted(statuses) == [401] * 6 + [429] * 24
+
+
+@pytest.mark.integration
+async def test_successful_sign_ins_do_not_use_up_the_failure_counters(client, jwt_mode, monkeypatch):
+    monkeypatch.setattr(jwt_mode, "TRUST_PROXY_HEADERS", True)
+    monkeypatch.setattr(jwt_mode, "CLIENT_ADDRESS_HEADER", "x-forwarded-for")
+    monkeypatch.setattr(auth_api, "failed_logins_per_account", RateLimiter(limit=4, window_seconds=900))
+    account = await register(client)
+    for number in range(8):
+        response = await client.post(
+            "/auth/login", headers={"X-Forwarded-For": f"198.51.100.{number}"}, json={"email": account["email"], "password": PASSWORD}
+        )
+        assert response.status_code == 200
+
+
+@pytest.mark.integration
+async def test_guessing_the_current_password_with_a_stolen_token_is_limited(client, jwt_mode, monkeypatch):
+    """The limit was only looked at after a wrong guess, so a right one always went through."""
+    monkeypatch.setattr(auth_api, "failed_logins_per_account", RateLimiter(limit=3, window_seconds=900))
+    account = await register(client)
+    for number in range(3):
+        wrong = await client.post("/auth/password", headers=account["headers"], json={"current_password": f"guess number {number}", "new_password": "a brand new secret"})
+        assert wrong.status_code == 401
+    right = await client.post("/auth/password", headers=account["headers"], json={"current_password": PASSWORD, "new_password": "a brand new secret"})
+    assert right.status_code == 429
+    assert (await client.get("/auth/me", headers=account["headers"])).status_code == 200  # nothing was changed
+
+
+async def test_the_queue_for_password_hashing_has_an_end(monkeypatch):
+    """A burst of sign-in attempts is told to come back; it does not keep every later visitor waiting."""
+    import asyncio
+    import time as clock
+
+    from app.errors import TooManyRequests
+    from app.security import passwords
+
+    monkeypatch.setattr(passwords, "MAX_WAITING_HASHES", 5)
+    monkeypatch.setattr(passwords, "verify_password", lambda password, password_hash: clock.sleep(0.05) or True)
+    results = await asyncio.gather(*(passwords.verify_password_async("x", "y") for _ in range(12)), return_exceptions=True)
+    assert results.count(True) == 5 and sum(isinstance(result, TooManyRequests) for result in results) == 7
+    assert passwords._waiting == 0 and await passwords.verify_password_async("x", "y") is True

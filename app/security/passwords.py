@@ -20,7 +20,7 @@ import weakref
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
-from app.errors import ValidationFailed
+from app.errors import TooManyRequests, ValidationFailed
 
 MIN_PASSWORD_CHARS = 10
 MAX_PASSWORD_CHARS = 128
@@ -33,6 +33,7 @@ _hasher = PasswordHasher(time_cost=2, memory_cost=19_456, parallelism=1)
 # and signing in needs no account, so without a limit anyone could make the server spend
 # all its memory and CPU on it. Further attempts wait their turn.
 MAX_CONCURRENT_HASHES = 2
+MAX_WAITING_HASHES = 40  # about four seconds of work; whoever arrives after that is asked to retry
 # Passwords that attackers try first. A real deployment would check a breach list.
 _COMMON = {
     "password", "password1", "password123", "1234567890", "12345678910", "qwertyuiop", "qwerty12345",
@@ -71,6 +72,7 @@ def verify_password(password: str, password_hash: str | None) -> bool:
 
 
 _turns: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = weakref.WeakKeyDictionary()
+_waiting = 0
 
 
 def _turn() -> asyncio.Semaphore:
@@ -81,15 +83,30 @@ def _turn() -> asyncio.Semaphore:
     return _turns[loop]
 
 
+async def _in_turn(work, *arguments):
+    """Run slow hashing work in a worker thread, at most ``MAX_CONCURRENT_HASHES`` at a time.
+
+    The queue in front of it is limited too. Without a limit, a burst of
+    sign-in attempts would keep every later visitor waiting behind it; with
+    one, the burst is told to come back and the queue stays short.
+    """
+    global _waiting
+    if _waiting >= MAX_WAITING_HASHES:
+        raise TooManyRequests("The server is busy with other sign-ins. Try again in a few seconds.")
+    _waiting += 1
+    try:
+        async with _turn():
+            return await asyncio.to_thread(work, *arguments)
+    finally:
+        _waiting -= 1
+
+
 async def hash_password_async(password: str) -> str:
-    """Hash in a worker thread (it is slow CPU work), at most ``MAX_CONCURRENT_HASHES`` at a time."""
-    async with _turn():
-        return await asyncio.to_thread(hash_password, password)
+    return await _in_turn(hash_password, password)
 
 
 async def verify_password_async(password: str, password_hash: str | None) -> bool:
-    async with _turn():
-        return await asyncio.to_thread(verify_password, password, password_hash)
+    return await _in_turn(verify_password, password, password_hash)
 
 
 def needs_rehash(password_hash: str) -> bool:

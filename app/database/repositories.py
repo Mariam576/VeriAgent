@@ -86,13 +86,68 @@ async def create_account(
     return await session.get(User, user_id) if user_id else None
 
 
+async def _hold_account(session: AsyncSession, user_id: uuid.UUID) -> User | None:
+    """Read the account's row and keep it locked until this transaction ends.
+
+    Concept - why a lock:
+        "Read the version, then issue a token for it" and "change the password,
+        raise the version, revoke the tokens" are each several steps. If they
+        run at the same moment their steps interleave, and a token can be
+        issued that the password change no longer sees. With the row locked,
+        one of the two happens entirely before the other.
+    """
+    result = await session.execute(
+        select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True)
+    )
+    return result.scalar_one_or_none()
+
+
 async def store_refresh_token(
-    session: AsyncSession, user_id: uuid.UUID, token_hash: str, expires_at: Any, family_id: uuid.UUID | None = None
-) -> RefreshToken:
+    session: AsyncSession, user_id: uuid.UUID, token_hash: str, expires_at: Any, family_id: uuid.UUID | None = None,
+    *, expected_version: int | None = None,
+) -> RefreshToken | None:
+    """Store a refresh token for a new session.
+
+    ``expected_version``: the token version the caller saw when it checked the
+    password (or the Google identity). If the account has moved on since - the
+    password was changed, the sessions were ended - nothing is stored and None
+    is returned: the sign-in that was checked no longer counts.
+    """
+    account = await _hold_account(session, user_id)
+    if account is None or (expected_version is not None and account.token_version != expected_version):
+        await session.rollback()
+        return None
     token = RefreshToken(user_id=user_id, token_hash=token_hash, expires_at=expires_at, family_id=family_id or uuid.uuid4())
     session.add(token)
     await session.commit()
     return token
+
+
+async def exchange_refresh_token(
+    session: AsyncSession, token_hash: str, new_hash: str, expires_at: Any
+) -> tuple[RefreshToken | None, bool, User | None]:
+    """Spend a refresh token and store its successor, as one step. Returns (old token, ok, account).
+
+    ``ok`` is True for exactly one caller (see ``use_refresh_token``). The
+    account's row is held while this happens, so a password change that runs
+    at the same moment either comes first - then the old token is already
+    revoked and ``ok`` is False - or comes second and revokes the successor.
+    """
+    token = (await session.execute(select(RefreshToken).where(RefreshToken.token_hash == token_hash))).scalar_one_or_none()
+    if token is None:
+        await session.commit()
+        return None, False, None
+    account = await _hold_account(session, token.user_id)
+    result = await session.execute(
+        update(RefreshToken)
+        .where(RefreshToken.id == token.id, RefreshToken.revoked_at.is_(None), RefreshToken.expires_at > utcnow())
+        .values(revoked_at=utcnow())
+    )
+    ok = result.rowcount == 1
+    if ok and account is not None and account.is_active:
+        session.add(RefreshToken(user_id=account.id, token_hash=new_hash, expires_at=expires_at, family_id=token.family_id))
+    await session.commit()
+    return token, ok, account
 
 
 async def use_refresh_token(session: AsyncSession, token_hash: str) -> tuple[RefreshToken | None, bool]:
@@ -145,6 +200,29 @@ async def end_access_tokens(session: AsyncSession, user_id: uuid.UUID) -> None:
     """
     await session.execute(update(User).where(User.id == user_id).values(token_version=User.token_version + 1))
     await session.commit()
+
+
+async def replace_password(session: AsyncSession, user_id: uuid.UUID, password_hash: str | None, **also: Any) -> int:
+    """Set a new password hash (None removes the password) and end every session. Returns the new token version.
+
+    One transaction, and the database does the counting (``token_version + 1``):
+    whatever else happened to the account a moment ago, the version afterwards
+    is higher than any that a token was ever issued for, and every refresh
+    token that exists at that moment is revoked. ``also``: further columns to
+    set in the same step (linking a Google identity).
+    """
+    version = (await session.execute(
+        update(User).where(User.id == user_id)
+        .values(password_hash=password_hash, token_version=User.token_version + 1, **also)
+        .returning(User.token_version)
+    )).scalar_one()
+    await session.execute(
+        update(RefreshToken)
+        .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
+        .values(revoked_at=utcnow())
+    )
+    await session.commit()
+    return int(version)
 
 
 async def delete_expired_refresh_tokens(session: AsyncSession) -> int:

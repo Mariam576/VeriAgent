@@ -53,6 +53,12 @@ class RateLimiter:
         hits = self._recent(key, time.monotonic())
         return max(1, int(hits[0] + self.window - time.monotonic()) + 1) if hits else 1
 
+    def take_back(self, key: str) -> None:
+        """Remove the latest attempt again (it was counted before its outcome was known, and it succeeded)."""
+        hits = self._hits.get(key)
+        if hits:
+            hits.pop()
+
     def forget(self, key: str) -> None:
         self._hits.pop(key, None)
 

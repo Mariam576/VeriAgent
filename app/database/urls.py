@@ -35,7 +35,7 @@ import uuid
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Literal
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
 _SCHEMES = ("postgresql+asyncpg", "postgresql+psycopg", "postgresql", "postgres")
 # Words in the query string that are not passed on to libpq (asyncpg's spelling, or our own).
@@ -105,10 +105,31 @@ def _tls_wanted(query: dict[str, str]) -> tuple[Tls, bool]:
     if mode in _VERIFYING:
         return "verified", mode == "verify-full"
     if mode == "require":
+        if query.get("sslrootcert"):
+            # libpq's own rule: "require" together with a certificate file means "check against that file".
+            return "verified", False
         return "unverified", False
     if mode == "disable":
         return "off", False
     return "default", False
+
+
+def _netloc(netloc: str) -> str:
+    """The "user:password@host:port" part with user and password percent-encoded once, properly.
+
+    A password with a space or a lone "%" is accepted by one driver and refused
+    by the other - and the one that refuses quotes the password in its error
+    message, which ends up in the log (found in review). Writing both parts in
+    the one spelling every driver reads the same way avoids both.
+    """
+    credentials, at, address = netloc.rpartition("@")
+    if not at:
+        return netloc
+    user, colon, password = credentials.partition(":")
+    encoded = quote(unquote(user), safe="")
+    if colon:
+        encoded += ":" + quote(unquote(password), safe="")
+    return f"{encoded}@{address}"
 
 
 def parse_database_url(url: str) -> DatabaseTarget:
@@ -130,7 +151,13 @@ def parse_database_url(url: str) -> DatabaseTarget:
     connect_args: dict[str, Any] = {}
     if tls == "verified":
         cafile = query.get("sslrootcert") or None
-        connect_args["ssl"] = _verifying_context(check_hostname, None if cafile == "system" else cafile)
+        try:
+            connect_args["ssl"] = _verifying_context(check_hostname, None if cafile == "system" else cafile)
+        except (OSError, ssl.SSLError):
+            raise ValueError(
+                "DATABASE_URL names a certificate file (sslrootcert) that cannot be read on this computer. "
+                "Leave sslrootcert out to use the certificate authorities the system trusts."
+            ) from None
     elif tls == "unverified":
         connect_args["ssl"] = "require"
     elif tls == "off":
@@ -145,12 +172,13 @@ def parse_database_url(url: str) -> DatabaseTarget:
         # Each prepared statement gets a name nobody else can have, in case the driver prepares one anyway.
         connect_args["prepared_statement_name_func"] = lambda: f"__asyncpg_{uuid.uuid4()}__"
         for_asyncpg["prepared_statement_cache_size"] = "0"
-    async_url = urlunsplit(("postgresql+asyncpg", parts.netloc, parts.path, urlencode(for_asyncpg), ""))
+    netloc = _netloc(parts.netloc)
+    async_url = urlunsplit(("postgresql+asyncpg", netloc, parts.path, urlencode(for_asyncpg), ""))
 
     # ---- psycopg (libpq): the string as the provider wrote it, minus what only asyncpg or we understand
     libpq = {key: value for key, value in query.items() if key not in _NOT_FOR_LIBPQ}
     if "sslmode" not in libpq and "ssl" in query:
         libpq["sslmode"] = {"unverified": "require", "off": "disable"}.get(tls, query["ssl"].lower() if tls == "verified" else "prefer")
     # quote_via=quote: libpq reads %20 as a space but does not read "+" as one.
-    psycopg_url = urlunsplit(("postgresql", parts.netloc, parts.path, urlencode(libpq, quote_via=quote), ""))
+    psycopg_url = urlunsplit(("postgresql", netloc, parts.path, urlencode(libpq, quote_via=quote), ""))
     return DatabaseTarget(async_url=async_url, connect_args=connect_args, psycopg_url=psycopg_url, pooled=pooled, host=host, tls=tls)
