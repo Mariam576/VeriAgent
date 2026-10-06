@@ -47,6 +47,11 @@ async def get_or_create_user(session: AsyncSession, user_id: uuid.UUID, name: st
 
 
 # ------------------------------------------------------------------ accounts
+def _printable(text: str) -> str:
+    """Without control characters: PostgreSQL refuses a text that contains the character with code 0."""
+    return "".join(char for char in text if char.isprintable()).strip()
+
+
 async def get_user(session: AsyncSession, user_id: uuid.UUID) -> User | None:
     user = await session.get(User, user_id)
     await session.commit()  # hand the connection back (see get_or_create_user)
@@ -75,7 +80,7 @@ async def create_account(
     statement = (
         pg_insert(User)
         .values(
-            id=uuid.uuid4(), email=email.strip().lower(), name=name.strip()[:120], password_hash=password_hash,
+            id=uuid.uuid4(), email=email.strip().lower(), name=_printable(name)[:120] or "user", password_hash=password_hash,
             google_sub=google_sub, email_verified=email_verified, is_active=True,
         )
         .on_conflict_do_nothing()
@@ -172,22 +177,23 @@ async def use_refresh_token(session: AsyncSession, token_hash: str) -> tuple[Ref
     return token, result.rowcount == 1
 
 
-async def revoke_token_family(session: AsyncSession, family_id: uuid.UUID) -> None:
+async def end_token_family(session: AsyncSession, token: RefreshToken) -> None:
+    """End a session completely: every refresh token that descends from the same sign-in, and every
+    access token of the account.
+
+    Used when a refresh token that was already spent comes back (a copy of it is in someone else's
+    hands), and when a person signs out. The account's row is held, so an exchange that is running at
+    the same moment either finishes first - its successor is revoked here - or comes after and finds
+    its token revoked. The access tokens end with the token version; other devices fetch a new one with
+    their own refresh cookie and notice nothing.
+    """
+    await _hold_account(session, token.user_id)
     await session.execute(
         update(RefreshToken)
-        .where(RefreshToken.family_id == family_id, RefreshToken.revoked_at.is_(None))
+        .where(RefreshToken.family_id == token.family_id, RefreshToken.revoked_at.is_(None))
         .values(revoked_at=utcnow())
     )
-    await session.commit()
-
-
-async def revoke_all_refresh_tokens(session: AsyncSession, user_id: uuid.UUID) -> None:
-    """Sign the user out everywhere (after a password change, or when an account is taken back)."""
-    await session.execute(
-        update(RefreshToken)
-        .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
-        .values(revoked_at=utcnow())
-    )
+    await session.execute(update(User).where(User.id == token.user_id).values(token_version=User.token_version + 1))
     await session.commit()
 
 
@@ -202,27 +208,59 @@ async def end_access_tokens(session: AsyncSession, user_id: uuid.UUID) -> None:
     await session.commit()
 
 
-async def replace_password(session: AsyncSession, user_id: uuid.UUID, password_hash: str | None, **also: Any) -> int:
+async def replace_password(
+    session: AsyncSession, user_id: uuid.UUID, password_hash: str | None, *,
+    unless_changed_from: str | None | type[Ellipsis] = ..., refresh_token: tuple[str, Any] | None = None, **also: Any,
+) -> int | None:
     """Set a new password hash (None removes the password) and end every session. Returns the new token version.
 
     One transaction, and the database does the counting (``token_version + 1``):
     whatever else happened to the account a moment ago, the version afterwards
     is higher than any that a token was ever issued for, and every refresh
-    token that exists at that moment is revoked. ``also``: further columns to
-    set in the same step (linking a Google identity).
+    token that exists at that moment is revoked.
+
+    ``unless_changed_from``: the password hash the caller checked the current
+    password against (None: the account had no password). If the password has
+    been replaced since - by another change, or because the address was taken
+    back by its owner - nothing is written and None is returned: of two changes
+    that run at the same moment, exactly one counts. (The hash and not the
+    token version is the condition: the version also moves when someone signs
+    out, and a person who holds a copied cookie could then keep the owner from
+    ever changing the password.)
+    ``refresh_token``: (hash, expiry) of the token for the session that goes
+    on; stored in the same step, so nothing can fall between. ``also``: further
+    columns to set (linking a Google identity).
     """
+    statement = update(User).where(User.id == user_id)
+    if unless_changed_from is not ...:
+        statement = statement.where(User.password_hash.is_not_distinct_from(unless_changed_from))
     version = (await session.execute(
-        update(User).where(User.id == user_id)
-        .values(password_hash=password_hash, token_version=User.token_version + 1, **also)
-        .returning(User.token_version)
-    )).scalar_one()
+        statement.values(password_hash=password_hash, token_version=User.token_version + 1, **also).returning(User.token_version)
+    )).scalar_one_or_none()
+    if version is None:  # the account is gone, or it changed since the caller looked
+        await session.rollback()
+        return None
     await session.execute(
         update(RefreshToken)
         .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
         .values(revoked_at=utcnow())
     )
+    if refresh_token is not None:
+        session.add(RefreshToken(user_id=user_id, token_hash=refresh_token[0], expires_at=refresh_token[1], family_id=uuid.uuid4()))
     await session.commit()
     return int(version)
+
+
+async def renew_password_hash(session: AsyncSession, user_id: uuid.UUID, old_hash: str, new_hash: str) -> None:
+    """Store the same password hashed with the current settings - only if the password is still that one.
+
+    (Third review: written from a copy that was read before a slow hash, this put the OLD password back
+    over a password change that had happened in between.)
+    """
+    await session.execute(
+        update(User).where(User.id == user_id, User.password_hash == old_hash).values(password_hash=new_hash)
+    )
+    await session.commit()
 
 
 async def delete_expired_refresh_tokens(session: AsyncSession) -> int:

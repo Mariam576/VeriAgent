@@ -41,13 +41,13 @@ from app.comparison.profile import (
     MAX_NAME_CHARS,
     MAX_PARTIES,
     MAX_QUOTE_CHARS,
-    PER_MANY,
     DocumentProfile,
     LineItem,
     PartyRole,
     ProfileField,
+    per_many,
 )
-from app.numbers import NUMBER_CORE, parse_number
+from app.numbers import CURRENCY_CODES, NUMBER_CORE, parse_number
 from app.patterns import MONEY, find_amounts, find_payment_terms, iter_segments, money_amount, money_currency, money_readings, sentence_bounds
 from app.rag.loaders import PageText
 from app.security.guardrails import trusted_part
@@ -148,7 +148,7 @@ _NOT_A_LINE = re.compile(
     r"\b(?:total|sub[\s-]?total|amount\s+due|balance|vat|gst|tax|deposit|discount|limit|threshold|value|"
     r"purchase\s+order|contract|invoice|payment|terms?|"
     # deductions and running totals: "Less CIS deduction", "Carried forward", "Previously invoiced", "Net amount"
-    r"deduction|retention|(?:brought|carried)\s+forward|b/f|c/f|previously\s+\w+|to\s+date|cumulative|"
+    r"deduct\w*|retention|withh\w+|tds|cis|(?:brought|carried)\s+forward|b/f|c/f|previously\s+\w+|to\s+date|cumulative|"
     r"(?:net|gross)\s+(?:amount|value|sum|payable|due)|equivalent)\b|^\W*(?:less|net|gross)\b",
     re.I,
 )
@@ -157,7 +157,7 @@ _QUANTITY_LINE = re.compile(
     rf"^\W*(?P<qty>{_NUMBER})\s*(?:x\s+)?(?P<desc>[^.:\n|]{{3,120}}?)\s+(?:at|@)\s+(?P<price>[^\s|]+(?:\s[^\s|]+)?)\s+(?:each|per\s+(?:\d[\d,.]*\d|\w+))",
     re.I,
 )
-_CELL_NUMBER = re.compile(rf"^\s*(?:£|\$|€|₹)?\s*(?P<num>{_NUMBER})\s*$")
+_CELL_NUMBER = re.compile(rf"^\s*(?:£|\$|€|₹|(?:{CURRENCY_CODES}|Rs\.?)\s?)?\s*(?P<num>{_NUMBER})\s*$", re.I)
 
 
 def _clip(text: str, limit: int = MAX_QUOTE_CHARS) -> str:
@@ -439,11 +439,11 @@ def _line_items(pages: list[PageText]) -> list[LineItem]:
                     rest = stripped[match.end():]
                     stated = MONEY.search(rest) if re.match(r"\s*[:=,]", rest) else None  # "... each: $8,200"
                     stated_amount = money_amount(stated) if stated else None
-                    # "at £12.00 per 1,000": the quantity and the line total are kept, the price is not a unit price.
-                    per_many = PER_MANY.search(match.group(0))
+                    # "at £12.00 per 1,000": the price is for a thousand. The comparison divides by it (profile.per_many).
+                    many = per_many(match.group(0))
                     add(
                         match.group("desc"), quantity[0],
-                        None if per_many else _unit_price(price, quantity[0], stated_amount),
+                        _unit_price(price, quantity[0] / many if many else quantity[0], stated_amount),
                         stated_amount, money_currency(price) or None, page,
                         stripped[: stated.end() + match.end()] if stated else match.group(0),
                     )

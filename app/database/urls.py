@@ -41,6 +41,15 @@ _SCHEMES = ("postgresql+asyncpg", "postgresql+psycopg", "postgresql", "postgres"
 # Words in the query string that are not passed on to libpq (asyncpg's spelling, or our own).
 _NOT_FOR_LIBPQ = ("ssl", "pgbouncer", "prepared_statement_cache_size")
 _VERIFYING = ("verify-ca", "verify-full")
+_SSLMODES = ("disable", "allow", "prefer", "require", *_VERIFYING)
+# Words libpq would read from the part after the "?" as a second address or a second set of credentials.
+# asyncpg reads them from the address part only, so the two drivers would connect to different places.
+_ADDRESS_WORDS = ("host", "hostaddr", "port", "dbname", "user", "password", "passfile", "service", "requiressl", "require_auth")
+_UNKNOWN_SETTING = (
+    "DATABASE_URL has a setting after the '?' that cannot be used here. Settings are written in small letters; "
+    "sslmode is one of disable, allow, prefer, require, verify-ca, verify-full; host, port, database, user and "
+    "password belong in the address part (postgresql://user:password@host:port/database)."
+)
 _UNREADABLE = (
     "DATABASE_URL could not be read. It has the form postgresql://user:password@host:port/database. "
     "If the password contains one of / ? # @ : or %, write that character percent-encoded (for example %40 for @)."
@@ -94,20 +103,30 @@ def _verifying_context(check_hostname: bool, cafile: str | None) -> ssl.SSLConte
 
 def _tls_wanted(query: dict[str, str]) -> tuple[Tls, bool]:
     """What the connection string asks for: (protection, also check the host name)."""
-    mode = (query.get("sslmode") or "").lower()
+    mode = query.get("sslmode") or ""
     if not mode and "ssl" in query:  # written the asyncpg way
         mode = {"true": "require", "1": "require", "false": "disable", "0": "disable"}.get(query["ssl"].lower(), query["ssl"].lower())
+    if mode and mode not in _SSLMODES:
+        # A word neither driver knows ("required", "verify_full") must not quietly become "the driver's
+        # default" for one of them - that default sends the password without checking anything.
+        raise ValueError(_UNKNOWN_SETTING)
     if query.get("channel_binding", "").lower() == "require":
         # Channel binding protects the password exchange against a man in the middle. asyncpg
         # cannot do it, so the certificate is verified instead - whatever sslmode says, because
         # libpq too refuses to connect unprotected when channel binding is required.
-        return "verified", mode != "verify-ca"
+        own_authority = bool(query.get("sslrootcert")) and query.get("sslrootcert") != "system"
+        return "verified", not (mode == "verify-ca" and own_authority)
+    # "verify-ca" checks that the certificate was signed by the authority in the given file, and not the
+    # host name. That is only a check when the file names ONE authority of your own. Against the system's
+    # list - every public authority there is - any certificate for any website would pass, so there the
+    # host name is checked as well (libpq refuses that combination outright).
+    own_authority = bool(query.get("sslrootcert")) and query.get("sslrootcert") != "system"
     if mode in _VERIFYING:
-        return "verified", mode == "verify-full"
+        return "verified", mode == "verify-full" or not own_authority
     if mode == "require":
         if query.get("sslrootcert"):
             # libpq's own rule: "require" together with a certificate file means "check against that file".
-            return "verified", False
+            return "verified", not own_authority
         return "unverified", False
     if mode == "disable":
         return "off", False
@@ -143,6 +162,8 @@ def parse_database_url(url: str) -> DatabaseTarget:
     if not host:
         raise ValueError(_UNREADABLE)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if any(key != key.lower() or key in _ADDRESS_WORDS for key in query):
+        raise ValueError(_UNKNOWN_SETTING)
     pooled = is_pooled(host, port, query)
     tls, check_hostname = _tls_wanted(query)
 

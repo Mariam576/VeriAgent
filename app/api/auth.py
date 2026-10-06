@@ -97,7 +97,11 @@ def _require_same_origin(request: Request) -> None:
     host = request.headers.get("host", "")
     if get_settings().TRUST_PROXY_HEADERS:
         host = request.headers.get("x-forwarded-host", host).split(",")[0].strip()
-    if urlparse(origin).netloc != host:
+    try:
+        same = urlparse(origin).netloc == host
+    except ValueError:  # "http://[": not an address at all
+        same = False
+    if not same:
         raise Forbidden("This request did not come from the VeriAgent page.")
 
 
@@ -202,15 +206,25 @@ async def login(body: LoginRequest, request: Request, response: Response, sessio
         counted.append((limiter, key))
     user = await repositories.get_user_by_email(session, email)
     await session.commit()
-    password_ok = await verify_password_async(body.password, user.password_hash if user else None)
+    try:
+        password_ok = await verify_password_async(body.password, user.password_hash if user else None)
+    except TooManyRequests:
+        # The server was too busy to look at the password at all: that is not a wrong password.
+        for limiter, key in counted:
+            limiter.take_back(key)
+        raise
     if user is None or not password_ok or not user.is_active:
         # One message for every failure: it must not reveal whether the account exists.
         raise Unauthorized("Email or password is incorrect.")
     failed_logins.forget(here)
     failed_logins_per_account.take_back(email)
     if needs_rehash(user.password_hash):
-        user.password_hash = await hash_password_async(body.password)
-        await session.commit()
+        try:
+            renewed = await hash_password_async(body.password)
+        except TooManyRequests:
+            renewed = None  # not now; the next sign-in will do it
+        if renewed is not None:
+            await repositories.renew_password_hash(session, user.id, user.password_hash, renewed)
     return await _issue_tokens(session, request, response, user)
 
 
@@ -228,6 +242,11 @@ async def google_sign_in(body: GoogleSignInRequest, request: Request, response: 
     if user is None:
         user = await repositories.get_user_by_email(session, identity.email)
         if user is not None:
+            if user.google_sub is not None:
+                # The address is already tied to a Google identity, and this is another one. An address can
+                # change hands at Google; the account here does not follow it by itself.
+                await session.commit()
+                raise Unauthorized("This email address is linked to a different Google account.")
             # Same address, first time with Google: connect the two.
             if not user.email_verified and user.password_hash is not None:
                 # Nobody ever proved that this address belongs to whoever chose the password
@@ -236,11 +255,19 @@ async def google_sign_in(body: GoogleSignInRequest, request: Request, response: 
                 # tokens and, through the token version, the access tokens that are still
                 # running. Otherwise someone could register with your address first, stay
                 # signed in, and set a new password a minute after you took the account back.
-                # One step in the database: see repositories.replace_password.
-                await repositories.replace_password(session, user.id, None, google_sub=identity.sub, email_verified=True)
+                # One step in the database, together with the owner's new session: see
+                # repositories.replace_password.
+                refresh_token, refresh_hash = tokens.new_refresh_token()
+                version = await repositories.replace_password(
+                    session, user.id, None, refresh_token=(refresh_hash, utcnow() + _refresh_lifetime()),
+                    google_sub=identity.sub, email_verified=True,
+                )
                 await session.refresh(user)
-            else:
-                user.google_sub, user.email_verified = identity.sub, True
+                await session.commit()
+                if version is None or not user.is_active:
+                    raise Unauthorized("This account cannot sign in.")
+                return await _answer(session, request, response, user, version, refresh_token)
+            user.google_sub, user.email_verified = identity.sub, True
             await session.commit()
         else:
             _check_signup_allowed(body.signup_code)
@@ -276,7 +303,7 @@ async def refresh(request: Request, response: Response, session: DbSession) -> T
         if spent_long_ago:
             # A refresh token is used once. One that returns after it was replaced was copied:
             # end every session that descends from it, for the thief and for the owner alike.
-            await repositories.revoke_token_family(session, token.family_id)
+            await repositories.end_token_family(session, token)
             _clear_cookie(response)
         raise Unauthorized("Please sign in again.")
     if user is None or not user.is_active:
@@ -293,25 +320,28 @@ async def logout(request: Request, session: DbSession) -> Response:
     # refresh cookie that was still live, or with a valid access token. A cookie that was
     # already spent proves nothing - anyone who ever saw an old one could otherwise sign the
     # owner out again and again (found in review).
-    user_id: uuid.UUID | None = None
-    presented = request.cookies.get(REFRESH_COOKIE)
-    if presented:
-        token, was_live = await repositories.use_refresh_token(session, tokens.hash_refresh_token(presented))
-        if token is not None and was_live:
-            user_id = token.user_id
+    signed_in: uuid.UUID | None = None  # proved by a valid access token
     scheme, _, bearer = request.headers.get("authorization", "").partition(" ")
-    if user_id is None and scheme.lower() == "bearer" and bearer.strip():
+    if scheme.lower() == "bearer" and bearer.strip():
         try:
             claimed, version = tokens.read_access_claims(bearer.strip(), await tokens.signing_secret(session))
         except Unauthorized:
             claimed = None
         account = await repositories.get_user(session, claimed) if claimed is not None else None
         if account is not None and account.token_version == version:
-            user_id = account.id
-    if user_id is not None:
-        # Other devices of this account keep their refresh cookie: they fetch a new
-        # access token at their next request and notice nothing.
-        await repositories.end_access_tokens(session, user_id)
+            signed_in = account.id
+
+    token, was_live = None, False
+    presented = request.cookies.get(REFRESH_COOKIE)
+    if presented:
+        token, was_live = await repositories.use_refresh_token(session, tokens.hash_refresh_token(presented))
+    if token is not None and (was_live or signed_in == token.user_id):
+        # The whole session ends: this cookie, any successor of it (if someone else - or another tab -
+        # exchanged it a moment ago) and the access tokens. Other devices of this account keep their
+        # own refresh cookie: they fetch a new access token at their next request and notice nothing.
+        await repositories.end_token_family(session, token)
+    elif signed_in is not None:
+        await repositories.end_access_tokens(session, signed_in)
     response = Response(status_code=204)
     _clear_cookie(response)
     return response
@@ -329,7 +359,11 @@ async def change_password(
     """Change the password (or set the first one, for an account that so far only used Google)."""
     if user.email is None:
         raise ValidationFailed("This account has no email address and cannot have a password.")
-    if user.password_hash is not None:
+    # The password as it was when this request checked it. If it has been replaced by the time the new
+    # one is written (another change, the address taken back by its owner), this change does not
+    # count: of two that run at the same moment, exactly one wins (third review).
+    seen_hash = user.password_hash
+    if seen_hash is not None:
         # Counted before it is checked, like a sign-in: a stolen access token must not give
         # unlimited guesses at the current password.
         if not failed_logins_per_account.hit(user.email):
@@ -337,17 +371,27 @@ async def change_password(
                 "Too many failed password attempts for this account. "
                 f"Try again in {failed_logins_per_account.retry_after(user.email)} seconds."
             )
-        if not await verify_password_async(body.current_password or "", user.password_hash):
+        try:
+            current_ok = await verify_password_async(body.current_password or "", seen_hash)
+        except TooManyRequests:
+            failed_logins_per_account.take_back(user.email)
+            raise
+        if not current_ok:
             raise Unauthorized("The current password is incorrect.")
         failed_logins_per_account.take_back(user.email)
     validate_password(body.new_password, user.email)
     new_hash = await hash_password_async(body.new_password)
-    # New hash, higher token version and every refresh token revoked - one step in the database.
-    # Access tokens issued before this moment stop working, on every device, and this one
-    # continues with fresh tokens.
-    await repositories.replace_password(session, user.id, new_hash)
+    # New hash, higher token version, every refresh token revoked and this session's new one stored -
+    # one step in the database. Access tokens issued before this moment stop working, on every device.
+    refresh_token, refresh_hash = tokens.new_refresh_token()
+    version = await repositories.replace_password(
+        session, user.id, new_hash, unless_changed_from=seen_hash, refresh_token=(refresh_hash, utcnow() + _refresh_lifetime()),
+    )
+    if version is None:
+        raise Conflict("The password was changed by someone else while this was running. Sign in again.")
     await session.refresh(user)
-    return await _issue_tokens(session, request, response, user)
+    await session.commit()
+    return await _answer(session, request, response, user, version, refresh_token)
 
 
 @router.delete("/me", status_code=204)

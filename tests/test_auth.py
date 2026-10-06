@@ -826,3 +826,168 @@ async def test_the_queue_for_password_hashing_has_an_end(monkeypatch):
     results = await asyncio.gather(*(passwords.verify_password_async("x", "y") for _ in range(12)), return_exceptions=True)
     assert results.count(True) == 5 and sum(isinstance(result, TooManyRequests) for result in results) == 7
     assert passwords._waiting == 0 and await passwords.verify_password_async("x", "y") is True
+
+
+# ============================================ found in the third review of Version 3
+@pytest.mark.integration
+async def test_of_two_password_changes_at_the_same_moment_exactly_one_counts(client, jwt_mode, monkeypatch):
+    """Found in the third review: both answered 200, and the password that ended up in the database was not
+    the one of whoever was told last that it had worked."""
+    account = await register(client)
+    async with other_client() as second:
+        other_session = (await second.post("/auth/login", json={"email": account["email"], "password": PASSWORD})).json()
+        hash_as_usual, running = auth_api.hash_password_async, {"inner": None}
+
+        async def the_other_change_overtakes(password: str) -> str:
+            if running["inner"] is None:  # only while the FIRST change is hashing
+                running["inner"] = "started"
+                running["inner"] = await second.post(
+                    "/auth/password", headers=bearer_of(other_session["access_token"]),
+                    json={"current_password": PASSWORD, "new_password": "the other new secret"},
+                )
+            return await hash_as_usual(password)
+
+        monkeypatch.setattr(auth_api, "hash_password_async", the_other_change_overtakes)
+        first = await client.post("/auth/password", headers=account["headers"], json={"current_password": PASSWORD, "new_password": "the first new secret"})
+        assert (running["inner"].status_code, first.status_code) == (200, 409)
+    async with other_client() as later:
+        assert (await later.post("/auth/login", json={"email": account["email"], "password": "the first new secret"})).status_code == 401
+        assert (await later.post("/auth/login", json={"email": account["email"], "password": "the other new secret"})).status_code == 200
+
+
+@pytest.mark.integration
+async def test_a_password_change_that_was_under_way_does_not_undo_taking_the_address_back(client, jwt_mode, google, monkeypatch):
+    """Found in the third review: a stranger who registered your address kept changing "his" password; one of
+    those changes landed after you had taken the account back with Google - and he was in again."""
+    email = new_email()
+    stranger = await register(client, email=email)
+    hash_as_usual, taken_back = auth_api.hash_password_async, {}
+
+    async def the_owner_arrives(password: str) -> str:
+        if not taken_back:
+            async with other_client() as owner:
+                taken_back["response"] = await owner.post("/auth/google", json={"credential": google_credential(google, email=email)})
+        return await hash_as_usual(password)
+
+    monkeypatch.setattr(auth_api, "hash_password_async", the_owner_arrives)
+    change = await client.post("/auth/password", headers=stranger["headers"], json={"current_password": PASSWORD, "new_password": "the stranger stays in"})
+    owner = taken_back["response"]
+    assert owner.status_code == 200 and owner.json()["user"]["has_password"] is False
+    assert change.status_code in (401, 409)
+    async with other_client() as again:
+        for password in (PASSWORD, "the stranger stays in"):
+            assert (await again.post("/auth/login", json={"email": email, "password": password})).status_code == 401
+    assert (await client.get("/auth/me", headers=bearer_of(owner.json()["access_token"]))).status_code == 200
+
+
+@pytest.mark.integration
+async def test_renewing_an_old_hash_at_sign_in_does_not_put_an_old_password_back(client, jwt_mode, monkeypatch):
+    from argon2 import PasswordHasher
+
+    account = await register(client)
+    async with get_session_factory()() as session:
+        user = await session.get(User, uuid.UUID(account["user"]["id"]))
+        user.password_hash = PasswordHasher(time_cost=3, memory_cost=65_536, parallelism=4).hash(PASSWORD)  # made with older settings
+        await session.commit()
+    hash_as_usual, changed = auth_api.hash_password_async, {}
+
+    async def the_owner_changes_the_password(password: str) -> str:
+        if not changed:  # while the racing sign-in is renewing the old hash
+            changed["started"] = True
+            changed["response"] = await client.post(
+                "/auth/password", headers=account["headers"], json={"current_password": PASSWORD, "new_password": "a brand new secret"}
+            )
+        return await hash_as_usual(password)
+
+    monkeypatch.setattr(auth_api, "hash_password_async", the_owner_changes_the_password)
+    async with other_client() as old_device:
+        await old_device.post("/auth/login", json={"email": account["email"], "password": PASSWORD})
+    assert changed["response"].status_code == 200
+    async with other_client() as later:
+        assert (await later.post("/auth/login", json={"email": account["email"], "password": PASSWORD})).status_code == 401
+        assert (await later.post("/auth/login", json={"email": account["email"], "password": "a brand new secret"})).status_code == 200
+
+
+@pytest.mark.integration
+async def test_a_copied_cookie_that_is_noticed_ends_everything_the_copy_obtained(client, jwt_mode, monkeypatch):
+    """Found in the third review: the reuse was noticed, but the thief's access token went on working -
+    long enough to delete the account."""
+    monkeypatch.setattr(auth_api, "REFRESH_RACE_SECONDS", -1)  # as if the original came back much later
+    account = await register(client)
+    original = client.cookies.get("veriagent_refresh")
+    async with other_client() as thief:
+        stolen = await thief.post("/auth/refresh", cookies={"veriagent_refresh": original})
+        assert stolen.status_code == 200
+        assert (await client.post("/auth/refresh")).status_code == 401  # the owner's cookie is spent: the copy is noticed
+        assert (await thief.get("/auth/me", headers=bearer_of(stolen.json()["access_token"]))).status_code == 401
+        assert (await thief.post("/auth/refresh")).status_code == 401
+        deleted = await thief.request("DELETE", "/auth/me", headers=bearer_of(stolen.json()["access_token"]), json={"confirm": "DELETE"})
+        assert deleted.status_code == 401
+    async with other_client() as owner:
+        assert (await owner.post("/auth/login", json={"email": account["email"], "password": PASSWORD})).status_code == 200
+
+
+@pytest.mark.integration
+async def test_signing_out_ends_the_session_even_if_its_cookie_was_already_exchanged_elsewhere(client, jwt_mode):
+    """Found in the third review: someone exchanged a copy of the cookie; the owner then signed out with the
+    spent one - and the copy's successor went on working."""
+    account = await register(client)
+    original = client.cookies.get("veriagent_refresh")
+    async with other_client() as thief:
+        assert (await thief.post("/auth/refresh", cookies={"veriagent_refresh": original})).status_code == 200
+        assert (await client.post("/auth/logout", headers=account["headers"])).status_code == 204
+        assert (await thief.post("/auth/refresh")).status_code == 401
+    async with get_session_factory()() as session:
+        live = (await session.execute(select(RefreshToken).where(
+            RefreshToken.user_id == uuid.UUID(account["user"]["id"]), RefreshToken.revoked_at.is_(None)
+        ))).scalars().all()
+    assert live == []
+
+
+@pytest.mark.integration
+async def test_another_google_identity_does_not_take_over_a_linked_account(client, jwt_mode, google):
+    email = new_email()
+    first = await client.post("/auth/google", json={"credential": google_credential(google, email=email, sub="g-first")})
+    assert first.status_code == 200
+    async with other_client() as other:
+        second = await other.post("/auth/google", json={"credential": google_credential(google, email=email, sub="g-second")})
+        assert second.status_code == 401 and "different Google account" in second.json()["error"]["message"]
+    assert (await client.get("/auth/me", headers=bearer_of(first.json()["access_token"]))).status_code == 200
+
+
+@pytest.mark.integration
+async def test_a_sign_in_turned_away_by_a_busy_server_is_not_a_wrong_password(client, jwt_mode, monkeypatch):
+    """Found in the third review: a flood of sign-ins for other accounts got an uninvolved user locked out for
+    "too many failed attempts" - with the right password every time."""
+    from app.errors import TooManyRequests
+
+    account = await register(client)
+    verify_as_usual = auth_api.verify_password_async
+
+    async def busy(password, password_hash):
+        raise TooManyRequests("The server is busy with other sign-ins. Try again in a few seconds.")
+
+    monkeypatch.setattr(auth_api, "verify_password_async", busy)
+    for _ in range(30):
+        assert (await client.post("/auth/login", json={"email": account["email"], "password": PASSWORD})).status_code == 429
+        auth_api.attempts_by_address.reset()  # the per-address limit is not what is being tested
+    monkeypatch.setattr(auth_api, "verify_password_async", verify_as_usual)
+    assert (await client.post("/auth/login", json={"email": account["email"], "password": PASSWORD})).status_code == 200
+
+
+@pytest.mark.integration
+async def test_an_invalid_request_is_answered_without_repeating_what_was_sent(client, jwt_mode):
+    """FastAPI's own answer quotes the input - a password that is too long, for example - and fails with 500
+    when the input cannot be written as text at all."""
+    secret = "S3cret-" + "x" * 300
+    too_long = await client.post("/auth/login", json={"email": "someone@example.com", "password": secret})
+    assert too_long.status_code == 422 and secret not in too_long.text and "S3cret" not in too_long.text
+    assert too_long.json()["error"]["code"] == "invalid_request" and "password" in too_long.json()["error"]["message"]
+    broken = await client.post(
+        "/auth/login", content=b'{"email": "someone@example.com", "password": "\\ud800"}', headers={"content-type": "application/json"}
+    )
+    assert broken.status_code == 422
+    named = await client.post("/auth/register", json={"email": new_email(), "password": PASSWORD, "name": "a\x00b"})
+    assert named.status_code == 201 and named.json()["user"]["name"] == "ab"
+    for path in ("/auth/refresh", "/auth/logout"):
+        assert (await client.post(path, headers={"Origin": "http://["})).status_code == 403

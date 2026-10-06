@@ -630,6 +630,7 @@ class InvestigationNodes:
             from_search,
             unrelated=_document_pairs(state, update, "unrelated_documents"),
             linked=_document_pairs(state, update, "linked_documents"),
+            net_totals=update.get("net_totals", state.get("net_totals", {})),
         )
         contradictions += [
             item.model_copy(update={"id": f"X{len(contradictions) + index}"})
@@ -651,11 +652,23 @@ class InvestigationNodes:
         """
         assert self.profiles is not None
         retrieved = [RetrievedChunk(**chunk) for chunk in state.get("retrieved_documents", [])]
-        document_ids = list(dict.fromkeys(
+        candidates = list(dict.fromkeys(
             chunk.document_id for chunk in retrieved if chunk.document_type in PROFILED_TYPES
-        ))[:MAX_PROFILED_DOCUMENTS]
+        ))
+        document_ids = candidates[:MAX_PROFILED_DOCUMENTS]
         if not document_ids:
             return []
+        if len(candidates) > MAX_PROFILED_DOCUMENTS:
+            # Said out loud (third review): a seventh invoice was left out of the comparison without a word.
+            left_out = list(dict.fromkeys(
+                chunk.filename for chunk in retrieved if chunk.document_id in candidates[MAX_PROFILED_DOCUMENTS:]
+            ))
+            note = (
+                f"Parties, dates and line items were compared for {MAX_PROFILED_DOCUMENTS} documents only. Not compared in "
+                f"detail: {', '.join(left_out[:6])}. Select fewer documents to have these checked."
+            )
+            if note not in state.get("limitations", []):
+                update["limitations"] = [*update.get("limitations", []), note]
         earlier = [Contradiction(**item) for item in state.get("contradictions", []) if item.get("origin") == "profile"]
         if set(document_ids) == set(state.get("compared_documents", [])):
             return earlier  # same documents as in the previous round: the comparison cannot come out differently
@@ -669,7 +682,8 @@ class InvestigationNodes:
             logger.warning("document comparison failed: %s: %s", type(exc).__name__, exc)
             tracing.record("error", "comparison", error=type(exc).__name__)
             update["limitations"] = [
-                "The detailed comparison of parties, dates, reference numbers and line items was unavailable for this request."
+                *update.get("limitations", []),
+                "The detailed comparison of parties, dates, reference numbers and line items was unavailable for this request.",
             ]
             return earlier
         if batch.llm_calls:
@@ -677,8 +691,9 @@ class InvestigationNodes:
         if batch.used_rules:
             update["used_fallback"] = True
             update["limitations"] = [
+                *update.get("limitations", []),
                 "The language model was unavailable while reading the document details (parties, dates, line items); "
-                "only common layouts were understood."
+                "only common layouts were understood.",
             ]
 
         # What the person asked for overrules what the supplier names suggest: documents that the question
@@ -692,6 +707,7 @@ class InvestigationNodes:
         findings = comparison.findings
         update["unrelated_documents"] = [list(pair) for pair in sorted(comparison.unrelated)]
         update["linked_documents"] = [list(pair) for pair in sorted(comparison.linked)]
+        update["net_totals"] = comparison.net_totals
         # "Not checked" must not read as "no problem": every pair that was left alone is said out loud.
         already_said = set(state.get("limitations", [])) | set(update.get("limitations", []))
         notes = [note for note in comparison.notes if note not in already_said]
@@ -1146,6 +1162,7 @@ class InvestigationNodes:
                 [EvidenceItem(**i) for i in keep],
                 unrelated=_document_pairs(state, {}, "unrelated_documents"),
                 linked=_document_pairs(state, {}, "linked_documents"),
+                net_totals=state.get("net_totals", {}),
             )
             # Findings from the document comparison stay as long as all their evidence survived.
             for item in state.get("contradictions", []):

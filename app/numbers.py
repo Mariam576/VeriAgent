@@ -25,7 +25,10 @@ _SPACES = "    "
 # A number: digits, optionally grouped by , . ' or spaces, optionally with decimals.
 NUMBER_CORE = r"(?:\d{1,3}(?:[,.'\u00a0\u202f\u2009 ]\d{2,3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?)"
 # ... standing on its own: not glued to a word ("v2") and not cut out of a longer number.
-NUMBER_TOKEN = re.compile(rf"(?<!\w)(?<!\d[.,]){NUMBER_CORE}(?![\w]|[.,]\d)")
+# A currency code may be written straight onto the figure: "USD58,000.00", "PKR150,000", "Rs5,000".
+_GLUED_CODES = "GBP|USD|EUR|PKR|INR|AED|SAR|KWD|QAR|BHD|OMR|CAD|AUD|NZD|CHF|JPY|CNY|SGD|HKD|ZAR|SEK|NOK|DKK"
+_NUMBER_START = rf"(?:(?<!\w)|(?<=(?<![A-Za-z])(?:{_GLUED_CODES}))|(?<=(?<![A-Za-z])Rs))(?<!\d[.,])"
+NUMBER_TOKEN = re.compile(rf"{_NUMBER_START}{NUMBER_CORE}(?![\w]|[.,]\d)")
 
 _WESTERN = re.compile(r"^\d{1,3}(?:,\d{3})+(?:\.\d+)?$")
 _INDIAN = re.compile(r"^\d{1,2}(?:,\d{2})+,\d{3}(?:\.\d+)?$")
@@ -156,8 +159,11 @@ def number_appears(value: float, text: str) -> bool:
     return any(abs(scaled - value) <= max(0.005, abs(value) * 1e-9) for scaled in scaled_numbers(text))
 
 
-_MINUS_BEFORE = re.compile(r"[-−–]\s?(?:[£$€₹]|[A-Za-z]{2,3}\.?)?\s?$")
-_CREDIT_AFTER = re.compile(r"\s?(?:-|−|cr\b|credit\b)", re.I)
+# A minus sign stands directly on the amount (or on its currency sign) and after a space, a bracket or a
+# colon: "-£1,200", "£-1,200", "GBP -58,000". The dash in "INV-311", "£100-£200" and "Total due - £1,200"
+# is a hyphen, a range and a separator.
+_MINUS_BEFORE = re.compile(r"(?:^|[\s:(=|])[-−](?:[£$€₹]|[A-Za-z]{2,3}\.?\s?)?$|[£$€₹][-−]$")
+_CREDIT_AFTER = re.compile(r"-(?!\S)|−(?!\S)|\s?cr\b\.?|\s?credit\b(?!\s+(?:card|note|limit|terms|account|period))", re.I)
 
 
 def number_stated(value: float, text: str) -> bool:
@@ -172,7 +178,7 @@ def number_stated(value: float, text: str) -> bool:
     for token, start, end in _tokens_with_columns(text):
         if not _token_states(token, -value):
             continue
-        before, after = text[max(start - 6, 0):start], text[end:end + 8]
+        before, after = text[max(start - 6, 0):start], text[end:end + 14]
         in_brackets = "(" in before[-3:] and after.lstrip().startswith(")")
         if _MINUS_BEFORE.search(before) or in_brackets or _CREDIT_AFTER.match(after):
             return True

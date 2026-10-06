@@ -18,7 +18,6 @@ What is compared
 What is not a contradiction
     * Two documents of the same kind: two invoices, two contracts, two orders.
       They are two pieces of business, not two statements of one quantity.
-      (Two versions of one file - the same file name twice - are compared.)
     * A document that states LESS than the one it is measured against: an
       invoice below its contract (a monthly invoice, an instalment, a part
       delivery), a call-off order below its framework agreement, a receipt for
@@ -75,6 +74,21 @@ _NO_TOTAL_DOCUMENT_TYPES = {"policy"}
 Pair = tuple[str, str]
 
 
+# Documents whose kind says nothing about their role: a memo, a budget report, a statement of account.
+# What they state is compared in both directions - a contract above the approved budget matters as
+# much as a budget above the contract.
+_STATEMENT_TYPES = {"other", "report", "financial_statement"}
+
+
+def _in_order(first: tuple[float, list[EvidenceItem]], second: tuple[float, list[EvidenceItem]]):
+    """The two sides with the reference first: the more authoritative document, with one exception."""
+    kinds = {first[1][0].document_type, second[1][0].document_type}
+    if kinds == {"purchase_order", "quotation"}:
+        # An order is placed on the strength of a quotation: the quotation is what the order is measured against.
+        return sorted((first, second), key=lambda side: side[1][0].document_type != "quotation")
+    return sorted((first, second), key=lambda side: _side_rank(side[1]))
+
+
 def _side_rank(items: list[EvidenceItem]) -> tuple[int, str]:
     best = min(_REFERENCE_PRIORITY.get(item.document_type, 4) for item in items)
     return best, min(item.filename for item in items)
@@ -127,31 +141,36 @@ def _relation(
             return "reference"  # two policies are meant to say the same thing
         if kind_a in ("invoice", "receipt"):
             return None  # two bills are two bills
-        # Two contracts, two quotations: two pieces of business. The one case in which they do state
-        # the same quantity is two versions of one document - recognised by the file name they share.
-        same_file = reference[0].filename.strip().lower() == checked[0].filename.strip().lower()
-        return "reference" if same_file or pair in linked else None
+        # Two contracts, two quotations: two pieces of business - unless something says that they
+        # belong together. (A shared file name does not: every scanner calls its output "scan.pdf".)
+        return "reference" if pair in linked else None
     if kind_a in _AGREEMENT_TYPES and kind_b in _AGREEMENT_TYPES:
         # A framework agreement and the cleaning contract next to it have nothing to say about each
         # other. An order is compared with a contract when it cites it - or when there is exactly one
         # of each, so that no guess is needed which belongs to which.
         return "reference" if pair in linked or (counts[kind_a] == 1 and counts[kind_b] == 1) else None
-    if kind_b == "receipt" and kind_a == "invoice":
-        # With several invoices there is no telling which one the receipt pays.
-        return "reference" if counts["invoice"] == 1 else None
+    if kind_b == "receipt" and counts.get("invoice"):
+        # A receipt is measured against the invoice it pays, not against the contract behind the invoice
+        # (which states its value before tax). With several invoices there is no telling which one it pays.
+        return "reference" if kind_a == "invoice" and counts["invoice"] == 1 else None
     return "reference"
 
 
 def find_contradictions(
-    evidence: list[EvidenceItem], *, unrelated: set[Pair] | None = None, linked: set[Pair] | None = None
+    evidence: list[EvidenceItem], *, unrelated: set[Pair] | None = None, linked: set[Pair] | None = None,
+    net_totals: dict[str, float] | None = None,
 ) -> list[Contradiction]:
     """Compare evidence items that share a comparison key.
 
     ``unrelated``: pairs of document ids that are known not to belong together
     and are never compared. ``linked``: pairs that are known to belong together
-    (an order that cites its contract). Both come from the document profiles
-    (app/comparison); without them only what the document types say is used.
+    (an invoice and the contract it cites, an order that cites its contract).
+    ``net_totals``: an invoice's amount before tax, where it states one - an
+    invoice for the agreed value plus VAT bills what was agreed. All three come
+    from the document profiles (app/comparison); without them only what the
+    document types say is used.
     """
+    nets = net_totals or {}
     apart = {frozenset(pair) for pair in unrelated or ()}
     together = {frozenset(pair) for pair in linked or ()}
     # key -> document_id -> the items that document contributed
@@ -202,20 +221,31 @@ def find_contradictions(
         for value, items in stated:
             agreed.setdefault(items[0].document_type, set()).add(value)
         for first, second in combinations(stated, 2):
-            # The more authoritative source is side A.
-            (value_a, items_a), (value_b, items_b) = sorted((first, second), key=lambda side: _side_rank(side[1]))
+            # The reference is side A.
+            (value_a, items_a), (value_b, items_b) = _in_order(first, second)
             if not _relation(key, items_a, items_b, counts, apart, together):
                 continue
             kind_a, kind_b = items_a[0].document_type, items_b[0].document_type
-            if kind_a in _AGREEMENT_TYPES and kind_b in ("invoice", "receipt") and value_b != value_a and value_b in agreed[kind_a]:
+            known_pair = frozenset((items_a[0].document_id, items_b[0].document_id)) in together
+            if (
+                kind_a in _AGREEMENT_TYPES and kind_b in ("invoice", "receipt") and value_b != value_a
+                and value_b in agreed[kind_a] and not known_pair
+            ):
+                # Only a guess, for when nothing better is known. An invoice that the profiles tie to THIS
+                # contract is measured against it, whatever another contract in the folder happens to total
+                # (third review: an over-billed invoice passed because a second contract had that total).
                 continue
             unit_a, unit_b = _unit(key, items_a), _unit(key, items_b)
             if unit_a and unit_b and unit_a != unit_b:
                 kind = "unit_mismatch"
             elif value_a == value_b:
                 continue
-            elif key == KEY_TOTAL_AMOUNT and value_b < value_a and kind_a != kind_b:
-                continue  # less than the reference: an instalment, a part delivery, a call-off, a part payment
+            elif key == KEY_TOTAL_AMOUNT and kind_a != kind_b and kind_b not in _STATEMENT_TYPES and (
+                min(value_b, nets.get(items_b[0].document_id, value_b)) <= value_a + 0.005
+            ):
+                # Not more than the reference: an instalment, a part delivery, a call-off, a part payment -
+                # or exactly the agreed value with the tax on top.
+                continue
             else:
                 kind = "difference"
             # Documents that say the same thing are reported together: "Contract and order state X but the invoice states Y".

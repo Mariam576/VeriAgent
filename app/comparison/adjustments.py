@@ -45,14 +45,18 @@ _ADDED = (
     r"(?:brought|carried)\s+forward|b/f|(?:previous|opening|outstanding)\s+balance|arrears"
 )
 _TAKEN_OFF = (
-    r"discount|rebate|less(?!\s+than)|deduction|retention|allowance|deposit|advance|prepaid|pre-paid|paid|"
+    r"discount|rebate|less(?!\s+than)|deduction|retention|allowance|deposit|advance|prepaid|pre-paid|paid|tds|cis|withholding|"
     r"payment\s+received|credit(?!\s+(?:note|memo|terms|period|limit))"
 )
 _EITHER_WAY = r"round(?:ing|ed)?(?:[\s-]off)?|adjustment"
+# Taxes only (not delivery or handling): what turns an amount "before tax" into the total.
+TAX = re.compile(r"\b(?:vat|gst|cgst|sgst|igst|hst|pst|sales\s+tax|further\s+tax|tax(?:es)?|duty|levy)\b", re.I)
 ADDED = re.compile(rf"\b(?:{_ADDED})\b", re.I)
 TAKEN_OFF = re.compile(rf"\b(?:{_TAKEN_OFF})\b", re.I)
 ADJUSTMENT_WORDS = re.compile(rf"\b(?:{_ADDED}|{_TAKEN_OFF}|{_EITHER_WAY})\b", re.I)
 _PERCENT = re.compile(r"\d\s?%")
+# Words that turn an adjustment round: a tax that is withheld is taken off, a retention that is released is added.
+_TURNED_ROUND = re.compile(r"\b(?:deduct\w*|withh\w+|tds|released?|refund\w*|revers\w+|credited|reclaim\w*)\b", re.I)
 # The condition word stands directly in front of the amount: "orders over £750", "up to £500".
 _CONDITION = re.compile(NOT_A_STATEMENT.pattern + r"(?:\s+of)?\W{0,3}$", re.I)
 
@@ -110,6 +114,8 @@ def find_adjustments(pages: list[PageText]) -> tuple[list[ProfileField], bool]:
             seen.add((words, abs(amount)))
             added, taken_off = bool(ADDED.search(segment)), bool(TAKEN_OFF.search(segment))
             direction = "add" if added and not taken_off else "subtract" if taken_off and not added else "either"
+            if _TURNED_ROUND.search(segment):
+                direction = "either"  # "CIS tax deducted", "retention released": the word alone does not say which way
             found.append(ProfileField(
                 text=direction, number=abs(amount), unit=money_currency(last) or None, page=page.page_number,
                 quote=segment[:MAX_QUOTE_CHARS],
@@ -118,16 +124,24 @@ def find_adjustments(pages: list[PageText]) -> tuple[list[ProfileField], bool]:
 
 
 def not_a_line(adjustment: ProfileField, lines: list[LineItem]) -> bool:
-    """False when this "adjustment" is one of the document's own line items, read a second time."""
+    """False when this "adjustment" is one of the document's own line items, read a second time.
+
+    The same words, and a figure of that line: its amount, or its unit price
+    ("2 delivery runs at £400.00 each" is a line of £800, not a £400 charge).
+    A model may shorten the row it quotes with "...", so the words of the
+    line's description are enough - the quote need not be the whole sentence.
+    """
     words = normalize(adjustment.quote)
     for line in lines:
-        amount = line.effective_amount
-        if line.page != adjustment.page or amount is None or adjustment.number is None:
+        if line.page != adjustment.page or adjustment.number is None:
             continue
-        if abs(abs(amount) - adjustment.number) > 0.005:
+        figures = [figure for figure in (line.amount, line.effective_amount, line.unit_price) if figure is not None]
+        if not any(abs(abs(figure) - adjustment.number) <= 0.005 for figure in figures):
             continue
         quote = normalize(line.quote)
-        if quote and (quote in words or words in quote):
+        described = [word for word in re.findall(r"[a-z0-9]+", line.description.lower()) if len(word) >= 3]
+        same_words = bool(described) and all(word in words for word in described)
+        if (quote and (quote in words or words in quote)) or same_words:
             return False
     return True
 
@@ -150,7 +164,9 @@ def asks_for_payment(total: ProfileField | None) -> bool:
     return bool(_ASKS_FOR_PAYMENT.search(total.quote)) and not _GIVES_BACK.search(total.quote)
 
 
-_MINIMUM_CHARGE = re.compile(r"\bminimum\s+(?:call[\s-]?out\s+)?(?:charge|fee|order(?:\s+value)?|billing|invoice)\b", re.I)
+# A minimum CHARGE (for a call-out, for attendance). "Minimum order value £50" is a condition of sale and
+# lifts no line above quantity x price.
+_MINIMUM_CHARGE = re.compile(r"\bminimum\s+(?:call[\s-]?out\s+|attendance\s+|service\s+|labou?r\s+)?(?:charge|fee|billing)\b", re.I)
 
 
 def has_minimum_charge(pages: list[PageText]) -> bool:
@@ -162,5 +178,14 @@ def is_pro_forma(pages: list[PageText]) -> bool:
     return any(_PRO_FORMA_HEADING.match(line) for line in _title_lines(pages))
 
 
+_NEGATED = re.compile(r"\b(?:not|no|never|nor|without|cannot|won't|shall\s+not)\b[^.;\n]{0,25}$", re.I)
+
+
 def renews_automatically(pages: list[PageText]) -> bool:
-    return any(_RENEWS.search(trusted_part(page.text)) for page in pages)
+    """Does the contract say that it renews by itself? ("does not renew automatically" says the opposite.)"""
+    for page in pages:
+        text = trusted_part(page.text)
+        for match in _RENEWS.finditer(text):
+            if not _NEGATED.search(text[max(match.start() - 40, 0):match.start()]):
+                return True
+    return False

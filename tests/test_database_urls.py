@@ -51,8 +51,14 @@ def test_ssl_modes_are_translated_faithfully():
     assert parse_database_url("postgresql://u:p@h/d?sslmode=prefer").connect_args == {}
     full = parse_database_url("postgresql://u:p@h/d?sslmode=verify-full&sslrootcert=system")
     assert verifies(full.connect_args["ssl"], hostname=True) and full.tls == "verified" and "sslrootcert" not in full.async_url
+    # "verify-ca" without an authority of one's own would accept any public certificate for any host:
+    # there the host name is checked as well (third review). With one's own authority file it is not.
     ca_only = parse_database_url("postgresql://u:p@h/d?sslmode=verify-ca")
-    assert verifies(ca_only.connect_args["ssl"], hostname=False) and ca_only.tls == "verified"
+    assert verifies(ca_only.connect_args["ssl"], hostname=True) and ca_only.tls == "verified"
+    for query in ("sslmode=verify-ca&sslrootcert=system", "sslmode=require&sslrootcert=system", "channel_binding=require&sslmode=verify-ca"):
+        assert verifies(parse_database_url(f"postgresql://u:p@h/d?{query}").connect_args["ssl"], hostname=True), query
+    own = ssl.get_default_verify_paths().cafile or ssl.get_default_verify_paths().openssl_cafile
+    assert verifies(parse_database_url(f"postgresql://u:p@h/d?sslmode=verify-ca&sslrootcert={own}").connect_args["ssl"], hostname=False)
     # Written the asyncpg way: psycopg gets the libpq spelling.
     for written, libpq in (("ssl=require", "sslmode=require"), ("ssl=true", "sslmode=require"), ("ssl=verify-full", "sslmode=verify-full")):
         target = parse_database_url(f"postgresql+asyncpg://u:p@h/d?{written}")
@@ -194,6 +200,19 @@ def test_a_password_with_a_space_or_a_percent_sign_is_written_one_way_for_both_d
     # A password that was already written percent-encoded is not encoded a second time.
     already = parse_database_url("postgresql://u:p%40ss%20word@db.example.com/x")
     assert already.psycopg_url == "postgresql://u:p%40ss%20word@db.example.com/x"
+
+
+@pytest.mark.parametrize("query", [
+    "sslmode=required", "sslmode=verify_full", "sslmode=verify-full%20", "SSLMODE=verify-full", "requiressl=1",
+    "host=db.other.example", "hostaddr=10.0.0.9", "port=6000", "dbname=other", "user=someone", "password=s3cret2",
+    "sslmode=require&require_auth=scram-sha-256", "ssl=maybe",
+])
+def test_a_setting_that_the_two_drivers_would_read_differently_is_refused(query):
+    """Found in the third review: an unknown sslmode became "the driver's default" for one driver only (which
+    then sent the password unprotected), and a host named after the "?" was a second address for the other."""
+    with pytest.raises(ValueError) as error:
+        parse_database_url(f"postgresql://app:s3cret@localhost:5432/veriagent?{query}")
+    assert "s3cret" not in str(error.value) and "setting after the '?'" in str(error.value)
 
 
 def test_a_certificate_file_means_the_certificate_is_checked(tmp_path):

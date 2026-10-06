@@ -88,6 +88,29 @@ def compare_names(first: str | None, second: str | None) -> NameMatch:
     return next(outcome for outcome in _ORDER if outcome in outcomes)
 
 
+def compare_claimed(claimed: str | None, known: str | None) -> NameMatch:
+    """The name a document gives for ITSELF against the name an agreement states.
+
+    Not symmetric, on purpose (third review): "Tolland Electrical Ltd t/a
+    Redbridge Lifts" on an invoice is Tolland Electrical saying so. A trading
+    name counts when the agreement states it; when only the invoice claims it,
+    the company in front of the "t/a" is the one that is compared, and the
+    claim itself is worth a look ("similar"), never a match.
+    """
+    own, theirs = name_parts(claimed), name_parts(known)
+    if not own or not theirs:
+        return "unknown"
+
+    def best(name: str) -> NameMatch:
+        outcomes = {_compare_one(name_tokens(name), name_tokens(other)) for other in theirs}
+        return next(outcome for outcome in _ORDER if outcome in outcomes)
+
+    first = best(own[0])
+    if first != "different" or len(own) == 1:
+        return first
+    return "similar" if any(best(other) in RELATED for other in own[1:]) else "different"
+
+
 def _stem(word: str) -> str:
     """'lifts' -> 'lift', 'services' -> 'service'. Rough on purpose: only used to notice look-alikes."""
     return word[:-1] if len(word) > 3 and word.endswith("s") and not word.endswith("ss") else word
@@ -126,8 +149,18 @@ def same_identifier(first: str | None, second: str | None) -> bool:
         return False
     if a == b:
         return True
+    # Leading zeros are a matter of taste: "MC/2026/11" is "MC-2026-011", "PO-04421" is "PO-4421".
+    without_zeros = [re.sub(r"[^A-Z0-9]", "", re.sub(r"(?<!\d)0+(?=\d)", "", (text or "").upper())) for text in (first, second)]
+    if without_zeros[0] == without_zeros[1]:
+        return True
     shorter, longer = sorted((a, b), key=len)
-    if not (len(shorter) >= 4 and sum(char.isdigit() for char in shorter) >= 3 and longer.endswith(shorter)):
-        return False
-    left_out = longer[: -len(shorter)]
-    return not left_out[-1].isdigit()
+    if len(shorter) >= 4 and sum(char.isdigit() for char in shorter) >= 3 and longer.endswith(shorter):
+        return not longer[: -len(shorter)][-1].isdigit()
+    # A suffix behind a separator is a part or a revision of the same document: "PO-4421/2", "MC-2026-011/A".
+    raw_a, raw_b = (first or "").strip().upper(), (second or "").strip().upper()
+    short_raw, long_raw = sorted((raw_a, raw_b), key=len)
+    rest = long_raw[len(short_raw):]
+    return bool(
+        len(shorter) >= 4 and long_raw.startswith(short_raw) and rest[:1] in ("/", "-", ".", " ", "(")
+        and 0 < len(re.sub(r"[^A-Z0-9]", "", rest)) <= 2
+    )

@@ -22,6 +22,7 @@ If the model is unavailable, the rules in ``rules.py`` build the profile.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from typing import Literal
 
@@ -180,6 +181,8 @@ def ground_extraction(
     dropped = 0
 
     for fact in extraction.facts:
+        if fact.number is not None and not math.isfinite(fact.number):
+            fact = fact.model_copy(update={"number": None})  # "infinity" and "not a number" are not amounts
         page_text = trusted.get(fact.page)
         quote = (fact.quote or "").strip()[:MAX_QUOTE_CHARS]
         value: ProfileField | None = None
@@ -227,6 +230,8 @@ def ground_extraction(
         quote = (line.quote or "").strip()[:MAX_QUOTE_CHARS]
         description = " ".join((line.description or "").split())[:MAX_DESCRIPTION_CHARS]
         numbers = [number for number in (line.quantity, line.unit_price, line.amount) if number is not None]
+        if not all(math.isfinite(number) for number in numbers):
+            numbers = []  # dropped below
         words = [word for word in re.findall(r"[a-z0-9]+", description.lower()) if len(word) >= 3]
         in_quote = sum(word in normalize(quote) for word in words)
         if (

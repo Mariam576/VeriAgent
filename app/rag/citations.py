@@ -53,19 +53,28 @@ _LEADER = re.compile(r"(?:\.[ \t]?){4,}|…{2,}|_{4,}")
 
 
 def _flatten(text: str) -> tuple[str, frozenset[int]]:
-    """``normalize(text)``, plus the positions of the spaces that were line breaks."""
+    """``normalize(text)``, plus the positions of the spaces that were line breaks between two statements.
+
+    A PDF breaks a long sentence wherever the line is full. Such a break is
+    not a boundary: the next line goes on in the middle of the sentence, with
+    a small letter. A line that starts with a capital, a figure or a symbol
+    is taken as a new statement ("Total amount due: see below" / "Credit limit
+    on this account: £58,000") - a "..." in a quote may not reach across it.
+    """
     pieces: list[str] = []
     breaks: set[int] = set()
     position = 0
-    for piece in re.split(r"(\s+)", _unify(_LEADER.sub(" ", text)).lower().strip()):
+    parts = re.split(r"(\s+)", _unify(_LEADER.sub(" ", text)).strip())
+    for index, piece in enumerate(parts):
         if not piece:
             continue
         if piece.isspace():
-            if "\n" in piece:
+            following = parts[index + 1] if index + 1 < len(parts) else ""
+            if "\n" in piece and not following[:1].islower():
                 breaks.add(position)
             piece = " "
-        pieces.append(piece)
-        position += len(piece)
+        pieces.append(piece.lower())
+        position += len(pieces[-1])
     return "".join(pieces), frozenset(breaks)
 
 

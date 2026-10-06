@@ -231,7 +231,9 @@ async def test_two_files_with_the_same_name_stay_distinguishable(client, user_he
     report = (await client.post("/investigations", headers=user_headers, json={"question": "Compare the total amounts in the quotes."})).json()
     sources = [source for source in report["sources"] if source["document"] == "Quote.txt"]
     assert len(sources) == 2 and len({source["document_id"] for source in sources}) == 2
-    assert [c["type"] for c in report["contradictions"]] == ["amount_mismatch"]
+    # Two quotations are two offers, not two statements of one amount: both totals are reported as facts,
+    # each with its own source, and neither is called a contradiction of the other.
+    assert report["contradictions"] == []
 
     findings = (await client.get(f"/investigations/{report['investigation_id']}/findings", headers=user_headers)).json()["findings"]
     fact_documents = {f["source_document_id"] for f in findings if f["finding_type"] == "fact"}

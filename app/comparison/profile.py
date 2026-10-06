@@ -43,6 +43,20 @@ MAX_PARTIES = 6
 # "5,000 labels at £12.00 per thousand", "price per 1,000", "£3.20 per 100": a price for that many, not for one.
 # Quantity x price is then not the line amount, and nobody made a mistake.
 PER_MANY = re.compile(r"\bper\s+(?:\d[\d,.]*\d|thousand|hundred|dozen|gross)\b|/\s?(?:1,?000|100)\b(?![/\d])", re.I)
+_MANY = {"thousand": 1000.0, "hundred": 100.0, "dozen": 12.0, "gross": 144.0}
+
+
+def per_many(text: str) -> float | None:
+    """How many units a price in ``text`` is for: 1000 for "per thousand" and "per 1,000". None: an ordinary unit price."""
+    match = PER_MANY.search(text)
+    if match is None:
+        return None
+    words = match.group(0).lower()
+    for word, size in _MANY.items():
+        if word in words:
+            return size
+    digits = re.sub(r"\D", "", words)
+    return float(digits) if digits and float(digits) > 1 else None
 
 
 class ProfileField(BaseModel):

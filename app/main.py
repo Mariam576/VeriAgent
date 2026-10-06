@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.agents.checkpoint import close_checkpointer, get_checkpointer
@@ -79,6 +80,19 @@ def create_app() -> FastAPI:
     async def handle_known_error(_: Request, exc: Exception) -> JSONResponse:
         status_code, payload = error_payload(exc)
         return JSONResponse(status_code=status_code, content={"error": payload})
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_invalid_request(_: Request, exc: RequestValidationError) -> JSONResponse:
+        # FastAPI's own answer repeats what was sent - including a password that was too long - and
+        # fails altogether when the input cannot be written as text. This one names the field and the
+        # problem, and nothing else.
+        fields = [
+            {"field": ".".join(str(part) for part in error.get("loc", ()) if part != "body"), "problem": str(error.get("msg", "invalid"))[:200]}
+            for error in exc.errors()[:10]
+        ]
+        first = fields[0] if fields else {"field": "", "problem": "invalid"}
+        message = f"{first['field'] or 'The request'}: {first['problem']}"
+        return JSONResponse(status_code=422, content={"error": {"code": "invalid_request", "message": message, "fields": fields}})
 
     @app.exception_handler(Exception)
     async def handle_unexpected_error(_: Request, exc: Exception) -> JSONResponse:

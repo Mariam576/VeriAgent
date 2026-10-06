@@ -311,7 +311,9 @@ def test_invoice_dates_are_checked_against_the_term():
         return profile("invoice", "I.txt", **{**INVOICE, "date": field(text, dates=readings)})
 
     assert check_pair(contract, dated("1 February 2026", date(2026, 2, 1))) == []  # the first day of the term
-    [early] = check_pair(contract, dated("14 January 2026", date(2026, 1, 14)))
+    # An annual fee is invoiced a few weeks ahead of the year it is for; months ahead is worth a look.
+    assert check_pair(contract, dated("14 January 2026", date(2026, 1, 14))) == []
+    [early] = check_pair(contract, dated("14 November 2025", date(2025, 11, 14)))
     assert (early.type, early.severity) == ("date_outside_term", "medium") and "before the term of C.txt starts (1 February 2026)" in early.description
 
     # In arrears: an invoice shortly after the term has ended is normal. Much later is worth a look.

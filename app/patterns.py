@@ -29,7 +29,15 @@ TOTAL_LABELS: list[tuple[re.Pattern[str], int]] = [
     (re.compile(r"\b(?:total (?:contract |order |purchase )?(?:value|price|sum|amount|fee|charges?|cost)|contract (?:value|price|sum|amount)|order (?:total|value))\b", re.I), 2),
     (re.compile(r"(?<![a-z-])total\b", re.I), 1),
 ]
-SUBTOTAL = re.compile(r"sub[\s-]?total", re.I)
+CEILING = re.compile(r"\b(?:not\s+(?:to\s+)?exceed|maximum|up\s+to|capped|limited\s+to|no\s+more\s+than)\b", re.I)
+PERIODIC = re.compile(r"\b(?:monthly|weekly|daily|hourly|quarterly|yearly|per\s+(?:month|week|day|hour|quarter|year|annum|visit|unit))\b", re.I)
+PER_PERIOD = re.compile(r"\s*(?:per|a|each|/)\s*(?:calendar\s+)?(?:month|week|day|hour|quarter|year|annum|visit|unit)\b|\s*p\.?\s?[am]\.?(?!\w)", re.I)
+# The amount before tax, under the names it goes by: "Subtotal", "Net amount", "Value excluding sales tax".
+SUBTOTAL = re.compile(
+    r"sub[\s-]?total|\bnet\s+(?:amount|total|value)\b|(?:^|\n)\W*net\s*:?\s*$|\bgoods\s+total\b|\btaxable\s+(?:value|amount)\b"
+    r"|\b(?:value|amount|total)\s+(?:excluding|excl\.?|before|ex\.?)\s+(?:sales\s+)?(?:tax|vat|gst)\b",
+    re.I,
+)
 # Words that make an amount a condition instead of a statement: "orders over £750", "up to £500".
 NOT_A_STATEMENT = re.compile(r"\b(?:above|exceed\w*|over|under|below|up to|more than|less than|at least|minimum|maximum|limit|threshold)\b", re.I)
 
@@ -85,10 +93,31 @@ def iter_segments(text: str):
         yield left, right, text[left:right].strip(" .\n")
 
 
+# "Rs. 1,150.00": the full stop belongs to the currency, the sentence goes on.
+_NOT_AN_END = re.compile(r"(?:^|[^A-Za-z])Rs$", re.I)
+
+
+def _stop_before(text: str, position: int) -> int:
+    """Index of the last ". " that ends a sentence before ``position``, or -1."""
+    while True:
+        position = text.rfind(". ", 0, position)
+        if position == -1 or not _NOT_AN_END.search(text[max(position - 3, 0):position]):
+            return position
+
+
+def _stop_after(text: str, position: int) -> int:
+    """Index of the first ". " that ends a sentence at or after ``position``, or -1."""
+    while True:
+        position = text.find(". ", position)
+        if position == -1 or not _NOT_AN_END.search(text[max(position - 3, 0):position]):
+            return position
+        position += 2
+
+
 def sentence_bounds(text: str, start: int, end: int) -> tuple[int, int]:
     """Start and end index of the sentence (or line) that contains text[start:end]."""
-    left = max(text.rfind(". ", 0, start), text.rfind("\n", 0, start)) + 1
-    right_candidates = [pos for pos in (text.find(". ", end), text.find("\n", end)) if pos != -1]
+    left = max(_stop_before(text, start), text.rfind("\n", 0, start)) + 1
+    right_candidates = [pos for pos in (_stop_after(text, end), text.find("\n", end)) if pos != -1]
     right = min(right_candidates) if right_candidates else len(text)
     return left, right
 
@@ -133,7 +162,12 @@ def find_amounts(text: str) -> list[AmountHit]:
                     continue
                 gap = before[label.end():]
                 # The amount must follow the label closely: "total ... is £40,000", "Total due: £58,000".
-                if len(gap) <= 30 and not re.search(r"\d", gap) and not NOT_A_STATEMENT.search(gap):
+                # A rate is not a total: "the total monthly charge is £3,000", "total fee of £40,000 per annum".
+                rate = PERIODIC.search(gap) or PER_PERIOD.match(text, match.end())
+                # "The total contract value shall not exceed £40,000": a ceiling is a total for our purpose,
+                # because the only thing ever reported is "more than the total".
+                condition = NOT_A_STATEMENT.search(gap) and not CEILING.search(gap)
+                if len(gap) <= 34 and not re.search(r"\d", gap) and not condition and not rate:
                     priority = level
                     break
         hits.append(AmountHit(

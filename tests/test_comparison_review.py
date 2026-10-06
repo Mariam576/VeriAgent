@@ -424,9 +424,8 @@ def test_two_agreements_are_two_pieces_of_business():
     apart = {("doc:Invoice_77.pdf", "doc:Maintenance_Contract.pdf"), ("doc:Invoice_311.pdf", "doc:Cleaning_Contract.pdf")}
     assert find_contradictions([cleaning, maintenance, *bills], unrelated=apart) == []
     assert find_contradictions([cleaning, maintenance]) == []
-    # Two versions of one file do state the same quantity.
-    [versions] = find_contradictions([stated("E1", "Quote.txt", "quotation", 100), stated("E2", "Quote.txt", "quotation", 250).model_copy(update={"document_id": "doc:second"})])
-    assert versions.type == "amount_mismatch"
+    # A shared file name says nothing either: every scanner calls its output "scan.pdf" (third review).
+    assert find_contradictions([stated("E1", "scan.pdf", "purchase_order", 500), stated("E2", "scan.pdf", "purchase_order", 12000).model_copy(update={"document_id": "doc:second"})]) == []
 
     framework = stated("E1", "Framework_Agreement.pdf", "contract", 500000)
     order, invoice = stated("E2", "Purchase_Order_4421.pdf", "purchase_order", 12000), stated("E3", "Invoice_640.pdf", "invoice", 12000)

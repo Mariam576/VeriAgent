@@ -65,6 +65,8 @@ class InvestigationState(TypedDict, total=False):
     unrelated_documents: list[list[str]]
     # [id, id]: pairs the profiles show to belong together (an invoice and its contract, an order and the contract it cites)
     linked_documents: list[list[str]]
+    # invoice id -> its amount before tax, where the invoice states one (an invoice is measured by that amount)
+    net_totals: dict[str, float]
     calculations: list[dict[str, Any]]
     tool_selection_done: bool
     sufficiency: dict[str, Any]
@@ -138,6 +140,7 @@ def initial_state(
         compared_documents=[],
         unrelated_documents=[],
         linked_documents=[],
+        net_totals={},
         calculations=[],
         tool_selection_done=False,
         missing_evidence=[],

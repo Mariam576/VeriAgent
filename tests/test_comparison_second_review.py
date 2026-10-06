@@ -296,9 +296,12 @@ def test_a_price_per_thousand_is_not_an_arithmetic_error():
         "7.5 hours site supervision at £85.00 per hour: £637.50\nTotal due: £837.50"
     ))
     assert [(line.quantity, line.unit_price, line.amount) for line in by_rules.line_items] == [
-        (5000, None, 60), (2000, None, 60), (2500, None, 80), (7.5, 85, 637.5),
+        (5000, 12, 60), (2000, 30, 60), (2500, 3.2, 80), (7.5, 85, 637.5),
     ]
     assert kinds([by_rules]) == []
+    # Third review: the price per thousand is worked out, not waved through - ten times too much is found.
+    ten_times = read_by_rules("inv", "invoice", "INVOICE\nInvoice No. INV-501\n5,000 printed labels at £12.00 per thousand: £600.00\nTotal due: £600.00")
+    assert kinds([ten_times]) == [("line_arithmetic_mismatch", "medium")]
     row = "Printed labels   Qty 5,000   Price per 1,000 £12.00   £60.00"
     by_model = read_by_model("inv", "invoice", f"INVOICE INV-501\n{row}\nTotal due: £60.00", [
         fact("total_amount", "Total due: £60.00", number=60, unit="GBP"),
@@ -387,7 +390,9 @@ def test_the_same_number_or_the_same_total_is_not_always_the_same_bill():
         "TAX INVOICE\nInvoice No. INV-640\nInvoice date: 9 March 2026\nFrom: Kestrel Packaging Ltd\nTo: Northwind Facilities Ltd\n"
         "Printed cartons: £1,200.00\nTotal due: £1,200.00"
     ))
-    assert pro_forma.pro_forma and not final.pro_forma and kinds([pro_forma, final]) == []
+    # Not the alarm of a duplicate - but one debt on two pieces of paper, so it is said quietly (third review).
+    [both] = compare([pro_forma, final]).findings
+    assert pro_forma.pro_forma and not final.pro_forma and both.severity == "low" and "Pay only one of the two" in both.description
 
     unknown = [
         read_by_rules("s1", "invoice", "Tolland Electrical Ltd\nINVOICE\nInvoice No. 1001\nInvoice date: 2 March 2026\nEmergency lighting test: £900.00\nTotal due: £900.00"),
