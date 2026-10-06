@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 
 from app.agents import prompts
 from app.comparison.dates import find_dates, months_in_text
+from app.comparison.names import name_tokens
 from app.comparison.profile import (
     MAX_DESCRIPTION_CHARS,
     MAX_IDENTIFIER_CHARS,
@@ -42,7 +43,7 @@ from app.comparison.profile import (
 )
 from app.comparison.rules import build_profile_with_rules, enrich
 from app.llm.base import BaseLLM, LLMConfigurationError, LLMError
-from app.numbers import normalize_unit, number_appears
+from app.numbers import normalize_unit, number_stated
 from app.rag.citations import normalize, quote_in_text
 from app.rag.loaders import PageText
 from app.schemas.investigation import RetrievedChunk
@@ -201,7 +202,7 @@ def ground_extraction(
                 if fact.number is not None and int(fact.number) in stated and quote_in_text(quote, page_text, strict_gaps=True):
                     value = ProfileField(number=float(int(fact.number)), unit="months", page=fact.page, quote=quote)
             elif fact.field in _NUMBER_FIELDS and fact.number is not None:
-                if quote_in_text(quote, page_text, 2, strict_gaps=True) and number_appears(abs(fact.number), quote):
+                if quote_in_text(quote, page_text, 2, strict_gaps=True) and number_stated(fact.number, quote):
                     unit = "days" if fact.field == "payment_terms_days" else normalize_unit(fact.unit)
                     value = ProfileField(number=float(fact.number), unit=unit, page=fact.page, quote=quote)
         if value is None:
@@ -210,8 +211,11 @@ def ground_extraction(
             continue
 
         if value.role is not None or fact.field == "party":
-            same_role = value.role is not None and any(party.role == value.role for party in profile.parties)
-            if not same_role and len(profile.parties) < MAX_PARTIES:
+            # Every party is kept: a joint venture has two suppliers, and either may send the invoice.
+            known = any(
+                (party.role, name_tokens(party.text)) == (value.role, name_tokens(value.text)) for party in profile.parties
+            )
+            if not known and len(profile.parties) < MAX_PARTIES:
                 profile.parties.append(value)
         elif getattr(profile, _SINGLE[fact.field]) is None:  # the first statement of a value wins
             setattr(profile, _SINGLE[fact.field], value)
@@ -228,7 +232,7 @@ def ground_extraction(
         if (
             not page_text or not quote or not numbers or not words
             or not quote_in_text(quote, page_text, 2, strict_gaps=True)
-            or not all(number_appears(abs(number), quote) for number in numbers)
+            or not all(number_stated(number, quote) for number in numbers)
             or in_quote * 2 < len(words)  # the description must mostly be the document's own words
         ):
             dropped += 1

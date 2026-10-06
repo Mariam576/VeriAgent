@@ -63,6 +63,8 @@ class InvestigationState(TypedDict, total=False):
     compared_documents: list[str]  # documents whose profiles the last comparison looked at
     # [invoice id, contract or order id]: pairs the profiles show to be two separate pieces of business
     unrelated_documents: list[list[str]]
+    # [id, id]: pairs the profiles show to belong together (an invoice and its contract, an order and the contract it cites)
+    linked_documents: list[list[str]]
     calculations: list[dict[str, Any]]
     tool_selection_done: bool
     sufficiency: dict[str, Any]
@@ -135,6 +137,7 @@ def initial_state(
         contradictions=[],
         compared_documents=[],
         unrelated_documents=[],
+        linked_documents=[],
         calculations=[],
         tool_selection_done=False,
         missing_evidence=[],

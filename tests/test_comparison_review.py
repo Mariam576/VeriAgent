@@ -412,8 +412,47 @@ def test_totals_are_only_held_against_each_other_where_that_means_something():
     # An invoice below it is an instalment, and two invoices are two bills.
     assert find_contradictions([contract, stated("E2", "Invoice_A.pdf", "invoice", 3333.33)]) == []
     assert find_contradictions([stated("E2", "Invoice_A.pdf", "invoice", 900), stated("E3", "Invoice_B.pdf", "invoice", 3150)]) == []
-    # Two contracts that state different values for the same thing still contradict each other.
-    assert [item.type for item in find_contradictions([contract, stated("E4", "Contract_copy.pdf", "contract", 45000)])] == ["amount_mismatch"]
+
+
+def test_two_agreements_are_two_pieces_of_business():
+    """Found in the second review: a cleaning contract and a maintenance contract, each with an invoice that
+    matches it exactly, were reported as contradicting each other - and so was a framework agreement with
+    the small order called off under it."""
+    cleaning, maintenance = stated("E1", "Cleaning_Contract.pdf", "contract", 18000), stated("E2", "Maintenance_Contract.pdf", "contract", 40000)
+    bills = [stated("E3", "Invoice_77.pdf", "invoice", 18000), stated("E4", "Invoice_311.pdf", "invoice", 40000)]
+    # Each invoice belongs to one contract; the profiles say which (see the graph test below).
+    apart = {("doc:Invoice_77.pdf", "doc:Maintenance_Contract.pdf"), ("doc:Invoice_311.pdf", "doc:Cleaning_Contract.pdf")}
+    assert find_contradictions([cleaning, maintenance, *bills], unrelated=apart) == []
+    assert find_contradictions([cleaning, maintenance]) == []
+    # Two versions of one file do state the same quantity.
+    [versions] = find_contradictions([stated("E1", "Quote.txt", "quotation", 100), stated("E2", "Quote.txt", "quotation", 250).model_copy(update={"document_id": "doc:second"})])
+    assert versions.type == "amount_mismatch"
+
+    framework = stated("E1", "Framework_Agreement.pdf", "contract", 500000)
+    order, invoice = stated("E2", "Purchase_Order_4421.pdf", "purchase_order", 12000), stated("E3", "Invoice_640.pdf", "invoice", 12000)
+    assert find_contradictions([framework, order, invoice]) == []
+    # An order ABOVE the contract it cites is a finding; an order next to two contracts is not guessed at.
+    big_order = stated("E2", "Purchase_Order_4421.pdf", "purchase_order", 520000)
+    [over] = find_contradictions([framework, big_order], linked={("doc:Purchase_Order_4421.pdf", "doc:Framework_Agreement.pdf")})
+    assert (over.source_a, over.value_b) == ("Framework_Agreement.pdf", 520000)
+    assert find_contradictions([framework, stated("E5", "Other_Contract.pdf", "contract", 9000), big_order]) == []
+
+
+def test_currencies_are_looked_at_before_anything_is_called_smaller():
+    """Found in the second review: GBP 40,000 against KWD 39,000 gave nothing, because 39,000 is "less"."""
+    contract = stated("E1", "Contract.pdf", "contract", 40000)
+    dinars = stated("E2", "Invoice_A.pdf", "invoice", 39000).model_copy(update={"unit": "KWD"})
+    [finding] = find_contradictions([contract, dinars])
+    assert finding.type == "unit_mismatch" and (finding.unit_a, finding.unit_b) == ("GBP", "KWD")
+
+
+def test_a_receipt_is_measured_against_the_invoice_it_pays():
+    invoice = stated("E1", "Invoice_A.pdf", "invoice", 11400)
+    [paid_more] = find_contradictions([invoice, stated("E2", "Receipt.pdf", "receipt", 14100)])
+    assert (paid_more.source_a, paid_more.value_a, paid_more.value_b) == ("Invoice_A.pdf", 11400, 14100)
+    assert find_contradictions([invoice, stated("E2", "Receipt.pdf", "receipt", 5000)]) == []  # a part payment
+    # With two invoices there is no telling which one the receipt belongs to.
+    assert find_contradictions([invoice, stated("E3", "Invoice_B.pdf", "invoice", 900), stated("E2", "Receipt.pdf", "receipt", 14100)]) == []
 
 
 # ==================================================================== in the graph

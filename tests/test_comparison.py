@@ -818,3 +818,21 @@ async def test_investigation_reports_comparison_findings_through_the_api(client,
             select(Finding).where(Finding.investigation_id == uuid.UUID(report["investigation_id"]), Finding.finding_type == "contradiction")
         )).scalars().all()
     assert len(stored) == 1 and "same invoice number (INV-880)" in stored[0].statement
+
+
+@integration
+async def test_comparison_endpoint_compares_what_was_put_side_by_side_and_says_what_it_left_alone(client, user_headers):
+    """Found in the second review: an invoice from another company next to a contract gave "no differences",
+    while the table above it showed supplier and total as different."""
+    uploaded = await upload_corpus(client, user_headers, "another_suppliers_invoice")
+    contract, own, other = (uploaded[name]["id"] for name in ("Maintenance_Contract.txt", "Invoice_311.txt", "Invoice_88.txt"))
+
+    # One invoice next to the contract: the two are compared, whatever the supplier names say.
+    pair = (await client.post("/comparisons", headers=user_headers, json={"document_ids": [contract, other]})).json()
+    assert sorted(finding["type"] for finding in pair["findings"]) == ["amount_mismatch", "party_mismatch"]
+
+    # Two invoices: each is checked against the contract it belongs to, and the note says which was not.
+    three = (await client.post("/comparisons", headers=user_headers, json={"document_ids": [contract, own, other]})).json()
+    assert three["findings"] == []
+    assert any("Invoice_88.txt was not checked against the contract Maintenance_Contract.txt" in note for note in three["notes"])
+    assert not any("name both in the question" in note for note in three["notes"])  # there is no question here

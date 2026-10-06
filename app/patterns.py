@@ -11,13 +11,15 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from app.numbers import NUMBER_CORE, normalize_unit, parse_number
+from app.numbers import CURRENCY_CODES, NUMBER_CORE, SCALE_WORDS, normalize_unit, parse_number
 
 # A currency marker directly before or after a number token (see app.numbers for the number formats).
-NUMBER = NUMBER_CORE + r"(?![\w]|[.,]\d)"
+# "USD 1.2 million" is left unread here: reading it as $1.20 would be a false alarm waiting to happen,
+# and an unread amount only means that one check is skipped.
+NUMBER = NUMBER_CORE + rf"(?![\w]|[.,]\d)(?!\s?(?:{SCALE_WORDS})\b)"
 MONEY = re.compile(
-    rf"(?P<cur>£|\$|€|₹|\b(?:GBP|USD|EUR|PKR|INR|AED|SAR|Rs\.?))\s?(?P<neg>[-−])?(?P<num>{NUMBER})"
-    rf"|(?<!\w)(?<!\d[.,])(?P<num2>{NUMBER})\s?(?P<cur2>GBP|USD|EUR|PKR|INR|AED|SAR)\b",
+    rf"(?P<cur>£|\$|€|₹|\b(?:{CURRENCY_CODES}|Rs\.?))\s?(?P<neg>[-−])?(?P<num>{NUMBER})"
+    rf"|(?<!\w)(?<!\d[.,])(?P<num2>{NUMBER})\s?(?P<cur2>{CURRENCY_CODES})\b",
     re.IGNORECASE,
 )
 
@@ -28,7 +30,8 @@ TOTAL_LABELS: list[tuple[re.Pattern[str], int]] = [
     (re.compile(r"(?<![a-z-])total\b", re.I), 1),
 ]
 SUBTOTAL = re.compile(r"sub[\s-]?total", re.I)
-_NOT_A_STATEMENT = re.compile(r"\b(?:above|exceed\w*|over|under|below|up to|more than|less than|limit|threshold)\b", re.I)
+# Words that make an amount a condition instead of a statement: "orders over £750", "up to £500".
+NOT_A_STATEMENT = re.compile(r"\b(?:above|exceed\w*|over|under|below|up to|more than|less than|at least|minimum|maximum|limit|threshold)\b", re.I)
 
 PAYMENT_TERMS = [
     re.compile(r"payment terms?\b[^.]{0,80}?\b(?P<days>\d{1,3})\s*(?:calendar |working |business )?days", re.I),
@@ -130,7 +133,7 @@ def find_amounts(text: str) -> list[AmountHit]:
                     continue
                 gap = before[label.end():]
                 # The amount must follow the label closely: "total ... is £40,000", "Total due: £58,000".
-                if len(gap) <= 30 and not re.search(r"\d", gap) and not _NOT_A_STATEMENT.search(gap):
+                if len(gap) <= 30 and not re.search(r"\d", gap) and not NOT_A_STATEMENT.search(gap):
                     priority = level
                     break
         hits.append(AmountHit(

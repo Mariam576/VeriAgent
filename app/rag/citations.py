@@ -19,7 +19,7 @@ import re
 
 from pydantic import BaseModel
 
-from app.numbers import find_number_tokens, number_appears, parse_number
+from app.numbers import find_number_tokens, number_appears, number_stated, parse_number
 from app.schemas.investigation import EvidenceItem, RetrievedChunk
 
 MIN_QUOTE_CHARS = 8  # a shorter text quote proves nothing ("pay", "the")
@@ -37,14 +37,39 @@ def format_citation(filename: str, page: int) -> str:
     return f"[{filename}, page {page}]"
 
 
+def _unify(text: str) -> str:
+    text = text.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+    return re.sub(r"[‐-―−]", "-", text)  # every kind of dash becomes "-"
+
+
 def normalize(text: str) -> str:
     """Make text comparable: same quotes and dashes, one space, lower case."""
-    text = text.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
-    text = re.sub(r"[‐-―−]", "-", text)  # every kind of dash becomes "-"
-    return re.sub(r"\s+", " ", text).strip().lower()
+    return re.sub(r"\s+", " ", _unify(text)).strip().lower()
 
 
-def _text_variants(text: str) -> list[str]:
+# "Total contract value ........ £40,000": the dots that lead the eye across a price list or a
+# table of contents. They are layout, not text, and must not be mistaken for a "..." in a quote.
+_LEADER = re.compile(r"(?:\.[ \t]?){4,}|…{2,}|_{4,}")
+
+
+def _flatten(text: str) -> tuple[str, frozenset[int]]:
+    """``normalize(text)``, plus the positions of the spaces that were line breaks."""
+    pieces: list[str] = []
+    breaks: set[int] = set()
+    position = 0
+    for piece in re.split(r"(\s+)", _unify(_LEADER.sub(" ", text)).lower().strip()):
+        if not piece:
+            continue
+        if piece.isspace():
+            if "\n" in piece:
+                breaks.add(position)
+            piece = " "
+        pieces.append(piece)
+        position += len(piece)
+    return "".join(pieces), frozenset(breaks)
+
+
+def _text_variants(text: str) -> list[tuple[str, frozenset[int]]]:
     """The chunk as a reader might retype it.
 
     PDF extraction breaks lines in the middle of sentences and sometimes in
@@ -53,45 +78,92 @@ def _text_variants(text: str) -> list[str]:
     """
     joined_words = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", text)  # "pay-\nment"  -> "payment"
     kept_hyphen = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1-\2", text)  # "INV-\n102"   -> "INV-102"
-    return list(dict.fromkeys(normalize(variant) for variant in (text, joined_words, kept_hyphen)))
+    variants: dict[str, frozenset[int]] = {}
+    for variant in (text, joined_words, kept_hyphen):
+        flat, breaks = _flatten(variant)
+        variants.setdefault(flat, breaks)
+    return list(variants.items())
 
 
 MAX_GAP_CHARS = 120
 
 
+def _whole(text: str, start: int, end: int) -> bool:
+    """Does text[start:end] begin and end where a word or a number begins and ends?
+
+    "£58" is written in "£58,000" and "40,000" in "£140,000" - as characters.
+    As values they are not there. A quote that has to state a value may not be
+    cut out of the middle of a longer number or word.
+    """
+    first, last = text[start], text[end - 1]
+    if first.isalnum() and start > 0 and text[start - 1].isalnum():
+        return False
+    if first.isdigit() and re.search(r"\d[.,]$", text[max(start - 2, 0):start]):
+        return False
+    if last.isalnum() and end < len(text) and text[end].isalnum():
+        return False
+    if last.isdigit() and re.match(r"[.,]\d", text[end:end + 2]):
+        return False
+    return True
+
+
+def _occurrences(text: str, fragment: str, start: int, whole: bool):
+    position = text.find(fragment, start)
+    while position != -1:
+        if not whole or _whole(text, position, position + len(fragment)):
+            yield position
+        position = text.find(fragment, position + 1)
+
+
+def _may_skip(skipped: str, before: str, after: str) -> bool:
+    """May a "..." in a quote that states a value stand for these words?"""
+    if len(skipped) > MAX_GAP_CHARS:
+        return False
+    cells = skipped.strip()
+    if (before.endswith("|") or cells.startswith("|")) and (after.startswith("|") or cells.endswith("|")):
+        return True  # whole cells of one table row: "Lift maintenance | ... | £1,000"
+    rest = re.sub(r"\.{2,}", " ", skipped)  # dots that lead across a line are not the end of a sentence
+    return not re.search(r"\d|[.!?;] ", rest)
+
+
 def quote_in_text(quote: str, text: str, min_chars: int = MIN_QUOTE_CHARS, *, strict_gaps: bool = False) -> bool:
     """Does the quote appear in the text, allowing for line breaks and "..." gaps?
 
-    ``strict_gaps``: for quotes that have to state a value. A "..." may then
-    only skip a few words inside one sentence, and never a number. Otherwise a
-    quote could be stitched together from a label and a figure that stand in
-    different sentences ("Total amount due: ... £58,000" on a page that says
-    "Total amount due: £40,000" and mentions a limit of £58,000 further down).
+    ``strict_gaps``: for quotes that have to state a value. Then
+
+    * every piece of the quote must begin and end at the edge of a word or
+      number ("£58" is not a quote from "£58,000"), and
+    * a "..." may only skip a few words inside one sentence on one line, and
+      never a number - unless it skips whole cells of one table row.
+
+    Otherwise a quote could be stitched together from a label and a figure that
+    stand in different sentences ("Total amount due: ... £58,000" on a page that
+    says "Total amount due: £40,000" and mentions a limit of £58,000 further down).
     """
     fragments = [
         normalize(fragment).strip(" .,;:\"'")
-        for fragment in re.split(r"\.{3,}|…|\[\.\.\.\]", quote)
+        for fragment in re.split(r"\.{3,}|…|\[\.\.\.\]", _LEADER.sub(" ", quote))
     ]
     fragments = [fragment for fragment in fragments if fragment]
     if not fragments or sum(len(fragment) for fragment in fragments) < min_chars:
         return False
 
-    for variant in _text_variants(text):
-        starts = [index for index in range(len(variant)) if variant.startswith(fragments[0], index)] if strict_gaps else [variant.find(fragments[0])]
-        for start in starts:
-            if start == -1:
-                break
+    for variant, breaks in _text_variants(text):
+        for start in _occurrences(variant, fragments[0], 0, strict_gaps):
             position = start + len(fragments[0])
-            for fragment in fragments[1:]:  # fragments must appear in the same order
-                found = variant.find(fragment, position)
+            for index, fragment in enumerate(fragments[1:], start=1):  # fragments must appear in the same order
+                found = next(_occurrences(variant, fragment, position, strict_gaps), -1)
                 if found == -1:
                     break
-                skipped = variant[position:found]
-                if strict_gaps and (len(skipped) > MAX_GAP_CHARS or re.search(r"\d|[.!?;] ", skipped)):
-                    break
+                if strict_gaps:
+                    crosses_a_line = any(position <= line_break < found for line_break in breaks)
+                    if crosses_a_line or not _may_skip(variant[position:found], fragments[index - 1], fragment):
+                        break
                 position = found + len(fragment)
             else:
                 return True
+            if not strict_gaps:
+                break  # as before: only the first place the quote starts is tried
     return False
 
 
@@ -105,7 +177,7 @@ def is_grounded(quote: str, value_number: float | None, chunk_text: str) -> bool
     """
     if value_number is None:
         return quote_in_text(quote, chunk_text)
-    return quote_in_text(quote, chunk_text, MIN_NUMERIC_QUOTE_CHARS, strict_gaps=True) and number_appears(value_number, quote)
+    return quote_in_text(quote, chunk_text, MIN_NUMERIC_QUOTE_CHARS, strict_gaps=True) and number_stated(value_number, quote)
 
 
 _FILENAME = re.compile(r"\S+\.(?:pdf|docx|txt)\b", re.IGNORECASE)

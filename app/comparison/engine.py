@@ -40,6 +40,21 @@ total, a second invoice from another supplier lies in the same folder. So:
     * arithmetic is only a finding when no tax, discount, charge or deposit
       on the page explains the difference, and rounding to the cent is not one.
 
+A third rule came out of the second review: leniency needs bounds, and silence
+needs a reason. Each of the rules above can be turned into a way of hiding
+something - a charge that is counted as a line and again as "an adjustment
+that explains the total", an invoice from a look-alike supplier that simply
+leaves out the contract number, the words "credit note" somewhere near the
+top. So:
+
+    * an amount explains the total once, and only if it is not one of the lines,
+    * a name that keeps the contract supplier's words with small changes is
+      compared, not skipped (names.may_belong_together),
+    * when the person names both documents, or selects a single invoice with
+      its contract, they are compared whatever the names say,
+    * and whenever a document is left unchecked, the result says so
+      (``Comparison.notes``): "not checked" must never look like "no problem".
+
 ``basic=True`` adds the total-amount and payment-terms comparison. Inside an
 investigation those two come from the retrieved evidence, so the graph leaves
 them out here; the stand-alone comparison endpoint switches them on.
@@ -53,9 +68,10 @@ from datetime import timedelta
 from itertools import combinations
 from typing import Literal
 
+from app.comparison.adjustments import ADDED
 from app.comparison.dates import add_months, format_date
-from app.comparison.names import RELATED, compare_names, same_identifier
-from app.comparison.profile import REFERENCE_TYPES, DocumentProfile, LineItem, ProfileField
+from app.comparison.names import RELATED, compare_names, may_belong_together, same_identifier
+from app.comparison.profile import PER_MANY, REFERENCE_TYPES, DocumentProfile, LineItem, ProfileField
 from app.formatting import format_number, format_value
 from app.schemas.investigation import KEY_PAYMENT_TERMS, KEY_TOTAL_AMOUNT
 from app.tools.contradiction import classify_difference
@@ -66,8 +82,18 @@ MAX_CITED_LINES = 8
 MAX_UNLISTED_LINES = 3
 MAX_FINDINGS = 12
 
+MAX_NOTES = 4
+
 CENT = 0.0101  # one cent (or penny, or paisa), with room for the way computers store decimals
 MAX_ADJUSTMENTS_TRIED = 7  # each can be added, subtracted or left out: 3^7 combinations at most
+# Delivery and postage ride along with an order without being on it - up to a point. A "handling
+# charge" of four times the goods is not an incidental.
+MAX_INCIDENTAL_SHARE = 0.25
+# The highest sales taxes are a little under 30%. A larger gap between lines and total is not "probably the tax".
+MAX_UNLISTED_TAX_SHARE = 0.3
+# The same invoice number this many days apart is more likely a numbering that starts again
+# (every year, every month) than the same bill sent twice.
+NUMBERING_RESTART_DAYS = 60
 
 _KIND = {"contract": "contract", "purchase_order": "purchase order", "invoice": "invoice"}
 _SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
@@ -213,9 +239,11 @@ def check_document(profile: DocumentProfile) -> list[ProfileFinding]:
     for item in profile.line_items:
         if item.quantity is None or item.unit_price is None or item.amount is None:
             continue
-        if _LINE_ADJUSTED.search(item.quote):
-            continue  # the line has a discount or tax of its own: not checked
+        if _LINE_ADJUSTED.search(item.quote) or PER_MANY.search(item.quote):
+            continue  # a discount or tax of its own, or a price "per 1,000": quantity x price is not the amount
         expected = round(item.quantity * item.unit_price, 2)
+        if profile.minimum_charge and item.amount > expected:
+            continue  # "minimum call-out charge applies": billed above quantity x price on purpose
         # Compared before rounding as well: 2.5 x 19.99 = 49.975 is 49.97 to one program and 49.98 to another.
         if not _close(item.quantity * item.unit_price, item.amount):
             findings.append(ProfileFinding(
@@ -241,10 +269,20 @@ def check_document(profile: DocumentProfile) -> list[ProfileFinding]:
             targets = [total.number]
             if subtotal is not None and subtotal.number is not None:
                 targets.append(subtotal.number)
-            # Everything on the page that may stand between the lines and the total.
-            adjustments = [(value.number, value.text or "either") for value in profile.adjustments if value.number]
-            if tax is not None and tax.number and not any(_close(tax.number, known) for known, _ in adjustments):
-                adjustments.append((tax.number, "add"))
+            # Everything on the page that may stand between the lines and the total. The tax comes first:
+            # only the first few are tried, and the tax is the one that is nearly always needed.
+            listed = [(value.number, value.text or "either") for value in profile.adjustments if value.number]
+            adjustments = [entry for entry in listed if entry[1] == "add"] + [entry for entry in listed if entry[1] != "add"]
+            tax_is_a_line = tax is not None and tax.number and any(
+                amount is not None and _close(amount, tax.number) and ADDED.search(item.description)
+                for item, amount in zip(profile.line_items, amounts)
+            )
+            if tax is not None and tax.number and not tax_is_a_line:
+                # The tax field is the same statement as one of the amounts found in the text: counted once.
+                same = next((entry for entry in adjustments if entry[1] == "add" and _close(entry[0], tax.number)), None)
+                if same is not None:
+                    adjustments.remove(same)
+                adjustments.insert(0, same or (tax.number, "add"))
             tolerance = min(CENT * max(len(amounts), 1), 0.1)  # every line may be rounded by up to a cent
             explained = any(
                 _close(line_sum, target, tolerance) or _explained_by_adjustments(line_sum, target, adjustments, tolerance)
@@ -258,7 +296,10 @@ def check_document(profile: DocumentProfile) -> list[ProfileFinding]:
                     f"{label} is {format_value(against.number, against.unit or total.unit)}."
                 )
                 # Something that could explain it is mentioned, or may simply not be listed: say so, and say it softly.
-                unlisted_extra = line_sum < against.number and not adjustments and label == "total"
+                # ... but only a difference of the size a tax can have. No tax turns 6,200 into 11,200.
+                unlisted_extra = (
+                    not adjustments and label == "total" and 0 < against.number - line_sum <= MAX_UNLISTED_TAX_SHARE * abs(line_sum)
+                )
                 if profile.unquantified_adjustment:
                     description += " The document mentions a discount, tax or charge without an amount, which could explain the difference."
                 elif unlisted_extra:
@@ -346,13 +387,19 @@ def _term_end(reference: DocumentProfile):
     return None, []
 
 
-def check_pair(reference: DocumentProfile, invoice: DocumentProfile, *, basic: bool = False) -> list[ProfileFinding]:
-    """Check one invoice against one contract or purchase order."""
+def check_pair(
+    reference: DocumentProfile, invoice: DocumentProfile, *, basic: bool = False, parties_only: bool = False
+) -> list[ProfileFinding]:
+    """Check one invoice against one contract or purchase order.
+
+    ``parties_only``: for a credit note. It gives money back, so its amounts,
+    dates and lines are not an invoice's - but who it comes from still matters.
+    """
     findings: list[ProfileFinding] = []
     ref_name, inv_name, kind = reference.filename, invoice.filename, _kind(reference)
 
     # ---- the two classic quantities (stand-alone comparison only, see the module text)
-    if basic:
+    if basic and not parties_only:
         a, b = reference.total, invoice.total
         if a is not None and b is not None and a.number is not None and b.number is not None:
             if a.unit and b.unit and a.unit != b.unit:
@@ -397,18 +444,22 @@ def check_pair(reference: DocumentProfile, invoice: DocumentProfile, *, basic: b
         mine = invoice.party(role)  # type: ignore[arg-type]
         if mine is None:
             continue
-        named = reference.party(role)  # type: ignore[arg-type]
-        candidates = [named] if named is not None else [party for party in reference.parties if party.role is None]
+        # Every party of that role (a joint venture has two suppliers), and every party whose role the
+        # reference does not state: an invoice from any of them comes from a party to the agreement.
+        named = reference.parties_with(role)  # type: ignore[arg-type]
+        unstated = [party for party in reference.parties if party.role is None]
+        candidates = named + unstated
         results = [compare_names(mine.text, candidate.text) for candidate in candidates]
         if not candidates or "same" in results or all(result == "unknown" for result in results):
             continue
+        shown = named or unstated
         short_form, look_alike = "short_form" in results, "similar" in results
-        theirs = " and ".join(candidate.text or "" for candidate in candidates)
+        theirs = " and ".join(candidate.text or "" for candidate in shown)
         if role == "supplier":
             description = f"{inv_name} is issued by {mine.text}, but the {kind} {ref_name} "
         else:
             description = f"{inv_name} is addressed to {mine.text}, but the {kind} {ref_name} "
-        description += f"names {theirs} as the {role}." if named is not None else f"is between {theirs}."
+        description += f"names {theirs} as the {role}." if named else f"is between {theirs}."
         if short_form:
             description += " One name is a shorter form of the other; check that they are the same company."
             severity = "low"  # usually a letterhead that leaves out a word; sometimes a look-alike that adds one
@@ -421,8 +472,10 @@ def check_pair(reference: DocumentProfile, invoice: DocumentProfile, *, basic: b
         findings.append(ProfileFinding(
             type="party_mismatch", key=role, severity=severity,  # type: ignore[arg-type]
             description=description, source_a=ref_name, source_b=inv_name, text_a=theirs, text_b=mine.text,
-            cited=[cite_party(reference, candidate) for candidate in candidates] + [cite_party(invoice, mine)],
+            cited=[cite_party(reference, candidate) for candidate in shown] + [cite_party(invoice, mine)],
         ))
+    if parties_only:
+        return findings
 
     # ---- dates
     if invoice.date is not None and invoice.date.dates:
@@ -443,7 +496,8 @@ def check_pair(reference: DocumentProfile, invoice: DocumentProfile, *, basic: b
                     cited=[cited_start, cite_date(invoice)],
                 ))
             last_day, stated = _term_end(reference)
-            if last_day is not None and min(invoice_dates) > last_day + timedelta(days=GRACE_AFTER_TERM_DAYS):
+            # A contract that renews by itself has no last day to be late for.
+            if last_day is not None and not reference.renews and min(invoice_dates) > last_day + timedelta(days=GRACE_AFTER_TERM_DAYS):
                 findings.append(ProfileFinding(
                     type="date_outside_term", key="document_date", severity="low",
                     description=(
@@ -466,6 +520,29 @@ def check_pair(reference: DocumentProfile, invoice: DocumentProfile, *, basic: b
         pairs, unmatched = match_lines(reference.line_items, invoice.line_items)
         for ordered, billed in pairs:
             cited = [cite_line(reference, ordered), cite_line(invoice, billed)]
+            same_currency = not (ordered.unit and billed.unit and ordered.unit != billed.unit)
+            if (
+                same_currency and ordered.effective_amount is not None and billed.effective_amount is not None
+                and _close(ordered.effective_amount, billed.effective_amount)
+            ):
+                # The money agrees. If quantity and price both differ, the two documents most likely count in
+                # different units (10 boxes of 100 at £50, or 1,000 pieces at £0.50): a note, not an accusation.
+                if (
+                    ordered.quantity is not None and billed.quantity is not None and not _same_count(ordered.quantity, billed.quantity)
+                    and ordered.unit_price is not None and billed.unit_price is not None
+                ):
+                    unit = ordered.unit or billed.unit
+                    findings.append(ProfileFinding(
+                        type="quantity_mismatch", key="quantity", severity="low",
+                        description=(
+                            f"{ref_name} lists {format_number(ordered.quantity)} x {ordered.description} at "
+                            f"{format_value(ordered.unit_price, unit)}, and {inv_name} bills {format_number(billed.quantity)} at "
+                            f"{format_value(billed.unit_price, unit)}. The line amounts agree "
+                            f"({format_value(billed.effective_amount, unit)}), so the two probably count in different units."
+                        ),
+                        source_a=ref_name, source_b=inv_name, value_a=ordered.quantity, value_b=billed.quantity, cited=cited,
+                    ))
+                continue
             # Billing fewer than ordered is a partial delivery, not a finding.
             if ordered.quantity is not None and billed.quantity is not None and billed.quantity > ordered.quantity + 0.0005:
                 findings.append(ProfileFinding(
@@ -519,8 +596,14 @@ def check_pair(reference: DocumentProfile, invoice: DocumentProfile, *, basic: b
                 ))
         # Only when at least one line matched: that shows the two documents describe items in comparable words.
         if pairs and reference.document_type == "purchase_order":
-            # Delivery, postage and the like ride along with an order without being on it.
-            unlisted = [item for item in unmatched if not _INCIDENTAL.search(item.description)]
+            # Delivery, postage and the like ride along with an order without being on it - as long as
+            # they stay small next to what was ordered.
+            matched_value = sum(abs(billed.effective_amount or 0) for _, billed in pairs)
+            incidental = [item for item in unmatched if _INCIDENTAL.search(item.description)]
+            charged = sum(abs(item.effective_amount or 0) for item in incidental)
+            # Without amounts on the matched lines there is nothing to measure against: left alone.
+            small_enough = matched_value == 0 or charged <= matched_value * MAX_INCIDENTAL_SHARE
+            unlisted = [item for item in unmatched if not (small_enough and item in incidental)]
             for item in unlisted[:MAX_UNLISTED_LINES]:
                 findings.append(ProfileFinding(
                     type="unlisted_line_item", key="line_item", severity="medium",
@@ -553,8 +636,13 @@ def check_series(reference: DocumentProfile, invoices: list[DocumentProfile], *,
     for invoice in invoices:
         pairs, _ = match_lines(reference.line_items, invoice.line_items)
         for ordered, line in pairs:
-            if ordered.quantity is not None and line.quantity is not None:
-                billed.setdefault(reference.line_items.index(ordered), []).append((invoice, line))
+            if ordered.quantity is None or line.quantity is None:
+                continue
+            # Quantities are only added up when they count the same thing: a line priced per piece
+            # is not added to an order counted in boxes.
+            if ordered.unit_price is not None and line.unit_price is not None and not _close(ordered.unit_price, line.unit_price, 0.00005):
+                continue
+            billed.setdefault(reference.line_items.index(ordered), []).append((invoice, line))
     for index, lines in billed.items():
         ordered = reference.line_items[index]
         assert ordered.quantity is not None
@@ -627,6 +715,31 @@ def _same_day(first: list, second: list) -> bool:
     return len(single) == 1 and single[0] in several
 
 
+def _days_apart(first: DocumentProfile, second: DocumentProfile) -> int | None:
+    """The smallest number of days between the two documents' dates, over every reading. None if a date is unknown."""
+    if first.date is None or second.date is None or not first.date.dates or not second.date.dates:
+        return None
+    return min(abs((a - b).days) for a in first.date.dates for b in second.date.dates)
+
+
+def _for_different_orders(first: DocumentProfile, second: DocumentProfile) -> bool:
+    """Do the two invoices say themselves that they belong to different orders (or contracts)?"""
+    for name in ("purchase_order_reference", "contract_reference"):
+        a, b = getattr(first, name), getattr(second, name)
+        if a is not None and b is not None and a.text and b.text and not same_identifier(a.text, b.text):
+            return True
+    return False
+
+
+def _bill_the_same_things(first: DocumentProfile, second: DocumentProfile) -> bool:
+    """Do both invoices list the same lines? Unknown (no lines read) counts as "may well be"."""
+    if not first.line_items or not second.line_items:
+        return True
+    a = sorted(sorted(_line_words(item.description)) for item in first.line_items)
+    b = sorted(sorted(_line_words(item.description)) for item in second.line_items)
+    return a == b
+
+
 def check_duplicates(invoices: list[DocumentProfile]) -> list[ProfileFinding]:
     findings = []
     for first, second in combinations(invoices, 2):
@@ -645,8 +758,17 @@ def check_duplicates(invoices: list[DocumentProfile]) -> list[ProfileFinding]:
         total_a, total_b = _total_of(first), _total_of(second)
         same_total = total_a is not None and total_b is not None and _close(total_a[0], total_b[0]) and total_a[1] == total_b[1]
         shown_a, shown_b = first.number.text, second.number.text  # type: ignore[union-attr]
+        days_apart = _days_apart(first, second)
+        far_apart = days_apart is not None and days_apart > NUMBERING_RESTART_DAYS
 
         if number_a == number_b:
+            if first.pro_forma != second.pro_forma:
+                continue  # a pro-forma invoice and the invoice that follows it carry the same number
+            if not same_total and (not related or far_apart):
+                # Different amounts under one number: worth a look from one supplier within a few weeks
+                # (a correction?). From suppliers whose names were not read, or a year apart, it is two
+                # invoices that happen to share a number.
+                continue
             description = f"{first.filename} and {second.filename} carry the same invoice number ({shown_a})"
             cited = [cite_number(first), cite_number(second)]
             if total_a is not None and total_b is not None:
@@ -660,18 +782,28 @@ def check_duplicates(invoices: list[DocumentProfile]) -> list[ProfileFinding]:
                     )
             else:
                 description += "."
+            if far_apart:
+                cited += [cite_date(first), cite_date(second)]
+                description += (
+                    f" They are dated {first.date.text} and {second.date.text}; a supplier that starts its numbering "  # type: ignore[union-attr]
+                    "again every year would explain it."
+                )
             if suppliers in ("short_form", "similar"):
                 description += f" The supplier is written differently on the two ({first.supplier.text} and {second.supplier.text})."  # type: ignore[union-attr]
             findings.append(ProfileFinding(
-                type="duplicate_invoice", key="invoice_number", severity="high" if same_total else "medium",
+                type="duplicate_invoice", key="invoice_number",
+                severity="low" if far_apart else "high" if same_total else "medium",
                 description=description, source_a=first.filename, source_b=second.filename,
                 text_a=shown_a, text_b=shown_b, cited=cited,
             ))
             continue
 
-        # The same bill under a new number: same supplier, same date, same total.
+        # The same bill under a new number: same supplier, same date, same total - and nothing on the
+        # two that says they are for different things (another order, other lines).
         same_date = first.date is not None and second.date is not None and _same_day(first.date.dates, second.date.dates)
         if related and same_total and same_date and total_a is not None:
+            if first.pro_forma != second.pro_forma or _for_different_orders(first, second) or not _bill_the_same_things(first, second):
+                continue
             findings.append(ProfileFinding(
                 type="duplicate_invoice", key="invoice_number", severity="medium",
                 description=(
@@ -698,35 +830,80 @@ def _supplier_link(invoice: DocumentProfile, candidate: DocumentProfile) -> str:
     """What the supplier names say about an invoice and a contract or order: related | unrelated | unknown."""
     if invoice.supplier is None or not candidate.parties:
         return "unknown"
-    named = candidate.supplier
-    others = [named] if named is not None else [party for party in candidate.parties if party.role is None]
-    results = [compare_names(invoice.supplier.text, party.text) for party in others]
-    if any(result in RELATED for result in results):
+    # The reference's suppliers, and every party whose role it does not state.
+    others = [party for party in candidate.parties if party.role != "customer"]
+    if not others:
+        return "unknown"
+    if any(may_belong_together(invoice.supplier.text, party.text) for party in others):
         return "related"
-    if results and all(result == "different" for result in results):
+    if all(compare_names(invoice.supplier.text, party.text) == "different" for party in others):
         return "unrelated"
     return "unknown"
 
 
-def find_reference(invoice: DocumentProfile, kind: str, profiles: list[DocumentProfile]) -> tuple[DocumentProfile | None, ProfileFinding | None]:
-    """The contract (or purchase order) an invoice belongs to, and a finding if its reference number points elsewhere.
+def _latest_revisions(candidates: list[DocumentProfile]) -> list[DocumentProfile]:
+    """Of several orders (or contracts) that carry one number, keep the one with the latest date.
 
-    An invoice belongs to a reference when it cites its number, or when it
-    comes from its supplier. An invoice from another company that cites
-    nothing is simply another piece of business that lies in the same folder:
-    it is left alone. (Before the review it was checked against whatever
-    contract was there, and accused of coming from the wrong supplier.)
+    An order that was revised lies in the library twice. The invoice is for
+    the latest version; which one was uploaded first must not decide.
     """
-    candidates = sorted(
+    by_number: dict[str, list[DocumentProfile]] = {}
+    for candidate in candidates:
+        by_number.setdefault(_identifier_key(candidate.number) or f"document {candidate.document_id}", []).append(candidate)
+    kept = []
+    for group in by_number.values():
+        dated = [candidate for candidate in group if candidate.date is not None and candidate.date.dates]
+        kept.append(max(dated, key=lambda candidate: max(candidate.date.dates)) if dated else group[0])  # type: ignore[union-attr]
+    return [candidate for candidate in candidates if candidate in kept]
+
+
+def _candidates(kind: str, profiles: list[DocumentProfile]) -> list[DocumentProfile]:
+    usable = sorted(
         (profile for profile in profiles if profile.document_type == kind and not profile.is_empty),
         key=_richness, reverse=True,
     )
+    return _latest_revisions(usable)
+
+
+def _cites(invoice: DocumentProfile, reference: DocumentProfile) -> bool:
+    cited = invoice.contract_reference if reference.document_type == "contract" else invoice.purchase_order_reference
+    return bool(
+        cited is not None and cited.text and reference.number is not None
+        and same_identifier(reference.number.text, cited.text)
+    )
+
+
+def find_reference(
+    invoice: DocumentProfile, kind: str, profiles: list[DocumentProfile], *,
+    assume_related: bool = False, forced: frozenset[tuple[str, str]] | set[tuple[str, str]] = frozenset(),
+) -> tuple[DocumentProfile | None, ProfileFinding | None]:
+    """The contract (or purchase order) an invoice belongs to, and a finding if its reference number points elsewhere.
+
+    An invoice belongs to a reference when it cites its number, or when it
+    comes from its supplier - or from a name that looks like its supplier's.
+    An invoice from quite another company that cites nothing is simply another
+    piece of business that lies in the same folder: it is left alone. (Before
+    the first review it was checked against whatever contract was there, and
+    accused of coming from the wrong supplier.)
+
+    Two things overrule the names, because the person asking knows better than
+    a name comparison (second review):
+
+    ``forced``          (invoice id, reference id) pairs the person named.
+    ``assume_related``  the person put one invoice next to these documents on
+                        purpose: the only contract (or order) there is the one
+                        it is to be checked against.
+    """
+    candidates = _candidates(kind, profiles)
     if not candidates:
         return None, None
     cited_reference = invoice.contract_reference if kind == "contract" else invoice.purchase_order_reference
     links = {candidate.document_id: _supplier_link(invoice, candidate) for candidate in candidates}
+    named = [candidate for candidate in candidates if (invoice.document_id, candidate.document_id) in forced]
     related = [candidate for candidate in candidates if links[candidate.document_id] == "related"]
-    possible = [candidate for candidate in candidates if links[candidate.document_id] != "unrelated"]
+    possible = [candidate for candidate in candidates if links[candidate.document_id] != "unrelated" or candidate in named]
+    if assume_related and len(candidates) == 1:
+        possible = candidates
 
     if cited_reference is not None and cited_reference.text:
         for candidate in candidates:
@@ -753,7 +930,9 @@ def find_reference(invoice: DocumentProfile, kind: str, profiles: list[DocumentP
             return (possible[0] if len(possible) == 1 else None), finding
         return None, None
 
-    # No reference number cited: the supplier decides.
+    # No reference number cited: the person's own words decide first, then the supplier.
+    if len(named) == 1:
+        return named[0], None
     if len(related) == 1:
         return related[0], None
     if not related and len(possible) == 1 and len(candidates) == 1:
@@ -761,48 +940,97 @@ def find_reference(invoice: DocumentProfile, kind: str, profiles: list[DocumentP
     return None, None
 
 
-def unrelated_pairs(profiles: list[DocumentProfile]) -> set[tuple[str, str]]:
-    """(invoice id, contract or order id) for invoices that are known not to belong to that reference.
+_IDENTIFIER_IN_TEXT = re.compile(r"[A-Za-z0-9][A-Za-z0-9/_.-]*\d[A-Za-z0-9/_-]*")
 
-    "Known" means: the invoice names its supplier, the reference names another
-    company, and the invoice does not cite the reference's number. The
-    investigation uses this to leave such pairs alone altogether - also in the
-    comparison of totals that comes from the search (app/tools/contradiction.py).
-    """
+
+def named_in(question: str, profiles: list[DocumentProfile]) -> set[str]:
+    """The ids of the documents a question names, by their number ("INV-355") or by their file name."""
+    lowered = question.lower()
+    tokens = _IDENTIFIER_IN_TEXT.findall(question)
+    named = set()
+    for profile in profiles:
+        stem = profile.filename.rsplit(".", 1)[0].lower()
+        if profile.filename.lower() in lowered or (len(stem) >= 4 and stem in lowered):
+            named.add(profile.document_id)
+        elif profile.number is not None and any(same_identifier(profile.number.text, token) for token in tokens):
+            named.add(profile.document_id)
+    return named
+
+
+def named_pairs(question: str, profiles: list[DocumentProfile]) -> set[tuple[str, str]]:
+    """(invoice id, reference id) for every invoice and contract or order that the question names together."""
+    named = named_in(question, profiles)
+    return {
+        (invoice.document_id, reference.document_id)
+        for invoice in profiles if invoice.document_type == "invoice" and invoice.document_id in named
+        for reference in profiles if reference.document_type in REFERENCE_TYPES and reference.document_id in named
+    }
+
+
+@dataclass
+class Comparison:
+    """What comparing a set of documents gave."""
+
+    findings: list[ProfileFinding] = field(default_factory=list)  # the most serious first
+    # What was NOT checked, and why. Shown to the reader: a pair that was left alone must not read as "no problem".
+    notes: list[str] = field(default_factory=list)
+    # (invoice id, contract or order id): this invoice is not held against that document - not here,
+    # and not in the comparison of totals that comes from the search (app/tools/contradiction.py).
+    unrelated: set[tuple[str, str]] = field(default_factory=set)
+    # Documents that belong together: (invoice, its contract or order) and (order, the contract it cites).
+    linked: set[tuple[str, str]] = field(default_factory=set)
+
+
+def _left_alone(invoice: DocumentProfile, candidate: DocumentProfile) -> str:
+    kind = _kind(candidate)
+    theirs = " and ".join(party.text or "" for party in candidate.parties if party.role != "customer")
+    return (
+        f"{invoice.filename} was not checked against the {kind} {candidate.filename}: it is issued by "
+        f"{invoice.supplier.text if invoice.supplier else 'another company'}, the {kind} names {theirs}, and the invoice "
+        f"does not quote the {kind}'s number. To have the two compared anyway, name both in the question or select just these documents."
+    )
+
+
+def compare(
+    profiles: list[DocumentProfile], *, basic: bool = False, assume_related: bool = False,
+    forced: frozenset[tuple[str, str]] | set[tuple[str, str]] = frozenset(),
+) -> Comparison:
+    """Run every check on a set of documents."""
     usable = [profile for profile in profiles if not profile.is_empty]
-    pairs: set[tuple[str, str]] = set()
-    for invoice in usable:
-        if invoice.document_type != "invoice":
-            continue
-        for reference in usable:
-            if reference.document_type not in REFERENCE_TYPES:
-                continue
-            cited = invoice.contract_reference if reference.document_type == "contract" else invoice.purchase_order_reference
-            cites_it = (
-                cited is not None and cited.text and reference.number is not None
-                and same_identifier(reference.number.text, cited.text)
-            )
-            if not cites_it and _supplier_link(invoice, reference) == "unrelated":
-                pairs.add((invoice.document_id, reference.document_id))
-    return pairs
-
-
-def compare_profiles(profiles: list[DocumentProfile], *, basic: bool = False) -> list[ProfileFinding]:
-    """Run every check on a set of documents. The most serious findings come first."""
-    usable = [profile for profile in profiles if not profile.is_empty]
-    # A credit note quotes the invoice it corrects and states a negative total: it is not an invoice to be checked.
-    invoices = [profile for profile in usable if profile.document_type == "invoice" and not profile.credit_note]
-    findings: list[ProfileFinding] = []
+    bills = [profile for profile in usable if profile.document_type == "invoice"]
+    # A credit note quotes the invoice it corrects and gives money back: it is not checked like an invoice.
+    invoices = [profile for profile in bills if not profile.credit_note]
+    result = Comparison()
+    findings = result.findings
     series: dict[str, tuple[DocumentProfile, list[DocumentProfile]]] = {}
 
-    for invoice in invoices:
+    for bill in bills:
+        if bill.credit_note:
+            result.notes.append(
+                f"{bill.filename} calls itself a credit note. Who it comes from was checked; its amounts, dates and lines "
+                "were not checked like an invoice's."
+            )
         for kind in REFERENCE_TYPES:
-            reference, mismatch = find_reference(invoice, kind, usable)
-            if mismatch is not None:
+            candidates = [profile for profile in usable if profile.document_type == kind]
+            reference, mismatch = find_reference(bill, kind, usable, assume_related=assume_related, forced=forced)
+            if mismatch is not None and not bill.credit_note:
                 findings.append(mismatch)
             if reference is not None:
-                findings += check_pair(reference, invoice, basic=basic)
-                series.setdefault(reference.document_id, (reference, []))[1].append(invoice)
+                findings += check_pair(reference, bill, basic=basic, parties_only=bill.credit_note)
+                result.linked.add((bill.document_id, reference.document_id))
+                if not bill.credit_note:
+                    series.setdefault(reference.document_id, (reference, []))[1].append(bill)
+                # It belongs to this one - so not to the others of the same kind (another contract, an
+                # earlier version of the order).
+                result.unrelated |= {
+                    (bill.document_id, other.document_id) for other in candidates if other.document_id != reference.document_id
+                }
+                continue
+            for candidate in candidates:
+                if not _cites(bill, candidate) and _supplier_link(bill, candidate) == "unrelated":
+                    result.unrelated.add((bill.document_id, candidate.document_id))
+                    if not bill.credit_note:
+                        result.notes.append(_left_alone(bill, candidate))
     for reference, group in series.values():
         findings += check_series(reference, group, basic=basic)
     findings += check_duplicates(invoices)
@@ -810,5 +1038,28 @@ def compare_profiles(profiles: list[DocumentProfile], *, basic: bool = False) ->
         if not profile.credit_note:
             findings += check_document(profile)
 
+    # An order that cites a contract belongs to it: the two totals may be compared (the order must not exceed the contract).
+    for order in usable:
+        cited = order.contract_reference if order.document_type == "purchase_order" else None
+        for contract in usable:
+            if cited is not None and contract.document_type == "contract" and _cites_number(cited, contract):
+                result.linked.add((order.document_id, contract.document_id))
+
     findings.sort(key=lambda finding: _SEVERITY_ORDER[finding.severity])  # stable: equal severities keep their order
-    return findings[:MAX_FINDINGS]
+    del findings[MAX_FINDINGS:]
+    result.notes = list(dict.fromkeys(result.notes))[:MAX_NOTES]
+    return result
+
+
+def _cites_number(cited: ProfileField, reference: DocumentProfile) -> bool:
+    return bool(cited.text and reference.number is not None and same_identifier(reference.number.text, cited.text))
+
+
+def unrelated_pairs(profiles: list[DocumentProfile]) -> set[tuple[str, str]]:
+    """(invoice id, contract or order id) for invoices that do not belong to that reference."""
+    return compare(profiles).unrelated
+
+
+def compare_profiles(profiles: list[DocumentProfile], *, basic: bool = False) -> list[ProfileFinding]:
+    """Run every check on a set of documents. The most serious findings come first."""
+    return compare(profiles, basic=basic).findings

@@ -13,7 +13,7 @@ from typing import Any
 
 from app.evaluation.corpus import Corpus
 from app.evaluation.dataset import EvalCase
-from app.numbers import number_appears
+from app.numbers import number_stated
 from app.rag.citations import normalize, numbers_not_in_source
 
 TOLERANCE = 0.01
@@ -187,7 +187,7 @@ def evaluate_case(case: EvalCase, state: dict[str, Any], corpus: Corpus, latency
     for item in state.get("evidence", []):
         page_text = corpus.page_text(item["filename"], item["page"])
         quote_ok = page_text is not None and bool(item.get("quote")) and normalize(item["quote"]) in normalize(page_text)
-        number_ok = item.get("value_number") is None or number_appears(item["value_number"], item.get("quote", ""))
+        number_ok = item.get("value_number") is None or number_stated(item["value_number"], item.get("quote", ""))
         claim_ok = page_text is not None and not numbers_not_in_source(item.get("claim", ""), page_text)
         if not (quote_ok and number_ok and claim_ok):
             unsupported.append(item.get("claim", "")[:120])

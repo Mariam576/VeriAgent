@@ -18,7 +18,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.comparison.engine import ProfileFinding, compare_profiles
+from app.comparison.engine import ProfileFinding, compare
 from app.comparison.names import compare_names, same_identifier
 from app.comparison.profile import FIELD_LABELS, PROFILED_TYPES, DocumentProfile, ProfileField
 from app.comparison.store import ProfileSource
@@ -154,7 +154,16 @@ async def compare_documents(
     if sum(profile is not None and not profile.is_empty for profile in profiles) < 2:
         notes.append("Fewer than two of these documents could be read in enough detail to compare them with each other.")
 
-    findings = compare_profiles([profile for profile in profiles if profile is not None], basic=True)
+    known = [profile for profile in profiles if profile is not None]
+    # Someone who puts ONE invoice next to a contract wants the two compared, whatever the supplier
+    # names say. With several invoices, each is checked against the contract it belongs to, and the
+    # notes say which were left alone.
+    one_invoice = sum(profile.document_type == "invoice" for profile in known) == 1
+    comparison = compare(known, basic=True, assume_related=one_invoice)
+    findings = comparison.findings
+    notes += [note.replace(" To have the two compared anyway, name both in the question or select just these documents.",
+                           " To have the two compared anyway, select just these two documents.")
+              for note in comparison.notes]
     return ComparisonOut(
         documents=[
             ComparedDocument(

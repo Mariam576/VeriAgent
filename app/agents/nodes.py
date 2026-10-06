@@ -63,7 +63,7 @@ from app.agents.assessment import (
 from app.agents.report import action_list, build_report, render_report
 from app.agents.reviewer import review_claims, reviewable
 from app.agents.state import InvestigationState
-from app.comparison.engine import Cited, ProfileFinding, compare_profiles, unrelated_pairs
+from app.comparison.engine import Cited, ProfileFinding, compare, named_pairs
 from app.comparison.profile import PROFILED_TYPES
 from app.comparison.store import ProfileSource
 from app.config import Settings
@@ -127,26 +127,9 @@ _NOTHING = {"none", "n/a", "na", "nothing", "nil", "no", "-", "not applicable", 
 NodeFunction = Callable[[Any, InvestigationState], Awaitable[dict[str, Any]]]
 
 
-def _between_unrelated(item: Contradiction, evidence: dict[str, EvidenceItem], unrelated: set[tuple[str, str]]) -> bool:
-    """Does this contradiction only hold bills against a contract or order they do not belong to?
-
-    Side A of a contradiction is the reference, side B the documents checked
-    against it. It is dropped when every document on side B is known to be
-    unrelated to every contract and purchase order on side A.
-    """
-    if item.value_a is None or item.value_b is None:
-        return False
-    items = [evidence[identifier] for identifier in item.evidence_ids if identifier in evidence]
-    checked = {
-        entry.document_id for entry in items
-        if entry.value_number is not None and abs(entry.value_number - item.value_b) < 0.005
-    }
-    references = {
-        entry.document_id for entry in items
-        if entry.value_number is not None and abs(entry.value_number - item.value_a) < 0.005
-        and entry.document_type in ("contract", "purchase_order")
-    }
-    return bool(checked) and bool(references) and all((bill, reference) in unrelated for bill in checked for reference in references)
+def _document_pairs(state: dict[str, Any], update: dict[str, Any], name: str) -> set[tuple[str, str]]:
+    """Pairs of document ids from the latest comparison (``update``), or from an earlier round (``state``)."""
+    return {(pair[0], pair[1]) for pair in update.get(name, state.get(name, [])) if len(pair) == 2}
 
 
 @dataclass
@@ -635,22 +618,23 @@ class InvestigationNodes:
         2. the document profiles: parties, reference numbers, dates and line items (app/comparison)
         """
         evidence = [EvidenceItem(**item) for item in state.get("evidence", [])]
-        contradictions = find_contradictions(evidence)
+        from_search = list(evidence)  # the comparison below adds its own evidence items to ``evidence``
         update: dict[str, Any] = {"events": [event("detect_contradictions", "Checking contradictions...")]}
 
+        detailed: list[Contradiction] = []
         if self.profiles is not None and state.get("analysis", {}).get("task_type") == "document_investigation":
             detailed = await self._compare_documents(state, evidence, update)
-            # An invoice that the profiles show to be another piece of business (another supplier, no
-            # reference to this contract) is not held against that contract's total either.
-            unrelated = {tuple(pair) for pair in update.get("unrelated_documents", state.get("unrelated_documents", []))}
-            if unrelated:
-                by_id = {item.id: item for item in evidence}
-                contradictions = [item for item in contradictions if not _between_unrelated(item, by_id, unrelated)]
-            contradictions = [item.model_copy(update={"id": f"X{index}"}) for index, item in enumerate(contradictions, start=1)]
-            contradictions += [
-                item.model_copy(update={"id": f"X{len(contradictions) + index}"})
-                for index, item in enumerate(detailed, start=1)
-            ]
+        # The profiles also say which documents belong together. An invoice from another supplier is not
+        # held against this contract's total, and two contracts are not held against each other.
+        contradictions = find_contradictions(
+            from_search,
+            unrelated=_document_pairs(state, update, "unrelated_documents"),
+            linked=_document_pairs(state, update, "linked_documents"),
+        )
+        contradictions += [
+            item.model_copy(update={"id": f"X{len(contradictions) + index}"})
+            for index, item in enumerate(detailed, start=1)
+        ]
 
         update["contradictions"] = [item.model_dump() for item in contradictions]
         update["events"].append(event("detect_contradictions", f"{len(contradictions)} contradiction(s) detected."))
@@ -697,8 +681,22 @@ class InvestigationNodes:
                 "only common layouts were understood."
             ]
 
-        findings = compare_profiles(batch.profiles)
-        update["unrelated_documents"] = [list(pair) for pair in sorted(unrelated_pairs(batch.profiles))]
+        # What the person asked for overrules what the supplier names suggest: documents that the question
+        # names together, or a single invoice selected with its contract, are compared in any case.
+        question = f"{state.get('question', '')} {state.get('standalone_question', '')}"
+        selected = set(state.get("document_ids") or [])
+        one_invoice_selected = bool(selected) and sum(
+            profile.document_type == "invoice" and profile.document_id in selected for profile in batch.profiles
+        ) == 1
+        comparison = compare(batch.profiles, assume_related=one_invoice_selected, forced=named_pairs(question, batch.profiles))
+        findings = comparison.findings
+        update["unrelated_documents"] = [list(pair) for pair in sorted(comparison.unrelated)]
+        update["linked_documents"] = [list(pair) for pair in sorted(comparison.linked)]
+        # "Not checked" must not read as "no problem": every pair that was left alone is said out loud.
+        already_said = set(state.get("limitations", [])) | set(update.get("limitations", []))
+        notes = [note for note in comparison.notes if note not in already_said]
+        if notes:
+            update["limitations"] = [*update.get("limitations", []), *notes]
         added_evidence = 0
         page_cache: dict[tuple[str, int], list[RetrievedChunk]] = {}
 
@@ -1144,7 +1142,11 @@ class InvestigationNodes:
             keep = [item for item in state.get("evidence", []) if item["id"] not in drops["evidence"]]
             update["evidence"] = keep
             kept_ids = {item["id"] for item in keep}
-            contradictions = find_contradictions([EvidenceItem(**i) for i in keep])
+            contradictions = find_contradictions(
+                [EvidenceItem(**i) for i in keep],
+                unrelated=_document_pairs(state, {}, "unrelated_documents"),
+                linked=_document_pairs(state, {}, "linked_documents"),
+            )
             # Findings from the document comparison stay as long as all their evidence survived.
             for item in state.get("contradictions", []):
                 if item.get("origin") == "profile" and set(item.get("evidence_ids", [])) <= kept_ids:

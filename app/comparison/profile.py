@@ -17,6 +17,7 @@ contracts, purchase orders and invoices.
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from typing import Literal
 
@@ -24,7 +25,8 @@ from pydantic import BaseModel, Field
 
 # Raise this number when the way profiles are built changes. Stored profiles
 # with a lower version are rebuilt the next time they are needed.
-PROFILE_VERSION = 2  # 2: adjustments (taxes, discounts, charges), credit notes, negative amounts
+PROFILE_VERSION = 3  # 2: adjustments, credit notes, negative amounts. 3: every party of a role, pro-forma
+# invoices, contracts that renew, adjustments that are not also lines.
 
 PROFILED_TYPES = ("contract", "purchase_order", "invoice")
 REFERENCE_TYPES = ("contract", "purchase_order")  # documents an invoice is checked against
@@ -37,6 +39,10 @@ MAX_DESCRIPTION_CHARS = 160
 MAX_QUOTE_CHARS = 300
 MAX_LINE_ITEMS = 60
 MAX_PARTIES = 6
+
+# "5,000 labels at £12.00 per thousand", "price per 1,000", "£3.20 per 100": a price for that many, not for one.
+# Quantity x price is then not the line amount, and nobody made a mistake.
+PER_MANY = re.compile(r"\bper\s+(?:\d[\d,.]*\d|thousand|hundred|dozen|gross)\b|/\s?(?:1,?000|100)\b(?![/\d])", re.I)
 
 
 class ProfileField(BaseModel):
@@ -99,9 +105,19 @@ class DocumentProfile(BaseModel):
     unquantified_adjustment: bool = False
     # A credit note takes money back. It quotes the invoice it corrects, so it must not be checked as an invoice.
     credit_note: bool = False
+    # A pro-forma invoice asks for payment in advance; the final invoice that follows carries the same number.
+    pro_forma: bool = False
+    # The document says that a minimum charge applies: a line may be billed above quantity x price.
+    minimum_charge: bool = False
+    # The contract says that it renews by itself: an invoice dated after the first term is then expected.
+    renews: bool = False
 
     def party(self, role: PartyRole) -> ProfileField | None:
         return next((party for party in self.parties if party.role == role), None)
+
+    def parties_with(self, role: PartyRole) -> list[ProfileField]:
+        """Every party in that role. A joint venture has two suppliers; both may send the invoice."""
+        return [party for party in self.parties if party.role == role]
 
     @property
     def supplier(self) -> ProfileField | None:

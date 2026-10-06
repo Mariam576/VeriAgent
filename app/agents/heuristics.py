@@ -154,7 +154,7 @@ def rule_based_extraction(chunks: list[RetrievedChunk]) -> EvidenceExtraction:
 # ========================================================== request analysis
 _GENERAL = re.compile(r"^\s*(?:hi|hello|hey|thanks|thank you|good (?:morning|afternoon|evening)|help|who are you|what can you do)\b[\s!.?]*$", re.I)
 _DECISION = re.compile(r"\b(?:approve|approved|approval|pay|paid|accept|accepted|reject|rejected|authori[sz]ed?|sign off)\b", re.I)
-_INVESTIGATE = re.compile(r"\b(?:review|compare|comparison|inconsisten\w*|contradict\w*|agree\w*|match\w*|verify|verification|check|approve\w*|risk\w*|audit\w*|discrepanc\w*|mismatch\w*|differ\w*)\b", re.I)
+_INVESTIGATE = re.compile(r"\b(?:review|compare|comparison|inconsisten\w*|contradict\w*|agree\w*|match\w*|verify|verification|check|approve\w*|risk\w*|audit\w*|discrepanc\w*|mismatch\w*|differ\w*|in order|in line with|legitimate|genuine|suspicious|fraud\w*)\b", re.I)
 _CALCULATE = re.compile(r"\b(?:calculate|calculation|difference|how much|percentage|percent|ratio|sum|add up|exceed\w*|variance|overcharg\w*)\b", re.I)
 _AMOUNT_TOPIC = re.compile(r"\b(?:amount|value|total|price|cost|invoice\w*|charge\w*|fee|sum|difference|exceed\w*|overcharg\w*)\b", re.I)
 _TERMS_TOPIC = re.compile(r"\b(?:payment|terms?|days|due|net)\b", re.I)

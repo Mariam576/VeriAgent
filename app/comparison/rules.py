@@ -23,9 +23,17 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 
-from app.comparison.adjustments import find_adjustments, is_credit_note
+from app.comparison.adjustments import (
+    asks_for_payment,
+    find_adjustments,
+    has_minimum_charge,
+    is_credit_note,
+    is_pro_forma,
+    not_a_line,
+    renews_automatically,
+)
 from app.comparison.dates import find_dates, months_in_text
-from app.comparison.names import LEGAL_FORMS
+from app.comparison.names import ALSO_KNOWN_AS, LEGAL_FORMS, name_tokens
 from app.comparison.profile import (
     MAX_DESCRIPTION_CHARS,
     MAX_IDENTIFIER_CHARS,
@@ -33,6 +41,7 @@ from app.comparison.profile import (
     MAX_NAME_CHARS,
     MAX_PARTIES,
     MAX_QUOTE_CHARS,
+    PER_MANY,
     DocumentProfile,
     LineItem,
     PartyRole,
@@ -104,10 +113,13 @@ _SUPPLIER_LABELS = ("from", "supplier", "vendor", "seller", "contractor", "servi
 _CUSTOMER_LABELS = ("to", "bill to", "billed to", "invoice to", "buyer", "customer", "client", "purchaser", "sold to", "ordered by", "ship to", "deliver to")
 # A purchase order is written by the buyer: there "From:" is the customer and "To:" the supplier.
 _SWAPPED_ON_AN_ORDER = {"from": "customer", "to": "supplier"}
-# "To: Accounts Payable, Northwind Facilities Ltd": the department is not the company.
-_DEPARTMENT = re.compile(
-    r"^(?:the\s+)?(?:accounts?(?:\s+(?:payable|receivable))?|finance|purchasing|procurement|billing|payables)"
-    r"(?:\s+(?:department|dept\.?|team|office|manager))?$|^(?:attn\.?|attention|f\.?a\.?o\.?|c/o)\b.*$",
+# "To: Accounts Payable, Northwind Facilities Ltd", "To: Estates Department, ...", "To: Mr J. Okafor, ...":
+# a department, a job title or a person is not the company the document is addressed to.
+_NOT_A_COMPANY = re.compile(
+    r"^(?:the\s+)?(?:accounts?(?:\s+(?:payable|receivable))?|finance|purchasing|procurement|billing|payables|estates?|"
+    r"facilities|head\s+office|[\w&' -]*\b(?:department|dept\.?|team|office|manager|director|officer|division|section|desk))$"
+    r"|^(?:attn\.?|attention|f\.?a\.?o\.?|c/o)\b.*$"
+    r"|^(?:mr|mrs|ms|miss|dr|prof)\b\.?(?:\s.*)?$",
     re.I,
 )
 _ROLE_WORDS: dict[str, PartyRole] = {
@@ -121,7 +133,11 @@ _PARTY_LABEL = re.compile(
     re.I | re.M,
 )
 _BETWEEN = re.compile(r"\bbetween\b\s*:?\s*", re.I)
-_ROLE_MARKER = re.compile(r"\(\s*(?:the\s+|each\s+a\s+)?[\"“”'‘’]?(?P<role>[A-Za-z][A-Za-z ]{2,24}?)[\"“”'‘’]?\s*\)")
+_ROLE_MARKER = re.compile(
+    r"\(\s*(?P<joint>(?:together|collectively|jointly)(?:\s+referred\s+to\s+as)?,?\s+)?(?:the\s+|each\s+a\s+)?"
+    r"[\"“”'‘’]?(?P<role>[A-Za-z][A-Za-z ]{2,24}?)[\"“”'‘’]?\s*\)"
+)
+MAX_CONTRACT_PARTIES = 4  # a client and a joint venture of three is about as far as "between A and B" goes
 _ENUMERATION = re.compile(r"\s*\(?\b(?:\d|[a-z]|i{1,3})\)\s*", re.I)
 _LEGAL_FORM = re.compile(r"\b(?:" + "|".join(LEGAL_FORMS) + r")\b\.?(?![\w-])", re.I)
 _HARD_STOPS = (",", ". ", ";", " (the", " (each", "\n", ":", " - ")
@@ -130,12 +146,15 @@ _SOFT_STOPS = (" and ", " for ", " of ", " whose ", " a company")
 _TAX_LABEL = re.compile(r"\b(?:vat|gst|sales\s+tax|tax)\b", re.I)
 _NOT_A_LINE = re.compile(
     r"\b(?:total|sub[\s-]?total|amount\s+due|balance|vat|gst|tax|deposit|discount|limit|threshold|value|"
-    r"purchase\s+order|contract|invoice|payment|terms?)\b",
+    r"purchase\s+order|contract|invoice|payment|terms?|"
+    # deductions and running totals: "Less CIS deduction", "Carried forward", "Previously invoiced", "Net amount"
+    r"deduction|retention|(?:brought|carried)\s+forward|b/f|c/f|previously\s+\w+|to\s+date|cumulative|"
+    r"(?:net|gross)\s+(?:amount|value|sum|payable|due)|equivalent)\b|^\W*(?:less|net|gross)\b",
     re.I,
 )
 _NUMBER = NUMBER_CORE + r"(?![\w]|[.,]\d)"
 _QUANTITY_LINE = re.compile(
-    rf"^\W*(?P<qty>{_NUMBER})\s*(?:x\s+)?(?P<desc>[^.:\n|]{{3,120}}?)\s+(?:at|@)\s+(?P<price>[^\s|]+(?:\s[^\s|]+)?)\s+(?:each|per\s+\w+)",
+    rf"^\W*(?P<qty>{_NUMBER})\s*(?:x\s+)?(?P<desc>[^.:\n|]{{3,120}}?)\s+(?:at|@)\s+(?P<price>[^\s|]+(?:\s[^\s|]+)?)\s+(?:each|per\s+(?:\d[\d,.]*\d|\w+))",
     re.I,
 )
 _CELL_NUMBER = re.compile(rf"^\s*(?:£|\$|€|₹)?\s*(?P<num>{_NUMBER})\s*$")
@@ -154,7 +173,7 @@ def _sentence(text: str, start: int, end: int) -> str:
     return text[left:right].strip(" \n")
 
 
-def _name_at(text: str, start: int, *, soft_stops: bool) -> tuple[str, int]:
+def _name_at(text: str, start: int, *, soft_stops: bool, _depth: int = 0) -> tuple[str, int]:
     """Read a company name that begins at ``text[start]``. Returns (name, index just after it).
 
     A name ends at its legal form ("... Ltd", "... Inc.") when one comes before any
@@ -174,6 +193,12 @@ def _name_at(text: str, start: int, *, soft_stops: bool) -> tuple[str, int]:
             break  # "(Pvt) Ltd", "Co. Ltd": keep reading until the last legal form in a row
     cut = legal.end() if legal is not None and legal.start() <= hard_cut else any_cut
     name = window[:cut].strip(" \t.,;:-\"'“”")
+    # "ABC Facilities Ltd trading as Sunshine Cleaning": the second name belongs to the same party.
+    alias = ALSO_KNOWN_AS.match(window, cut) if _depth < 2 else None
+    if name and alias and alias.end() > cut:
+        other, other_end = _name_at(text, start + alias.end(), soft_stops=soft_stops, _depth=_depth + 1)
+        if other:
+            return text[start:other_end].strip(" \t.,;:-\"'“”)")[:MAX_NAME_CHARS], other_end
     return name[:MAX_NAME_CHARS], start + cut
 
 
@@ -249,12 +274,25 @@ def _labelled_parties(pages: list[PageText], document_type: str = "invoice") -> 
         for match in _PARTY_LABEL.finditer(text):
             label = match.group("label").lower()
             name, name_end = _name_at(text, match.end(), soft_stops=False)
-            # "To: Accounts Payable, Northwind Facilities Ltd": step over the department to the company.
-            for _ in range(2):
-                if not _DEPARTMENT.match(name) or not text.startswith(",", name_end):
+            # "To: Accounts Payable, Northwind Facilities Ltd": step over the department (or the person) to
+            # the company. What follows must look like a company; otherwise the party stays unread.
+            for _ in range(3):
+                if not _NOT_A_COMPANY.match(name):
                     break
-                name, name_end = _name_at(text, name_end + 1 + (len(text[name_end + 1:]) - len(text[name_end + 1:].lstrip(" "))), soft_stops=False)
-            if len(name) < 2 or not re.search(r"[A-Za-z]", name) or _DEPARTMENT.match(name):
+                line_end = text.find("\n", match.end())
+                line_end = len(text) if line_end == -1 else line_end
+                comma = text.find(",", name_end, line_end)
+                step = comma if comma != -1 else line_end
+                start = step + 1
+                while start < len(text) and text[start] in " \t":
+                    start += 1
+                following, following_end = _name_at(text, start, soft_stops=False) if start < len(text) else ("", start)
+                looks_like_a_name = bool(following) and not re.search(r"\d", following) and comma != -1
+                if not (_LEGAL_FORM.search(following) or looks_like_a_name):
+                    name = ""
+                    break
+                name, name_end = following, following_end
+            if len(name) < 2 or not re.search(r"[A-Za-z]", name) or _NOT_A_COMPANY.match(name):
                 continue
             role: PartyRole = "supplier" if label in _SUPPLIER_LABELS else "customer"
             if document_type == "purchase_order":
@@ -264,12 +302,16 @@ def _labelled_parties(pages: list[PageText], document_type: str = "invoice") -> 
 
 
 def _contract_parties(pages: list[PageText]) -> list[ProfileField]:
-    """'... between A (the "Client") and B (the "Supplier")', with or without the roles."""
+    """'... between A (the "Client") and B (the "Supplier")', with or without the roles.
+
+    A joint venture is read too: '... and (1) B and (2) C (together the "Contractor")'
+    gives the role to both B and C.
+    """
     for page, text in _pages(pages):
         for between in _BETWEEN.finditer(text):
             parties: list[ProfileField] = []
             position = between.end()
-            for _ in range(2):
+            for _ in range(MAX_CONTRACT_PARTIES):
                 enumeration = _ENUMERATION.match(text, position)
                 if enumeration:
                     position = enumeration.end()
@@ -288,6 +330,12 @@ def _contract_parties(pages: list[PageText]) -> list[ProfileField]:
                         quote_end = name_end + marker.end()
                         separator = re.search(r"\band\b", tail[marker.end():])
                         separator_end = marker.end() + separator.end() if separator else None
+                        if marker.group("joint"):
+                            # "(together the "Contractor")": the role belongs to the parties named just before as well.
+                            for earlier in reversed(parties):
+                                if earlier.role is not None:
+                                    break
+                                earlier.role = role
                     else:
                         separator_end = separator.end() if separator else None
                 else:
@@ -301,7 +349,7 @@ def _contract_parties(pages: list[PageText]) -> list[ProfileField]:
                 position = name_end + separator_end
                 while position < len(text) and text[position] in " \t\n":
                     position += 1
-            if len(parties) == 2:
+            if len(parties) >= 2:
                 return parties
     return []
 
@@ -391,8 +439,11 @@ def _line_items(pages: list[PageText]) -> list[LineItem]:
                     rest = stripped[match.end():]
                     stated = MONEY.search(rest) if re.match(r"\s*[:=,]", rest) else None  # "... each: $8,200"
                     stated_amount = money_amount(stated) if stated else None
+                    # "at £12.00 per 1,000": the quantity and the line total are kept, the price is not a unit price.
+                    per_many = PER_MANY.search(match.group(0))
                     add(
-                        match.group("desc"), quantity[0], _unit_price(price, quantity[0], stated_amount),
+                        match.group("desc"), quantity[0],
+                        None if per_many else _unit_price(price, quantity[0], stated_amount),
                         stated_amount, money_currency(price) or None, page,
                         stripped[: stated.end() + match.end()] if stated else match.group(0),
                     )
@@ -409,8 +460,17 @@ def _line_items(pages: list[PageText]) -> list[LineItem]:
 
 def enrich(profile: DocumentProfile, pages: list[PageText]) -> DocumentProfile:
     """Add what code finds in the text of every document, however the rest of the profile was built."""
-    profile.adjustments, profile.unquantified_adjustment = find_adjustments(pages)
-    profile.credit_note = profile.document_type == "invoice" and is_credit_note(pages)
+    adjustments, profile.unquantified_adjustment = find_adjustments(pages)
+    # A line item is what is billed. Read a second time as "a charge that explains the total" it would explain anything.
+    profile.adjustments = [value for value in adjustments if not_a_line(value, profile.line_items)]
+    profile.minimum_charge = has_minimum_charge(pages)
+    if profile.document_type == "invoice":
+        # A credit note says so in its heading - and does not ask for money. "CREDIT NOTE" over a positive
+        # "Total amount due" is checked like any other invoice.
+        profile.credit_note = is_credit_note(pages) and not asks_for_payment(profile.total)
+        profile.pro_forma = is_pro_forma(pages)
+    elif profile.document_type == "contract":
+        profile.renews = renews_automatically(pages)
     return profile
 
 
@@ -437,8 +497,8 @@ def build_profile_with_rules(
     if document_type == "contract" or not parties:
         parties = _contract_parties(pages) or parties
     unique: list[ProfileField] = []
-    for party in parties:  # one supplier, one customer; parties without a role are all kept
-        if party.role is None or all(other.role != party.role for other in unique):
+    for party in parties:  # every party is kept (a joint venture has two suppliers); a name said twice counts once
+        if all((other.role, name_tokens(other.text)) != (party.role, name_tokens(party.text)) for other in unique):
             unique.append(party)
     profile.parties = unique[:MAX_PARTIES]
 

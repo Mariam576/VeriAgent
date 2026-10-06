@@ -37,7 +37,10 @@ export function CompareView({ documentIds, onClose }: { documentIds: string[]; o
             Differences found <span className="count">{result.findings.length}</span>
           </h3>
           {result.findings.length === 0 ? (
-            <p className="muted">No differences between the facts these documents state. A person should still read them.</p>
+            <p className="muted">
+              The checks that were run found nothing{result.notes.length > 0 ? " - see the notes above for what was not checked" : ""}. Rows marked in
+              the table below differ between the documents; a person should still read them.
+            </p>
           ) : (
             result.findings.map((finding, index) => (
               <Expandable key={index} title={finding.description} badge={<RiskBadge level={finding.severity} />} defaultOpen={index === 0}>

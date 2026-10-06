@@ -88,25 +88,94 @@ def numbers_in_text(text: str) -> list[float]:
     return values
 
 
-def number_appears(value: float, text: str) -> bool:
-    """Is ``value`` written somewhere in ``text``, in any supported format?"""
-    tokens = [token for token, _, _ in find_number_tokens(text)]
+# The currency codes read in front of or behind an amount. A fixed list on purpose: "any three capital
+# letters" would also read "INV 102" and "VAT 20" as money. The rarer ones only count in capitals
+# ("cad 40" is forty drawings, not forty Canadian dollars).
+CURRENCY_CODES = "GBP|USD|EUR|PKR|INR|AED|SAR|(?-i:KWD|QAR|BHD|OMR|CAD|AUD|NZD|CHF|JPY|CNY|SGD|HKD|ZAR|SEK|NOK|DKK)"
+
+# "USD 1.2 million", "£40k", "£1.5m": a number with a word or letter that multiplies it. The short
+# letters only count directly behind an amount of money - "1.5m" of cable is a length.
+_SCALES = {
+    "k": 1e3, "thousand": 1e3, "m": 1e6, "mn": 1e6, "mio": 1e6, "million": 1e6, "bn": 1e9, "billion": 1e9,
+    "lakh": 1e5, "lakhs": 1e5, "crore": 1e7, "crores": 1e7,
+}
+SCALE_WORDS = r"thousand|million|billion|mio|lakhs?|crores?"
+_SCALED = re.compile(
+    rf"(?:(?P<money>[£$€₹]|\b(?:{CURRENCY_CODES}|Rs\.?))\s?)?(?<![\w.,])(?P<num>{NUMBER_CORE})"
+    rf"(?:(?P<short>k|m|mn|bn)(?!\w)|\s?(?P<word>{SCALE_WORDS})\b)",
+    re.I,
+)
+
+
+def scaled_numbers(text: str) -> list[float]:
+    """The values of numbers written with a multiplier: "USD 1.2 million" -> [1200000.0]."""
+    values = []
+    for match in _SCALED.finditer(text):
+        short = match.group("short")
+        if short and not match.group("money"):
+            continue
+        scale = _SCALES[(short or match.group("word")).lower()]
+        values += [reading * scale for reading in parse_number(match.group("num"))]
+    return values
+
+
+def _token_states(token: str, value: float) -> bool:
+    if any(abs(candidate - value) < 0.005 for candidate in parse_number(token)):
+        return True
+    # Last resort for whole numbers in an unusual grouping ("12,50,000.00", "1.50.000"): compare the
+    # bare digits. Only for tokens that are grouped thousands - every group after the first has two
+    # or three digits and the last one three. "12,50" (twelve and a half) and "1,234.56" are not
+    # 1250 and 123456, and must not pass as them.
+    if float(value).is_integer():
+        whole = re.sub(r"[.,]0+$", "", token)
+        groups = re.split(rf"[,.'{_SPACES}]", whole)
+        grouped = len(groups) >= 2 and all(len(group) in (2, 3) for group in groups[1:]) and len(groups[-1]) == 3
+        if grouped and "".join(groups) == str(int(abs(value))):
+            return True
+    return False
+
+
+_SCALE_FOLLOWS = re.compile(rf"\s?(?:{SCALE_WORDS})\b", re.I)
+
+
+def _tokens_with_columns(text: str) -> list[tuple[str, int, int]]:
+    # "1.2 million" states one million two hundred thousand, not 1.2: such a token only counts with its multiplier.
+    tokens = [token for token in find_number_tokens(text) if not _SCALE_FOLLOWS.match(text, token[2])]
     # "5 250 1,250.00" may be one number with spaces as separators, or the columns of a table row
     # (quantity 5, price 250, amount 1,250.00). For "is it written there?" both readings count.
-    tokens += [part.group(0) for token in tokens if re.search(rf"[{_SPACES}]", token) for part in re.finditer(r"\d+(?:[.,]\d+)*", token)]
-    for token in tokens:
-        if any(abs(candidate - value) < 0.005 for candidate in parse_number(token)):
+    for token, start, _ in list(tokens):
+        if re.search(rf"[{_SPACES}]", token):
+            tokens += [(part.group(0), start + part.start(), start + part.end()) for part in re.finditer(r"\d+(?:[.,]\d+)*", token)]
+    return tokens
+
+
+def number_appears(value: float, text: str) -> bool:
+    """Is ``value`` written somewhere in ``text``, in any supported format?"""
+    if any(_token_states(token, value) for token, _, _ in _tokens_with_columns(text)):
+        return True
+    return any(abs(scaled - value) <= max(0.005, abs(value) * 1e-9) for scaled in scaled_numbers(text))
+
+
+_MINUS_BEFORE = re.compile(r"[-−–]\s?(?:[£$€₹]|[A-Za-z]{2,3}\.?)?\s?$")
+_CREDIT_AFTER = re.compile(r"\s?(?:-|−|cr\b|credit\b)", re.I)
+
+
+def number_stated(value: float, text: str) -> bool:
+    """Like ``number_appears``, and a negative value must be written as negative.
+
+    "-£1,200", "£-1,200", "(£1,200)", "1,200-" and "£1,200 CR" state minus
+    1,200. A plain "£1,200" does not: a model that reads a charge as a credit
+    (or the other way round) must not get that past the check.
+    """
+    if value >= 0:
+        return number_appears(value, text)
+    for token, start, end in _tokens_with_columns(text):
+        if not _token_states(token, -value):
+            continue
+        before, after = text[max(start - 6, 0):start], text[end:end + 8]
+        in_brackets = "(" in before[-3:] and after.lstrip().startswith(")")
+        if _MINUS_BEFORE.search(before) or in_brackets or _CREDIT_AFTER.match(after):
             return True
-        # Last resort for whole numbers in an unusual grouping ("12,50,000.00", "1.50.000"): compare the
-        # bare digits. Only for tokens that are grouped thousands - every group after the first has two
-        # or three digits and the last one three. "12,50" (twelve and a half) and "1,234.56" are not
-        # 1250 and 123456, and must not pass as them.
-        if float(value).is_integer():
-            whole = re.sub(r"[.,]0+$", "", token)
-            groups = re.split(rf"[,.'{_SPACES}]", whole)
-            grouped = len(groups) >= 2 and all(len(group) in (2, 3) for group in groups[1:]) and len(groups[-1]) == 3
-            if grouped and "".join(groups) == str(int(abs(value))):
-                return True
     return False
 
 

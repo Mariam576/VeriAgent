@@ -358,6 +358,45 @@ def corpora() -> dict[str, Corpus]:
                 ],
             ),
             Corpus(
+                "look_alike_without_reference",
+                [
+                    _MAINTENANCE_CONTRACT,
+                    _doc(
+                        "Invoice_358.txt",
+                        """INVOICE Invoice No. INV-358. Invoice date: 14 March 2026. From: Redbridge Lift Services
+                        Ltd. To: Harlow Print Works Ltd. Lift maintenance, annual. Total amount due: £58,000.
+                        Payment terms: 30 days from the date of invoice.""",
+                    ),
+                ],
+            ),
+            Corpus(
+                "two_contracts",
+                [
+                    _MAINTENANCE_CONTRACT,
+                    _doc(
+                        "Invoice_311.txt",
+                        """INVOICE Invoice No. INV-311. Invoice date: 20 February 2026. From: Redbridge Lifts Ltd.
+                        To: Harlow Print Works Ltd. Contract reference: MC-2026-011. Lift maintenance, annual:
+                        £40,000. Total amount due: £40,000. Payment terms: 30 days from the date of invoice.""",
+                    ),
+                    _doc(
+                        "Cleaning_Contract.txt",
+                        """CLEANING CONTRACT Contract No. CC-2026-004. This contract is made on 12 January 2026
+                        between Harlow Print Works Ltd (the "Client") and Fenwick Cleaning Services Ltd (the
+                        "Supplier") for daily office cleaning.""",
+                        """3. Charges. 3.1 The total contract value is £18,000 for the Term, exclusive of VAT.
+                        3.2 Payment terms: 30 days from the date of invoice.""",
+                    ),
+                    _doc(
+                        "Invoice_77.txt",
+                        """INVOICE Invoice No. INV-77. Invoice date: 25 February 2026. From: Fenwick Cleaning
+                        Services Ltd. To: Harlow Print Works Ltd. Contract reference: CC-2026-004. Office
+                        cleaning, annual: £18,000. Total amount due: £18,000. Payment terms: 30 days from the
+                        date of invoice.""",
+                    ),
+                ],
+            ),
+            Corpus(
                 "discount_and_tax",
                 [
                     _doc(
@@ -554,6 +593,22 @@ CASES: list[EvalCase] = [
         "Check invoice INV-903 for errors.",
         statuses=("no_issues_found",), risk_levels=("low",), contradictions=(),
         note="Lines of £1,000, a discount of £100 and VAT of £180 give the stated £1,080: the page explains itself.",
+    ),
+    EvalCase(
+        "comparison_look_alike_supplier_without_a_reference", "comparison", "look_alike_without_reference",
+        "Review invoice INV-358 against the maintenance contract.",
+        statuses=("review_required",), risk_levels=("high", "critical"), contradictions=("amount_mismatch", "party_mismatch"),
+        answer_contains=("Redbridge Lift Services Ltd", "Redbridge Lifts Ltd"), human_review=True,
+        note=(
+            "The invoice does not quote the contract number and comes from a name that only resembles the contract "
+            "supplier's. Leaving it alone as 'another supplier's business' would be exactly what a look-alike hopes for."
+        ),
+    ),
+    EvalCase(
+        "comparison_two_contracts_each_with_its_invoice", "comparison", "two_contracts",
+        "Do the invoices from our suppliers match their contracts?",
+        statuses=("no_issues_found",), risk_levels=("low",), contradictions=(),
+        note="Two contracts and two invoices that match them exactly. £18,000 and £40,000 are two pieces of business, not a contradiction.",
     ),
     # ------------------------------------------------------------- forensics
     EvalCase(
