@@ -21,11 +21,28 @@ Version 2:
 - [Milestone 12: streaming](#milestone-12-streaming)
 - [Milestone 13: evaluation](#milestone-13-evaluation)
 - [Milestone 14: the interface](#milestone-14-the-interface)
+
+Version 3:
+
+- [Milestone 15: sign-in](#milestone-15-sign-in)
+- [Milestone 16: document comparison](#milestone-16-document-comparison)
+- [Milestone 17: file forensics](#milestone-17-file-forensics)
+- [Milestone 18: the independent reviewer](#milestone-18-the-independent-reviewer)
+- [Milestone 19: actions through MCP](#milestone-19-actions-through-mcp)
+- [Milestone 20: background jobs and upkeep](#milestone-20-background-jobs-and-upkeep)
+- [Milestone 21: the React interface](#milestone-21-the-react-interface)
+- [Milestone 22: deployment](#milestone-22-deployment)
+
+Looking back:
+
 - [What the Version 2 review found](#what-the-version-2-review-found)
-- [Concepts planned for Version 3](#concepts-planned-for-version-3)
+- [What three rounds of review taught in Version 3](#what-three-rounds-of-review-taught-in-version-3)
+- [What is still open](#what-is-still-open)
 - [Interview questions](#interview-questions)
 
 All commands assume the stack is running (`docker compose up`) and are typed in a second PowerShell window in the project folder.
+
+Since Version 3 the API asks who you are. The "Try it" steps that call the API directly are easiest on <http://localhost:8000/docs>: sign in with `POST /auth/login`, copy the `access_token` from the answer, press **Authorize** and paste it. For quick experiments you can instead set `AUTH_MODE=dev` in `.env`, which believes an `X-User-Id` header as Versions 1 and 2 did. Never use that mode on a machine other people can reach.
 
 ---
 
@@ -335,14 +352,16 @@ Then look at `GET /investigations`, restart the API (`docker compose restart api
 **Try it:**
 
 ```powershell
-curl.exe -N -X POST http://localhost:8000/investigations/stream -H "Content-Type: application/json" -d '{\"question\": \"Compare the invoice with the contract.\"}'
+docker compose exec api python -m scripts.run_demo --email you@example.com
 ```
+
+The lines that appear one by one are the events of the stream. In the browser, open the developer tools (F12), the Network tab, ask a question in the interface and click the request named `stream`.
 
 ---
 
 ## Milestone 13: evaluation
 
-**What was built:** 30 cases with known right answers, and the metrics that summarise how the agent did on them.
+**What was built:** cases with known right answers (30 in Version 2, 46 now), and the metrics that summarise how the agent did on them.
 
 | File | Role |
 | --- | --- |
@@ -362,21 +381,190 @@ curl.exe -N -X POST http://localhost:8000/investigations/stream -H "Content-Type
 
 ## Milestone 14: the interface
 
-**What was built:** a Streamlit page with documents and history on the left, the chat in the middle and the result on the right.
+**What was built:** in Version 2, a Streamlit page with documents and history on the left, the chat in the middle and the result on the right. Version 3 replaced it with a React interface that keeps the same layout (Milestone 21). The three ideas it taught still hold.
+
+**Concept: the interface is just another client.** It never imports the agent or opens the database. Everything it shows comes from the HTTP API. That is why the interface could be replaced in Version 3 without touching the agent.
+
+**Concept: where state lives.** Streamlit runs the whole script again on every click and keeps what must survive in `st.session_state`. React keeps state in components and redraws only what changed. Either way the question is the same: what must survive a click, and what must survive a reload? In VeriAgent a reload loses nothing that matters, because the server holds every report.
+
+**Concept: output is an attack surface too.** Streamlit renders strings as Markdown. A document containing `![x](http://attacker/pixel.png)` would make the browser call that address as soon as the report is shown. Text from documents must always be displayed as text.
+
+---
+
+## Milestone 15: sign-in
+
+**What was built:** accounts with email and password or Google, replacing the `X-User-Id` placeholder.
 
 | File | Role |
 | --- | --- |
-| `ui/app.py` | The page. |
-| `ui/api_client.py` | Every call to the API, including reading the event stream. |
-| `ui/safe_text.py` | Makes text from documents display literally. |
+| `app/api/auth.py` | Register, sign in, Google, refresh, sign out, change password, delete account. |
+| `app/security/passwords.py` | argon2 hashing in a small queue. |
+| `app/security/tokens.py` | Access tokens (JWT) and the signing key. |
+| `app/security/google.py` | Checks a Google ID token against Google's public keys. |
+| `app/security/rate_limit.py` | A sliding-window counter. |
+| `app/security/permissions.py` | `get_current_user`: the one place every endpoint asks "who is this?". |
 
-**Concept: the interface is just another client.** It never imports the agent or opens the database. Everything it shows comes from the HTTP API, so a different frontend can replace it without touching the backend.
+**Concept: never store a password.** Store a slow, salted hash (argon2). Slow on purpose: someone who steals the table must spend real time per guess. The same slowness is a way to exhaust your server, so hashing runs in a queue with a limit.
 
-**Concept: reruns and session state.** Streamlit runs the whole script again on every click. What must survive (the chat, the report on screen) lives in `st.session_state`.
+**Concept: two tokens.** An **access token** is a signed note: "this is user X, valid for 30 minutes". The server checks the signature and needs no database lookup for the proof. It is short-lived because it cannot be taken back. A **refresh token** is a random string stored (hashed) in the database and kept by the browser in a cookie that scripts cannot read. It lives long, and can be revoked.
 
-**Concept: output is an attack surface too.** Streamlit renders strings as Markdown. A document containing `![x](http://attacker/pixel.png)` would make the browser call that address as soon as the report is shown. Every string from the API passes through `plain()` first.
+**Concept: rotation and reuse detection.** Every use of a refresh token replaces it with a new one. If an old one ever comes back, two parties hold copies and one of them is a thief. You cannot tell which, so the whole family of sessions ends.
 
-**Try it:** open <http://localhost:8501>, upload the samples, ask the demo question, open a contradiction card and read the quote under "Evidence".
+**Concept: taking tokens back.** A signed token stays valid until it expires. VeriAgent puts a version number in it and keeps the current number on the account. Changing the password or signing out raises the number, and every older token stops working.
+
+**Concept: check, then act, is a race.** "Read the password hash, verify, write the new hash" is three steps. Two requests can interleave between them. The reviews found several such races (a stolen session slipping a fresh token past a password change; two changes at once). The fix is always to make the database do the check and the write in one step: `UPDATE ... WHERE password_hash IS NOT DISTINCT FROM :the_one_i_checked`, or `SELECT ... FOR UPDATE` to hold the row.
+
+**Concept: count before you check.** A limiter that counts a wrong password after checking it lets a hundred simultaneous guesses through, because all of them were checked before any was counted. Count first, give the count back on success.
+
+**Try it:** sign in at <http://localhost:8000/docs> with `POST /auth/login`, copy the `access_token`, press **Authorize**. Then change your password and see the old token refused.
+
+---
+
+## Milestone 16: document comparison
+
+**What was built:** a structured profile per contract, order and invoice, and a rule engine that compares them.
+
+| File | Role |
+| --- | --- |
+| `app/comparison/profile.py` | The profile: parties, numbers, dates, totals, lines, each with page and quote. |
+| `app/comparison/llm.py` / `rules.py` | Two readers that fill a profile: with a model, and without one. |
+| `app/comparison/adjustments.py` | Finds tax, discounts, charges and deposits on a page. |
+| `app/comparison/names.py`, `dates.py` | Is this the same company? The same day? |
+| `app/comparison/engine.py` | Every check. No model. |
+
+**Concept: extract once, compare in code.** Asking a model "do these two documents agree?" gives a different answer each time and no way to test it. Asking it "what does this document say?", checking each answer against the page, and then comparing in Python gives findings that are repeatable and explainable.
+
+**Concept: a checker's false alarms cost more than its misses.** A tool that accuses an honest supplier three times will not be believed the fourth time. The first review fed the engine ordinary documents (a partial delivery, two taxes, a deposit) and got accusations. The rule that came out: *do not accuse what you do not model.*
+
+**Concept: every exemption is a hiding place.** The second review turned each piece of leniency into a way to hide: "small charges are ignored" hid a large one, "different supplier names are skipped" hid a look-alike supplier. The rule: *leniency needs bounds, and silence needs a reason.* Whatever is not checked is named in the report.
+
+**Concept: a document's word about itself is a claim.** An invoice that says "trading as Redbridge Lifts" has not proven it. The contract saying so would. The third review's rule: *a guess gives way to knowledge*, and what a party says about itself is not knowledge.
+
+**Try it:** in the interface tick `Contract.pdf` and `Invoice_102.pdf`, press **Compare**. Then read `tests/test_comparison_review.py`: every test is a small business situation.
+
+---
+
+## Milestone 17: file forensics
+
+**What was built:** an inspection of every uploaded file for signs of editing and for text a reader cannot see.
+
+| File | Role |
+| --- | --- |
+| `app/forensics/pdf.py` | Draws each page twice and compares the pictures. |
+| `app/forensics/docx.py` | Resolves Word formatting the way Word does. |
+| `app/forensics/analyze.py` | Turns indicators into a level and a score. |
+
+**Concept: the text layer is not the page.** A PDF is a list of drawing commands. "Extract the text" returns every text command, also those drawn in white, behind a box, in a switched-off layer or outside the page. A model that reads the extraction reads things no human reviewer was shown. That is a prompt-injection channel and a way to plant evidence.
+
+**Concept: a deny-list loses.** The first version listed tricks: white text, tiny text, text behind rectangles. The review hid text in nine other ways within the hour (a white ellipse, 6% opacity, a white picture). There will always be a tenth.
+
+**Concept: ask the picture.** The fix inverts the question. Do not ask "which trick was used?", ask "what did this character change on the page?". Draw the page with text and without, and compare. A character that left no ink of its own is hidden, whatever the reason. One rule replaces the list.
+
+**Concept: an indicator is not proof.** "Saved by an editing program" is true of many honest files. The result is a level with reasons, shown to a person. It raises the risk; it never decides.
+
+**Try it:** upload `samples/forensics/Invoice_205_altered.pdf` and click its name. Then open the file in a PDF reader and try to find the covered £10,000 yourself.
+
+---
+
+## Milestone 18: the independent reviewer
+
+**What was built:** a second model call that reads each extracted statement next to its quote and judges whether one follows from the other.
+
+| File | Role |
+| --- | --- |
+| `app/agents/reviewer.py` | The prompt, the verdicts, and what is done with them. |
+
+**Concept: what code cannot check.** Code can prove that a quote is on the page and that the number is in the quote. It cannot tell that "the subtotal is £40,000" was turned into "the total is £40,000". That is a question about meaning.
+
+**Concept: independence.** A model asked to check its own answer tends to agree with itself, especially when it sees its own reasoning. The reviewer gets only the statement and the quote, and a narrow question. A different model (`REVIEWER_MODEL`) is more independent still.
+
+**Concept: this is the one place a second "agent" earns its cost.** The spec warns against multiple agents without a purpose. Here the purpose is exactly the one that justifies it: a view that does not share the first one's mistakes.
+
+**Try it:** set `ENABLE_CLAIM_REVIEW=false`, restart, run the demo, and compare the number of LLM calls in the trace.
+
+---
+
+## Milestone 19: actions through MCP
+
+**What was built:** after approval, VeriAgent can create an issue in a ticket list or in GitHub.
+
+| File | Role |
+| --- | --- |
+| `app/actions/proposals.py` | Builds the issue text from the stored findings. |
+| `app/actions/client.py` | Speaks MCP: list tools, call a tool. |
+| `app/actions/ticket_server.py` | A small MCP server of our own. |
+| `app/actions/runner.py` | Runs an approved action exactly once and records the outcome. |
+
+**Concept: MCP.** The Model Context Protocol is a standard way for a program to offer tools: a server lists its tools with a schema, a client calls them. The same client code talks to our own ticket server (a child process, over stdin and stdout) and to GitHub's server (over HTTPS). Swapping the target is configuration.
+
+**Concept: a tool with side effects is a different kind of thing.** A calculator can be called freely. Creating an issue cannot be undone and is seen by other people. So: the text is written by code, not by the model; a person reads the exact text before it is sent; only one tool is allowed; and it runs once.
+
+**Concept: "unknown" is an outcome.** If the request was sent and no answer came, the issue may or may not exist. Recording that as "failed" invites a retry that creates a second one. VeriAgent records "unknown" and tells the person to look.
+
+**Try it:** approve the demo investigation with the ticket box ticked, then `docker compose exec api cat data/tickets.jsonl`.
+
+---
+
+## Milestone 20: background jobs and upkeep
+
+**What was built:** uploads that are processed after the answer was sent, and an hourly clean-up.
+
+| File | Role |
+| --- | --- |
+| `app/jobs.py` | A small job runner on asyncio: a limit on how many run at once, periodic jobs, a clean shutdown. |
+| `app/maintenance.py` | Expired sign-ins, stale saved state, stuck documents. |
+
+**Concept: answer first, work later.** Reading and embedding a large file takes longer than a person wants to watch a spinner. The upload answers `202 Accepted` with the document in the state "processing"; the client asks again later.
+
+**Concept: the smallest thing that works.** The usual answer is a queue (Redis, Celery) and a worker service. That is right when work must survive a crash or spread over machines. Here a job that dies with the process is found by the upkeep task and marked failed, and the person uploads again. One process, no new technology.
+
+**Try it:** upload a file in the interface and watch its label change from "processing" to its type.
+
+---
+
+## Milestone 21: the React interface
+
+**What was built:** a React and TypeScript interface, built by Vite and served by the API itself.
+
+| File | Role |
+| --- | --- |
+| `frontend/src/api/client.ts` | Every call to the API; keeps the access token in memory and renews it. |
+| `frontend/src/api/sse.ts` | Reads the event stream. |
+| `frontend/src/components/` | One file per part of the screen. |
+| `app/web.py` | Serves the built files with security headers. |
+
+**Concept: where a token may live.** `localStorage` can be read by any script on the page, so one injected script would steal the session. The access token lives in a variable; the refresh token in a cookie that scripts cannot read. After a reload the variable is empty and the cookie gets a new token.
+
+**Concept: one origin.** The API serves the interface, so both have the same address. No CORS rules are needed, and the cookie can be `SameSite=Strict`.
+
+**Concept: a content security policy.** A response header tells the browser which sources of script it may run. With "only our own files", an injected `<script>` does nothing even if a bug lets it into the page.
+
+**Concept: a build step.** The browser cannot run TypeScript or JSX. Vite turns `frontend/src` into three plain files in `frontend/dist`. The Dockerfile does this in a first stage with Node and copies only the result into the Python image.
+
+**Try it:** `cd frontend; npm install; npm run dev` starts a development server that reloads on every save (the API must be running on port 8000).
+
+---
+
+## Milestone 22: deployment
+
+**What was built:** a description of the service for Render, support for a hosted database, and start-up checks.
+
+| File | Role |
+| --- | --- |
+| `render.yaml` | The service, its settings, and which values are secrets. |
+| `app/database/urls.py` | Turns one connection string into what two database drivers need. |
+| `app/startup.py` | Refuses to start with settings that cannot work together. |
+| `docs/DEPLOYMENT.md` | The step-by-step guide. |
+
+**Concept: configuration comes from the environment.** The same image runs on your PC and on a host. Only environment variables differ. Secrets are typed into the host, never committed.
+
+**Concept: HTTPS ends at the proxy.** The host's proxy speaks HTTPS to the browser and plain HTTP to the container. The application must be told to believe the proxy's "this came over HTTPS" header, and must not believe it anywhere else, because a visitor can send the same header.
+
+**Concept: fail at start, not at the first request.** A wrong setting that shows up at midnight during the first sign-in is expensive. `app/startup.py` checks combinations when the process starts and says in plain words what to change.
+
+**Concept: free hosting shapes the design.** No permanent disk: files are deleted after processing and everything lives in the database. 512 MB of memory: no PyTorch, embeddings come from an API. A service that sleeps: nothing may depend on being awake.
+
+**Try it:** follow `docs/DEPLOYMENT.md`.
 
 ---
 
@@ -394,13 +582,26 @@ As after Version 1, a second reviewer tried to break the system. Each item has a
 
 ---
 
-## Concepts planned for Version 3
+## What three rounds of review taught in Version 3
 
-- **MCP.** A standard way to give the agent tools that live in other systems, for example creating a ticket after approval. Every such tool has side effects, so it would sit behind the human approval step.
-- **Document forensics.** Today a quote is checked, not its author. A supplier's letter that says "approved by the Finance Director" counts as an approval statement. Deciding how much to trust a source is the next step.
-- **A reranking model.** Reranking is rule-based. A cross-encoder model that reads the question and the chunk together ranks better and costs more.
-- **Background workers.** An interrupted run continues only when someone resumes it. A worker queue would do that by itself and let uploads be processed outside the request.
-- **Authentication.** `X-User-Id` is a placeholder. Everything already filters by the current user, so only `get_current_user` has to change.
+After Version 3 was built, independent reviewers who had not seen the code being written tried to break three parts of it: sign-in, the comparison and the forensic check. Then a second group reviewed the fixes, and a third group reviewed those. Each finding became a test (`tests/test_*_review.py`, `tests/test_*_second_review.py`, `tests/test_*_third_review.py`).
+
+- **A fix is new code, and new code has defects.** The second round found that fixes of the first had gone too far (a decorative background turned a typed page into "a scan") or had opened a gap. The third round found a guess, added at the last minute of the second, that let an over-billed invoice pass. Review the fix, not only the original.
+- **Lists of bad things lose to one question about the result.** See Milestone 17. The same idea fixed the quote check: not "which characters may a quote skip?" but "is this, read as a person reads it, one statement on the page?".
+- **Both kinds of error matter.** Every round reported things that were missed *and* honest cases that were accused. A fix for one kind is tested against the other: the forensic tests keep a set of honest pages that must stay clean.
+- **Silence must be distinguishable from "all clear".** A report that says nothing about two documents might mean they agree, or that they were never compared. Now it says which.
+- **Concurrency bugs do not show up in tests that run one request at a time.** The sign-in races were found by reading the code and asking "what if a second request arrives between these two lines?".
+- **Reviews do not converge to zero.** The third round still found 34 issues. At some point the honest move is to fix what can be fixed properly, write down the rest as known limits (see the README), and keep a person in the loop. That is a design decision, not a defeat: the whole system assumes its own checks can be wrong.
+
+---
+
+## What is still open
+
+- **OCR.** Scanned documents are not read, and a font that draws one character while reporting another cannot be caught without reading the picture.
+- **A reranking model.** Reranking is rule-based. A cross-encoder model that reads the question and the chunk together ranks better and needs more memory than free hosting has.
+- **Real-model evaluation.** The 46 cases have only been run with the offline stand-in. Until they run with Gemini, the numbers describe the guardrails, not the agent.
+- **More than one process.** Limits, background jobs and the guard against running one investigation twice live in memory. Several processes need shared counters and a queue.
+- **Email.** Without it there is no password reset and no proof that an address belongs to the person who typed it.
 
 ---
 
@@ -452,7 +653,7 @@ One graph with ordinary nodes does the job. More agents add cost, latency and fa
 Set `LLM_PROVIDER=grok` with its key and model. Only `app/llm/factory.py` knows which provider is in use.
 
 **How do you evaluate the system?**
-With 30 cases whose expected outcomes were worked out by hand, in six categories, and the metrics of the specification. Hallucinated citations, unsupported claims, crashes and successful injections are hard targets: one of them makes the run fail. A crashed case counts as failed in every rate.
+With 46 cases whose expected outcomes were worked out by hand, in eight categories, and the metrics of the specification. Some cases are ordinary business that must not be reported. Hallucinated citations, unsupported claims, crashes and successful injections are hard targets: one of them makes the run fail. A crashed case counts as failed in every rate.
 
 **What is checkpointing and why PostgreSQL?**
 After every node the graph state is saved under a thread id. In memory it would be lost on restart; in PostgreSQL an investigation can wait days for a decision and be continued by a different process.
@@ -479,4 +680,25 @@ Vector search finds meaning and misses exact codes; keyword search is the revers
 Only fixed progress sentences, tool names with a status and the final report are sent. Nodes announce themselves by name; nothing the model produced is forwarded until it has been validated and assembled into the report.
 
 **How would you deploy it?**
-The API and the interface are stateless containers and PostgreSQL holds all state, including paused investigations, so it suits any container platform with a managed PostgreSQL that has pgvector. Before that: real authentication, secrets from a secret store, migrations with Alembic, a worker queue for resuming and for uploads, and a database-level lock per investigation so that several API processes can run safely.
+It is one stateless container (API and interface) and PostgreSQL holds all state, including paused investigations, so it suits any container platform with a managed PostgreSQL that has pgvector. `render.yaml` and `docs/DEPLOYMENT.md` do it on free plans. To run several containers, the in-memory limits and the job list would move into the database or Redis, and migrations would move to Alembic.
+
+**How does sign-in work?**
+A password is stored as an argon2 hash. Signing in returns a short-lived signed access token, kept in memory by the browser, and sets a long-lived refresh token in a cookie scripts cannot read. Each refresh replaces the refresh token; one that is used twice ends the whole session family. A version number in the access token lets a password change or sign-out end every token at once.
+
+**Why not keep the token in localStorage?**
+Any script on the page can read it, so one injected script steals the session. A variable is gone after a reload, and the cookie, which scripts cannot read, gets a new token.
+
+**How do you find hidden text in a PDF?**
+Each page is drawn twice, with and without its text, and the pictures are compared. A character that left no ink of its own is hidden, whatever trick was used. Hidden text is reported and never passed to the model.
+
+**Why compare documents with rules and not with the model?**
+The model reads each document once into a profile whose every field is checked against the page. Comparing profiles in code gives the same answer every time, can be tested case by case, and can say why.
+
+**What is MCP and how do you keep it safe?**
+A standard protocol through which a program offers tools. VeriAgent uses it for the one thing with an effect outside the system, creating an issue. The text is built by code from stored findings, a person reads it and approves it, one tool is on the allowlist, and an unanswered request is recorded as "unknown" instead of being retried.
+
+**Is the reviewer a second agent?**
+It is a second model call with a narrow question: does this statement follow from this quote? It sees neither the first call's reasoning nor the rest of the investigation. That independence is the purpose; without it, a second call would only add cost.
+
+**What did the reviews find that tests did not?**
+Things nobody thought to test: honest documents that were accused, exemptions used as hiding places, two requests arriving between two lines of code. Tests check what the author thought of. A reviewer who did not write the code thinks of other things.

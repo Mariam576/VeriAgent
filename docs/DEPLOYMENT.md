@@ -53,6 +53,25 @@ PyTorch alone needs more memory than the free plan has, so the hosted version as
 the Gemini API for embeddings instead. The application without PyTorch was measured
 at about 200 MB.
 
+## Before you start: check it on your PC
+
+A deployment that fails is slower to debug than a PC that fails. Two checks first:
+
+1. The version you are about to push runs locally:
+
+   ```powershell
+   docker compose up --build --remove-orphans
+   ```
+
+   (`--remove-orphans` matters once, if you ran Version 2 before: it removes the old interface container.)
+2. Your key and model answer:
+
+   ```powershell
+   docker compose exec api python -m scripts.check_llm
+   ```
+
+Then push to GitHub. Render builds what is on GitHub, not what is on your PC.
+
 ## Step 1: the database on Neon
 
 1. Sign up at <https://neon.com> and create a **project**. Give it a name
@@ -67,6 +86,10 @@ at about 200 MB.
    Switch **Connection pooling off** in that dialog (the host name then has no
    `-pooler` in it) and copy the string. Both kinds work with VeriAgent; the direct
    one is the simpler of the two.
+   Paste the string exactly as Neon shows it. VeriAgent refuses to start with a
+   database address it cannot read unambiguously (a setting after the `?` that it
+   does not know, or a host or password written there instead of in the address
+   itself), and says which part to change.
 3. Keep the string for step 3. **It contains the database password.** Treat it like
    a password: do not paste it into a file of the repository, a chat or a screenshot.
 
@@ -144,7 +167,8 @@ forgets a password signs in with Google (if you switched that on) or asks you.
    create an **OAuth client ID** of the type **Web application**.
 2. Under **Authorised JavaScript origins** add the address of your site exactly as
    the browser shows it, without a path: `https://veriagent-xxxx.onrender.com`.
-   (For your PC add `http://localhost:8000` as well.)
+   For your PC add **both** `http://localhost` and `http://localhost:8000`; Google
+   asks for the address with and without the port.
 3. Copy the client id (it ends in `.apps.googleusercontent.com`; it is not a secret)
    and add it in Render → **Environment** as `GOOGLE_CLIENT_ID`.
 
@@ -188,11 +212,15 @@ there, and removes keys and passwords from error messages before it logs them.
 | What you see | What it means | What to do |
 |---|---|---|
 | `VeriAgent cannot start with these settings:` followed by a list | the start-up check (`app/startup.py`) found settings that cannot work together | each line says what to change |
+| Lines that begin with `Configuration:` | warnings from the same check: the service runs, but something is risky (anyone can register, no daily limit, the database certificate is not checked, a key is empty) | read them once after the first start; each says what to set |
+| `DATABASE_URL` is named in the list | the address has a setting VeriAgent does not know, or cannot be read | copy the string from Neon again, unchanged |
 | `Database not ready yet (attempt …)` fifteen times, then `Could not connect to the database` | the connection string is wrong, or the database was deleted | copy the string from Neon again into `DATABASE_URL` |
 | `The database stores …-dimensional embeddings but EMBEDDING_DIM is …` | `EMBEDDING_DIM` no longer matches the database | set it back to the number the message names |
 | The page takes a minute to appear | the service was asleep | nothing; it is awake now |
 | "Too many requests" or a quota message from Gemini in a result | the free tier of the Gemini API is used up for the moment | wait; or lower `LLM_REQUESTS_PER_MINUTE` |
 | A document stays "processing", then shows "failed" | the service restarted while it was being read | upload it again |
+| A document cannot be inspected or downloaded again later | with `KEEP_UPLOADED_FILES=false` the file itself is deleted after processing; its text, vectors and inspection result stay | nothing; upload it again only if you want a fresh inspection |
+| An investigation shows "interrupted" after the service slept or restarted | the run was cut off; its progress is saved | open it from the history, it continues from the last finished step |
 | The build stops with an out-of-memory error | the full image was built | check that `LOCAL_EMBEDDINGS` is `false` in the service's environment |
 | Sign-in works, but a reload shows the sign-in page again | the sign-in cookie was not stored | open the site with `https://`, and check that `TRUST_PROXY_HEADERS` is `true` |
 | The Google button does not appear, or shows an error | the origin is not registered | compare the address in step 2 of the Google section, character by character |
