@@ -361,7 +361,7 @@ def test_reading_and_inspecting_draw_the_file_once(monkeypatch):
 
     drawn = []
     real = pdf_module._pictures
-    monkeypatch.setattr(pdf_module, "_pictures", lambda page, workshop=None: (drawn.append(page.number), real(page, workshop))[1])
+    monkeypatch.setattr(pdf_module, "_pictures", lambda page, *more: (drawn.append(page.number), real(page, *more))[1])
     data = make(lambda page, document: page.insert_text(SPOT, SECRET, fontsize=9, color=(1, 1, 1)))
     pages = load_pages(data, ".pdf")
     report = analyze_document(data, ".pdf", "invoice", pages)
